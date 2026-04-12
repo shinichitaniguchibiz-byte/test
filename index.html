@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>中学受験 過去問検索プロトタイプ</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>中学受験 過去問検索</h1>
+      <p>キーワード・学校属性・教科・偏差値で横断検索（プロトタイプ）</p>
+    </header>
+
+    <main class="layout">
+      <section class="left-panel">
+        <div class="card filters">
+          <h2>検索条件</h2>
+          <div class="filter-grid">
+            <label>
+              キーワード
+              <input id="keyword" type="text" placeholder="例: 徳川家康" />
+            </label>
+
+            <label>
+              教科
+              <select id="subject">
+                <option value="">指定なし（全教科）</option>
+                <option value="算数">算数</option>
+                <option value="国語">国語</option>
+                <option value="理科">理科</option>
+                <option value="社会">社会</option>
+              </select>
+            </label>
+
+            <label>
+              学校種別
+              <select id="schoolType">
+                <option value="">指定なし（共学校含む）</option>
+                <option value="男子校">男子校</option>
+                <option value="女子校">女子校</option>
+                <option value="共学校">共学校</option>
+              </select>
+            </label>
+
+            <label>
+              偏差値（以上）
+              <input id="hensachiMin" type="number" min="0" max="80" step="1" placeholder="例: 55" />
+            </label>
+
+            <label>
+              検索ヒット率（以上 %）
+              <input id="hitRateMin" type="number" min="0" max="100" step="1" placeholder="例: 70" />
+            </label>
+
+            <label>
+              教学区分
+              <select id="kyogaku">
+                <option value="">指定なし</option>
+                <option value="教学あり">教学あり</option>
+                <option value="教学なし">教学なし</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="actions">
+            <button id="searchBtn">検索する</button>
+            <button id="clearBtn" class="secondary">条件をクリア</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>検索結果（左下）</h2>
+          <p id="resultCount" class="muted">0 件</p>
+          <ul id="resultList" class="result-list"></ul>
+        </div>
+      </section>
+
+      <section class="right-panel card">
+        <h2>過去問一覧（右側）</h2>
+        <div id="detail" class="muted">左の検索結果をクリックすると、ここに該当PDF情報を表示します。</div>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>
