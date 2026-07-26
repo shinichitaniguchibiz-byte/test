@@ -28,9 +28,9 @@ jobs:
         working-directory: radio_sqlite
         run: python app/radio_batch.py self-test
 
-      - name: Initialize database
+      - name: Initialize delivery database
         working-directory: radio_sqlite
-        run: python app/radio_batch.py --database database/ci_radio.db init
+        run: python app/radio_batch.py --database database/radio.db init
 
       - name: Check schema and seed rows
         working-directory: radio_sqlite
@@ -38,7 +38,7 @@ jobs:
           python - <<'PY'
           import sqlite3
           from pathlib import Path
-          db = Path('database/ci_radio.db')
+          db = Path('database/radio.db')
           assert db.exists(), db
           with sqlite3.connect(db) as conn:
               assert conn.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
@@ -50,21 +50,37 @@ jobs:
 
       - name: Verify initialized database
         working-directory: radio_sqlite
-        run: python app/radio_batch.py --database database/ci_radio.db verify
+        run: python app/radio_batch.py --database database/radio.db verify
 
-      - name: Remove test database and runtime files
+      - name: Prepare clean delivery database
         working-directory: radio_sqlite
         run: |
-          rm -f database/ci_radio.db database/ci_radio.db-wal database/ci_radio.db-shm
+          python - <<'PY'
+          import sqlite3
+          from pathlib import Path
+          db = Path('database/radio.db')
+          with sqlite3.connect(db) as conn:
+              conn.execute('PRAGMA foreign_keys=ON')
+              conn.execute('DELETE FROM download_attempt')
+              conn.execute('DELETE FROM run')
+              conn.commit()
+              assert conn.execute('SELECT COUNT(*) FROM program').fetchone()[0] == 5
+              assert conn.execute('SELECT COUNT(*) FROM recording').fetchone()[0] == 0
+              assert conn.execute('SELECT COUNT(*) FROM run').fetchone()[0] == 0
+              assert conn.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+              conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+              conn.execute('VACUUM')
+          print('DELIVERY_DATABASE=PASS')
+          PY
+          rm -f database/radio.db-wal database/radio.db-shm
           rm -f .radio_sqlite.lock
           find log/runs -type f ! -name '.gitkeep' -delete
+          find . -type d -name '__pycache__' -prune -exec rm -rf {} +
 
-      - name: Build delivery ZIP
-        run: zip -r 20260726_radio_sqlite_headless.zip radio_sqlite -x '*/__pycache__/*'
-
-      - name: Upload delivery ZIP
+      - name: Upload tested delivery directory
         uses: actions/upload-artifact@v4
         with:
           name: 20260726_radio_sqlite_headless
-          path: 20260726_radio_sqlite_headless.zip
+          path: radio_sqlite
+          include-hidden-files: true
           if-no-files-found: error
