@@ -1,0 +1,70 @@
+name: Radio SQLite Headless Test
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Compile Python
+        run: python -m py_compile radio_sqlite/app/radio_batch.py
+
+      - name: Run isolated recording insert test
+        working-directory: radio_sqlite
+        run: python app/radio_batch.py self-test
+
+      - name: Initialize database
+        working-directory: radio_sqlite
+        run: python app/radio_batch.py --database database/ci_radio.db init
+
+      - name: Check schema and seed rows
+        working-directory: radio_sqlite
+        run: |
+          python - <<'PY'
+          import sqlite3
+          from pathlib import Path
+          db = Path('database/ci_radio.db')
+          assert db.exists(), db
+          with sqlite3.connect(db) as conn:
+              assert conn.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+              assert conn.execute('SELECT COUNT(*) FROM program').fetchone()[0] == 5
+              assert conn.execute('SELECT COUNT(*) FROM recording').fetchone()[0] == 0
+              assert conn.execute('SELECT COUNT(*) FROM sqlite_master WHERE type="table" AND name IN ("program", "recording", "run", "download_attempt")').fetchone()[0] == 4
+          print('DATABASE_TEST=PASS')
+          PY
+
+      - name: Verify initialized database
+        working-directory: radio_sqlite
+        run: python app/radio_batch.py --database database/ci_radio.db verify
+
+      - name: Remove test database and runtime files
+        working-directory: radio_sqlite
+        run: |
+          rm -f database/ci_radio.db database/ci_radio.db-wal database/ci_radio.db-shm
+          rm -f .radio_sqlite.lock
+          find log/runs -type f ! -name '.gitkeep' -delete
+
+      - name: Build delivery ZIP
+        run: zip -r 20260726_radio_sqlite_headless.zip radio_sqlite -x '*/__pycache__/*'
+
+      - name: Upload delivery ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: 20260726_radio_sqlite_headless
+          path: 20260726_radio_sqlite_headless.zip
+          if-no-files-found: error
