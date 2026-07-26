@@ -1,0 +1,32 @@
+name: Radio Header Cut Package
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  test-and-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run integration test
+        run: python tests/test_radio_header_cut_update.py
+
+      - name: Write test result
+        run: |
+          printf 'RESULT=PASS\nPYTHON=3.12\nTEST=database migration, rerun, zero-second conversion, status 0, integrity, foreign keys\n' > radio_header_cut_update/TEST_RESULT.txt
+
+      - name: Upload update package
+        uses: actions/upload-artifact@v4
+        with:
+          name: 20260726_radio_header_cut_complete_update_v1
+          path: radio_header_cut_update
+          if-no-files-found: error
+          retention-days: 7
