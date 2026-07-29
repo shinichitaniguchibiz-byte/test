@@ -1,0 +1,62 @@
+name: Validate radio V34
+
+on:
+  pull_request:
+    paths:
+      - "radio/20260729/**"
+      - ".github/workflows/validate-radio-v34.yml"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile Python
+        run: python -m py_compile radio/20260729/nhk_download.py
+
+      - name: Static contract checks
+        shell: python
+        run: |
+          from pathlib import Path
+          source = Path("radio/20260729/nhk_download.py").read_text(encoding="utf-8")
+          required = [
+              'PROGRAM_VERSION = "V34_COMPLETE_REWRITE_EXPLICIT_SAVE_NO_AUTOSAVE_GATE"',
+              "workbook.Save()",
+              "autosave_required=False",
+              "MAX_CONCURRENT_DOWNLOADS = 15",
+              '"-http_seekable", "0"',
+          ]
+          forbidden = [
+              "workbook.AutoSaveOn = True",
+              "No download is permitted. No download is permitted.",
+              "$patch = @'",
+              "Set-Location ",
+          ]
+          missing = [item for item in required if item not in source]
+          present_forbidden = [item for item in forbidden if item in source]
+          if missing:
+              raise SystemExit(f"Missing required contracts: {missing}")
+          if present_forbidden:
+              raise SystemExit(f"Forbidden content present: {present_forbidden}")
+          print("STATIC_CONTRACTS=PASS")
+
+      - name: Build package
+        run: |
+          mkdir -p package
+          cp radio/20260729/nhk_download.py package/
+          cp radio/20260729/RUN_NHK_DOWNLOAD.bat package/
+          cp radio/20260729/README.txt package/
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: 20260729_nhk_download_v34_complete
+          path: package/
+          if-no-files-found: error
