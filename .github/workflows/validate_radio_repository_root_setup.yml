@@ -19,6 +19,14 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $root = Join-Path $env:RUNNER_TEMP "radio-recording"
+          $packageDir = Join-Path $env:RUNNER_TEMP "radio-setup-package"
+          $sourceDir = (Resolve-Path ".\artifacts\radio_repository_root_setup").Path
+
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+          Copy-Item "$sourceDir\SETUP_RADIO_REPOSITORY_WRAPPER.ps1" "$packageDir\SETUP_RADIO_REPOSITORY.ps1"
+          Copy-Item "$sourceDir\SETUP_RADIO_REPOSITORY.ps1" "$packageDir\SETUP_RADIO_REPOSITORY_CORE.ps1"
+          Copy-Item "$sourceDir\README.txt" $packageDir
+          $setupScript = Join-Path $packageDir "SETUP_RADIO_REPOSITORY.ps1"
 
           New-Item -ItemType Directory -Path $root -Force | Out-Null
           New-Item -ItemType Directory -Path (Join-Path $root "audio") -Force | Out-Null
@@ -30,7 +38,7 @@ jobs:
           Set-Content -LiteralPath (Join-Path $root "audio\existing.m4a") -Value "audio" -Encoding UTF8
           Set-Content -LiteralPath (Join-Path $root "database\radio_catalog.db") -Value "database" -Encoding UTF8
 
-          & .\artifacts\radio_repository_root_setup\SETUP_RADIO_REPOSITORY.ps1 -RootPath $root
+          & $setupScript -RootPath $root
 
           if (-not (Test-Path -LiteralPath (Join-Path $root ".git"))) { throw ".git was not created" }
           if (Test-Path -LiteralPath (Join-Path $root "main")) { throw "main directory remains" }
@@ -54,12 +62,14 @@ jobs:
           git -C $root commit -m "Add test task"
           if ($LASTEXITCODE -ne 0) { throw "task commit failed" }
 
+          $locationBeforeWorktree = (Get-Location).Path
           & (Join-Path $root "dev\scripts\create_worktree.ps1") -Slug "database-table-design"
+          if ((Get-Location).Path -ne $locationBeforeWorktree) { throw "create_worktree changed caller location" }
           if (-not (Test-Path -LiteralPath (Join-Path $root "dev\worktrees\database-table-design\.git"))) {
             throw "isolated worktree was not created"
           }
 
-          & .\artifacts\radio_repository_root_setup\SETUP_RADIO_REPOSITORY.ps1 -RootPath $root
+          & $setupScript -RootPath $root
           & (Join-Path $root "dev\scripts\run_checks.ps1") -RootPath $root
 
           Write-Host "WINDOWS_SETUP_VALIDATION=PASS"
@@ -71,7 +81,8 @@ jobs:
           $source = ".\artifacts\radio_repository_root_setup"
           $package = ".\package"
           New-Item -ItemType Directory -Path $package -Force | Out-Null
-          Copy-Item "$source\SETUP_RADIO_REPOSITORY.ps1" $package
+          Copy-Item "$source\SETUP_RADIO_REPOSITORY_WRAPPER.ps1" "$package\SETUP_RADIO_REPOSITORY.ps1"
+          Copy-Item "$source\SETUP_RADIO_REPOSITORY.ps1" "$package\SETUP_RADIO_REPOSITORY_CORE.ps1"
           Copy-Item "$source\README.txt" $package
 
           $hashes = Get-ChildItem $package -File | Sort-Object Name | ForEach-Object {
