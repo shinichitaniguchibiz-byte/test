@@ -1,0 +1,88 @@
+name: Validate radio repository root setup
+
+on:
+  pull_request:
+    paths:
+      - "artifacts/radio_repository_root_setup/**"
+      - ".github/workflows/validate_radio_repository_root_setup.yml"
+
+jobs:
+  validate:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate setup and root migration
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = Join-Path $env:RUNNER_TEMP "radio-recording"
+
+          New-Item -ItemType Directory -Path $root -Force | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $root "audio") -Force | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $root "database") -Force | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $root "dev") -Force | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $root "main") -Force | Out-Null
+
+          Set-Content -LiteralPath (Join-Path $root "main\nhk_download.py") -Value "print('stable-download-placeholder')" -Encoding UTF8
+          Set-Content -LiteralPath (Join-Path $root "audio\existing.m4a") -Value "audio" -Encoding UTF8
+          Set-Content -LiteralPath (Join-Path $root "database\radio_catalog.db") -Value "database" -Encoding UTF8
+
+          & .\artifacts\radio_repository_root_setup\SETUP_RADIO_REPOSITORY.ps1 -RootPath $root
+
+          if (-not (Test-Path -LiteralPath (Join-Path $root ".git"))) { throw ".git was not created" }
+          if (Test-Path -LiteralPath (Join-Path $root "main")) { throw "main directory remains" }
+          if (-not (Test-Path -LiteralPath (Join-Path $root "nhk_download.py"))) { throw "main content was not migrated" }
+          if (-not (Test-Path -LiteralPath (Join-Path $root "audio\existing.m4a"))) { throw "audio data changed" }
+          if (-not (Test-Path -LiteralPath (Join-Path $root "database\radio_catalog.db"))) { throw "database data changed" }
+
+          git -C $root check-ignore -q -- audio/existing.m4a
+          if ($LASTEXITCODE -ne 0) { throw "audio is not ignored" }
+          git -C $root check-ignore -q -- database/radio_catalog.db
+          if ($LASTEXITCODE -ne 0) { throw "database is not ignored" }
+
+          git -C $root config user.name "CI"
+          git -C $root config user.email "ci@example.invalid"
+          git -C $root commit -m "Initialize test repository"
+          if ($LASTEXITCODE -ne 0) { throw "initial commit failed" }
+
+          & (Join-Path $root "dev\scripts\run_checks.ps1") -RootPath $root
+          & (Join-Path $root "dev\scripts\new_codex_task.ps1") -Slug "database-table-design"
+          git -C $root add docs/codex_tasks
+          git -C $root commit -m "Add test task"
+          if ($LASTEXITCODE -ne 0) { throw "task commit failed" }
+
+          & (Join-Path $root "dev\scripts\create_worktree.ps1") -Slug "database-table-design"
+          if (-not (Test-Path -LiteralPath (Join-Path $root "dev\worktrees\database-table-design\.git"))) {
+            throw "isolated worktree was not created"
+          }
+
+          & .\artifacts\radio_repository_root_setup\SETUP_RADIO_REPOSITORY.ps1 -RootPath $root
+          & (Join-Path $root "dev\scripts\run_checks.ps1") -RootPath $root
+
+          Write-Host "WINDOWS_SETUP_VALIDATION=PASS"
+
+      - name: Build downloadable package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $source = ".\artifacts\radio_repository_root_setup"
+          $package = ".\package"
+          New-Item -ItemType Directory -Path $package -Force | Out-Null
+          Copy-Item "$source\SETUP_RADIO_REPOSITORY.ps1" $package
+          Copy-Item "$source\README.txt" $package
+
+          $hashes = Get-ChildItem $package -File | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          }
+          $hashes | Set-Content -LiteralPath "$package\SHA256SUMS.txt" -Encoding ASCII
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: 20260731_radio_repository_root_setup
+          path: package/*
+          if-no-files-found: error
