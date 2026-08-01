@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import re
 import subprocess
 import sys
@@ -15,12 +16,25 @@ DEVICE = "cuda"
 COMPUTE_TYPE = "float16"
 DEFAULT_INPUT_FILE = "b.m4a"
 DEFAULT_OUTPUT_DIRECTORY = "stt_test"
+DEFAULT_BATCH_SIZE = 8
 JST = timezone(timedelta(hours=9), name="JST")
 
-HOTWORDS = (
-    "NHK ラジオ英会話 Lesson Grammar and Vocabulary Essential Expressions "
-    "Practical Usage Pronunciation Polish dialogue key sentence pronunciation "
-    "英語 日本語 文法 語彙 発音 音読 練習"
+INITIAL_PROMPT = (
+    "NHKラジオ英会話の音声です。日本語の解説と英語のダイアログ、"
+    "例文、発音練習をすべて省略せずに文字起こししてください。"
+    "英語は英語表記のまま残し、同じ英文の繰り返しも残してください。"
+)
+
+KNOWN_HALLUCINATIONS = (
+    "English Subtitles by the Amara.org community",
+    "Subtitles by the Amara.org community",
+)
+
+EXPECTED_SECTIONS = (
+    "Grammar and Vocabulary",
+    "Essential Expressions",
+    "Practical Usage",
+    "Pronunciation Polish",
 )
 
 
@@ -29,7 +43,7 @@ class TranscriptionError(RuntimeError):
 
 
 class StepTimer:
-    """Measure and summarize each processing step."""
+    """Measure and summarize processing steps."""
 
     def __init__(self) -> None:
         self.started_at = time.perf_counter()
@@ -58,6 +72,12 @@ class StepTimer:
     def total_seconds(self) -> float:
         return time.perf_counter() - self.started_at
 
+    def step_seconds(self, name: str) -> float:
+        for step_name, elapsed, _result in self.steps:
+            if step_name == name:
+                return elapsed
+        return 0.0
+
     def print_summary(self, overall_result: str) -> None:
         if self.current_name is not None:
             self.finish("FAILED" if overall_result == "FAILED" else overall_result)
@@ -76,8 +96,8 @@ class StepTimer:
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Transcribe mixed Japanese-English audio locally with an "
-            "accuracy-oriented faster-whisper configuration."
+            "Transcribe mixed Japanese-English lesson audio with a batched "
+            "large-v3 configuration tuned for accuracy and speed."
         )
     )
     parser.add_argument(
@@ -93,6 +113,12 @@ def parse_arguments() -> argparse.Namespace:
             "The output file name is created from the JST execution time."
         ),
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help="Initial GPU batch size. Default: 8.",
+    )
     return parser.parse_args()
 
 
@@ -104,8 +130,6 @@ def resolve_path(script_directory: Path, value: str) -> Path:
 
 
 def ensure_stt_virtual_environment(script_directory: Path) -> None:
-    """Relaunch with .venv-stt before importing the ML libraries."""
-
     expected_python = script_directory / ".venv-stt" / "Scripts" / "python.exe"
     current_python = Path(sys.executable).resolve()
 
@@ -142,9 +166,12 @@ def create_output_path(output_directory: Path, created_at: datetime) -> Path:
     return candidate
 
 
-def validate_environment(input_file: Path, ctranslate2: object) -> None:
+def validate_environment(input_file: Path, batch_size: int, ctranslate2: object) -> None:
     if not input_file.is_file():
         raise FileNotFoundError(f"Input file was not found: {input_file}")
+
+    if batch_size < 1:
+        raise ValueError("--batch-size must be at least 1.")
 
     cuda_device_count = ctranslate2.get_cuda_device_count()
     if cuda_device_count < 1:
@@ -156,6 +183,33 @@ def validate_environment(input_file: Path, ctranslate2: object) -> None:
             f"{COMPUTE_TYPE} is not supported. "
             f"Supported types: {sorted(supported_compute_types)}"
         )
+
+
+def build_batch_candidates(initial_batch_size: int) -> list[int]:
+    candidates: list[int] = []
+    current = initial_batch_size
+
+    while current >= 1:
+        if current not in candidates:
+            candidates.append(current)
+        if current == 1:
+            break
+        current = max(1, current // 2)
+
+    return candidates
+
+
+def is_cuda_memory_error(exception: BaseException) -> bool:
+    message = str(exception).lower()
+    return any(
+        term in message
+        for term in (
+            "out of memory",
+            "cuda_error_out_of_memory",
+            "failed to allocate",
+            "memory allocation",
+        )
+    )
 
 
 def load_model(WhisperModel: object) -> object:
@@ -176,29 +230,56 @@ def load_model(WhisperModel: object) -> object:
     return model
 
 
-def transcribe_audio(model: object, input_file: Path) -> tuple[list[object], object]:
-    print("TRANSCRIPTION_START")
+def transcribe_once(
+    model: object,
+    BatchedInferencePipeline: object,
+    input_file: Path,
+    batch_size: int,
+) -> tuple[list[object], object]:
+    pipeline = BatchedInferencePipeline(model=model)
 
-    segments_iterator, information = model.transcribe(
+    segments_iterator, information = pipeline.transcribe(
         str(input_file),
         task="transcribe",
-        language=None,
-        multilingual=True,
+
+        # The large model already handles Japanese-English code switching.
+        # Keeping the base language fixed avoids unstable per-segment language
+        # switching while preserving English text in mixed lesson audio.
+        language="ja",
+        multilingual=False,
+
         beam_size=5,
         best_of=5,
         patience=1.0,
-        temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
         length_penalty=1.0,
-        vad_filter=False,
-        condition_on_previous_text=False,
-        prompt_reset_on_temperature=0.5,
+        repetition_penalty=1.05,
+        no_repeat_ngram_size=0,
+        temperature=0.0,
+
+        # The prompt describes the audio format without injecting lesson text.
+        initial_prompt=INITIAL_PROMPT,
+        hotwords=None,
+
+        # Preserve short pronunciation drills while using VAD for batching.
+        vad_filter=True,
+        vad_parameters={
+            "threshold": 0.30,
+            "min_speech_duration_ms": 80,
+            "min_silence_duration_ms": 500,
+            "speech_pad_ms": 450,
+        },
+
+        # Segment timestamps are retained, but expensive word-level alignment
+        # is disabled because the output is plain text only.
         without_timestamps=False,
-        word_timestamps=True,
-        hallucination_silence_threshold=2.0,
+        word_timestamps=False,
+        hallucination_silence_threshold=None,
+
         compression_ratio_threshold=2.4,
         log_prob_threshold=-1.0,
         no_speech_threshold=0.6,
-        hotwords=HOTWORDS,
+
+        batch_size=batch_size,
         log_progress=True,
     )
 
@@ -207,6 +288,41 @@ def transcribe_audio(model: object, input_file: Path) -> tuple[list[object], obj
         raise TranscriptionError("Whisper returned no transcription segments.")
 
     return segments, information
+
+
+def transcribe_with_batch_fallback(
+    model: object,
+    BatchedInferencePipeline: object,
+    input_file: Path,
+    batch_candidates: Iterable[int],
+) -> tuple[list[object], object, int]:
+    last_exception: BaseException | None = None
+
+    for batch_size in batch_candidates:
+        print()
+        print("TRANSCRIPTION_ATTEMPT")
+        print(f"BATCH_SIZE={batch_size}")
+
+        try:
+            segments, information = transcribe_once(
+                model=model,
+                BatchedInferencePipeline=BatchedInferencePipeline,
+                input_file=input_file,
+                batch_size=batch_size,
+            )
+            return segments, information, batch_size
+
+        except Exception as exception:
+            last_exception = exception
+            if not is_cuda_memory_error(exception):
+                raise
+
+            print(f"GPU_MEMORY_RETRY=BATCH_SIZE_{batch_size}")
+            gc.collect()
+
+    raise TranscriptionError(
+        "Transcription failed even at the smallest batch size."
+    ) from last_exception
 
 
 def contains_latin_text(text: str) -> bool:
@@ -219,7 +335,12 @@ def ends_sentence(text: str) -> bool:
 
 def normalize_segment_text(text: str) -> str:
     text = text.replace("\u3000", " ").strip()
-    return re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"[ \t]+", " ", text)
+
+    for hallucination in KNOWN_HALLUCINATIONS:
+        text = text.replace(hallucination, "")
+
+    return text.strip()
 
 
 def append_text(current: str, new_text: str) -> str:
@@ -282,6 +403,19 @@ def detect_decoder_loop(text: str) -> str | None:
     return None
 
 
+def print_quality_summary(text: str) -> None:
+    latin_characters = sum(1 for character in text if character.isascii() and character.isalpha())
+    found_sections = [section for section in EXPECTED_SECTIONS if section in text]
+    missing_sections = [section for section in EXPECTED_SECTIONS if section not in text]
+
+    print("TRANSCRIPT_QUALITY_SUMMARY")
+    print(f"TEXT_CHARACTERS={len(text)}")
+    print(f"LATIN_CHARACTERS={latin_characters}")
+    print(f"EXPECTED_SECTIONS_FOUND={len(found_sections)}/{len(EXPECTED_SECTIONS)}")
+    print("FOUND_SECTIONS=" + " | ".join(found_sections))
+    print("MISSING_SECTIONS=" + (" | ".join(missing_sections) if missing_sections else "NONE"))
+
+
 def write_text_atomically(output_file: Path, text: str) -> None:
     temporary_file = output_file.with_name(output_file.name + ".part")
 
@@ -305,16 +439,17 @@ def run() -> int:
         input_file = resolve_path(script_directory, arguments.input)
         output_directory = resolve_path(script_directory, arguments.output_dir)
         output_file = create_output_path(output_directory, created_at)
+        batch_candidates = build_batch_candidates(arguments.batch_size)
         timer.finish()
 
         timer.start("import_transcription_libraries")
         import ctranslate2
         import faster_whisper
-        from faster_whisper import WhisperModel
+        from faster_whisper import BatchedInferencePipeline, WhisperModel
         timer.finish()
 
         timer.start("validate_environment")
-        validate_environment(input_file, ctranslate2)
+        validate_environment(input_file, arguments.batch_size, ctranslate2)
         timer.finish()
 
         print("TRANSCRIPTION_CONFIGURATION")
@@ -324,11 +459,14 @@ def run() -> int:
         print(f"CUDA_DEVICES={ctranslate2.get_cuda_device_count()}")
         print(f"MODEL={MODEL_NAME}")
         print(f"COMPUTE_TYPE={COMPUTE_TYPE}")
-        print("LANGUAGE=auto")
-        print("MULTILINGUAL=True")
-        print("VAD_FILTER=False")
+        print("LANGUAGE=ja")
+        print("MULTILINGUAL=False")
+        print("BATCHED_INFERENCE=True")
+        print("VAD_FILTER=True")
+        print("WORD_TIMESTAMPS=False")
         print("BEAM_SIZE=5")
-        print("CONDITION_ON_PREVIOUS_TEXT=False")
+        print("HOTWORDS=None")
+        print("BATCH_CANDIDATES=" + ",".join(str(value) for value in batch_candidates))
         print(f"OUTPUT_CREATED_AT={created_at.isoformat()}")
         print(f"INPUT={input_file}")
         print(f"OUTPUT={output_file}")
@@ -338,7 +476,12 @@ def run() -> int:
         timer.finish()
 
         timer.start("transcribe_audio")
-        segments, information = transcribe_audio(model, input_file)
+        segments, information, used_batch_size = transcribe_with_batch_fallback(
+            model=model,
+            BatchedInferencePipeline=BatchedInferencePipeline,
+            input_file=input_file,
+            batch_candidates=batch_candidates,
+        )
         timer.finish()
 
         timer.start("format_and_validate_transcript")
@@ -356,23 +499,18 @@ def run() -> int:
         timer.finish()
 
         audio_seconds = float(getattr(information, "duration", 0.0))
-        transcription_seconds = next(
-            (
-                elapsed
-                for name, elapsed, _result in timer.steps
-                if name == "transcribe_audio"
-            ),
-            0.0,
-        )
+        transcription_seconds = timer.step_seconds("transcribe_audio")
         realtime_factor = (
             transcription_seconds / audio_seconds if audio_seconds > 0 else 0.0
         )
 
         print("TRANSCRIPTION_RESULT=PASS")
         print(f"OUTPUT_FILE={output_file}")
+        print(f"BATCH_SIZE_USED={used_batch_size}")
         print(f"SEGMENT_COUNT={len(segments)}")
         print(f"AUDIO_SECONDS={audio_seconds:.3f}")
         print(f"REALTIME_FACTOR={realtime_factor:.4f}")
+        print_quality_summary(transcript)
 
         overall_result = "PASS"
         return 0
