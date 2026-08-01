@@ -1,0 +1,62 @@
+Purpose
+
+Convert a raw transcript of an NHK English-learning program into one complete and readable plain-text lesson transcript.
+
+Output rules
+
+Return plain text only. Do not use Markdown, asterisks, bullets, numbered lists, tables, code fences, HTML, XML, JSON, or decorative symbols. Do not add a preface, summary, correction report, or explanation of the editing process.
+
+Content rules
+
+Preserve the full lesson flow. Do not summarize or omit dialogue, Japanese explanations, English examples, model answers, pronunciation drills, intentional repetitions, or the closing conversation. Keep Japanese in Japanese and English in English. Do not translate between them. Do not invent missing material. Correct only clear speech-recognition errors supported by nearby context, grammar explanations, or a reliable repetition of the same sentence elsewhere in the transcript.
+
+Section structure
+
+Use ordinary section headings on their own lines, with one blank line before and after each major section. Typical headings are Lesson number and title, Dialogue, Grammar and Vocabulary, Essential Expressions, Practical Usage, Pronunciation Polish, and Closing Conversation. Use only headings supported by the source, and preserve the source order.
+
+Paragraph structure
+
+Join fragmented recognition segments into continuous and meaningful paragraphs. Do not create a new paragraph after every recognition segment. Keep sentences together while they explain the same word, grammatical point, expression, example, or pronunciation feature. Begin a new paragraph when the topic, example, exercise stage, speaker role, or lesson section changes. Restore normal punctuation, capitalization, apostrophes, and sentence boundaries. Japanese explanations must read as continuous natural Japanese prose. English explanations must read as continuous natural English prose.
+
+Dialogue structure
+
+Place each speaker's utterance on a separate line. Use the speaker's name when clearly known. Otherwise use Speaker A, Speaker B, Speaker C, and so on consistently within that dialogue.
+
+Example:
+
+Theo: Dad's birthday is coming up next week. We should do something special.
+Jennifer: Yeah, but Mom already booked dinner, right?
+
+Keep one continuous exchange together as one dialogue block, followed by one blank line. When the dialogue is repeated later, reproduce it again in that position. Do not replace it with a note saying that it was repeated.
+
+English examples and pronunciation practice
+
+Place each complete key sentence, model sentence, answer, or pronunciation target on its own line. Preserve intentional repetitions exactly. If a sentence is spoken twice, print it twice. Do not merge repeated lines. For step-by-step pronunciation practice, keep each unit on its own line in spoken order.
+
+Example:
+
+baked him
+baked him
+
+What if
+What if
+
+What if we baked him a
+What if we baked him a
+
+cake ourselves
+cake ourselves
+
+Do not convert clear English words into katakana. When a repeated target sentence has one obvious recognition error, use the most reliable version repeated elsewhere in the lesson.
+
+Japanese explanations
+
+Connect Japanese fragments into natural sentences and paragraphs while preserving the original explanation and teaching sequence. Keep English words in Roman letters when the speaker is explicitly explaining those words. Do not replace the original explanation with a newly written explanation.
+
+Final verification
+
+The output must be plain text only. All source sections must remain. Repeated English must remain repeated. Dialogue speakers must be separated line by line. Explanation fragments must be joined into meaningful paragraphs. Japanese and English must not be translated into each other. No unsupported sentence may be added.
+
+Source transcript
+
+{{TRANSCRIPT}}
