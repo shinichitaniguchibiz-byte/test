@@ -1,0 +1,468 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ラジオ英会話 Lesson 76｜控えめな提案</title>
+  <style>
+    :root {
+      --ink: #24211f;
+      --muted: #6e6762;
+      --line: #ddd5d0;
+      --accent: #b95437;
+      --accent-soft: #f5e5df;
+      --paper: #fffdfa;
+      --panel: #f8f5f2;
+      --english: #2d3b49;
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      background: #f1efec;
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Yu Gothic UI", "Yu Gothic", Meiryo, sans-serif;
+      font-size: 17px;
+      line-height: 1.85;
+    }
+
+    .page {
+      width: min(900px, calc(100% - 28px));
+      margin: 24px auto;
+      background: var(--paper);
+      border: 1px solid var(--line);
+      box-shadow: 0 5px 18px rgba(42, 34, 30, 0.06);
+    }
+
+    header {
+      padding: 28px 34px 22px;
+      border-top: 8px solid var(--accent);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .eyebrow {
+      margin: 0 0 6px;
+      color: var(--accent);
+      font-size: 0.88rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(1.55rem, 3.6vw, 2.15rem);
+      line-height: 1.35;
+      font-weight: 700;
+    }
+
+    .subtitle {
+      margin: 8px 0 0;
+      color: var(--muted);
+      font-size: 1rem;
+    }
+
+    nav {
+      padding: 14px 28px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+    }
+
+    nav ul {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 18px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    nav a {
+      color: var(--ink);
+      font-size: 0.92rem;
+      text-decoration: none;
+      border-bottom: 1px solid transparent;
+    }
+
+    nav a:hover,
+    nav a:focus-visible {
+      color: var(--accent);
+      border-bottom-color: var(--accent);
+    }
+
+    main { padding: 8px 34px 42px; }
+
+    section {
+      padding-top: 26px;
+      scroll-margin-top: 16px;
+    }
+
+    h2 {
+      margin: 0 0 16px;
+      padding-bottom: 7px;
+      border-bottom: 2px solid var(--accent);
+      font-size: 1.35rem;
+      line-height: 1.4;
+    }
+
+    h3 {
+      margin: 24px 0 8px;
+      color: var(--accent);
+      font-size: 1.08rem;
+      line-height: 1.5;
+    }
+
+    p { margin: 0 0 14px; }
+
+    .key {
+      margin-top: 20px;
+      padding: 19px 22px;
+      border: 1px solid #d9b1a5;
+      border-left: 5px solid var(--accent);
+      background: var(--accent-soft);
+    }
+
+    .key .label {
+      margin: 0 0 4px;
+      color: var(--accent);
+      font-size: 0.82rem;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+    }
+
+    .key .english {
+      margin: 0;
+      color: var(--english);
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: clamp(1.3rem, 3.5vw, 1.75rem);
+      line-height: 1.45;
+    }
+
+    .key .ja { margin: 7px 0 0; }
+
+    .lesson-point {
+      margin-top: 18px;
+      padding: 16px 18px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+    }
+
+    .dialogue {
+      border-top: 1px solid var(--line);
+    }
+
+    .dialogue-line {
+      display: grid;
+      grid-template-columns: 105px 1fr;
+      gap: 14px;
+      padding: 12px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .speaker {
+      color: var(--accent);
+      font-weight: 700;
+    }
+
+    .english {
+      color: var(--english);
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: 1.08rem;
+      line-height: 1.65;
+    }
+
+    .translation {
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+
+    .note,
+    .example,
+    .practice {
+      margin: 12px 0 18px;
+      padding: 14px 17px;
+      border: 1px solid var(--line);
+      background: #fff;
+    }
+
+    .note strong,
+    .example strong,
+    .practice strong { color: var(--accent); }
+
+    .example .english,
+    .practice .english { margin-bottom: 4px; }
+
+    .vocabulary {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 8px;
+    }
+
+    .vocabulary th,
+    .vocabulary td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    .vocabulary th {
+      width: 34%;
+      color: var(--english);
+      font-family: Georgia, "Times New Roman", serif;
+      font-weight: 700;
+    }
+
+    .summary {
+      margin: 0;
+      padding-left: 1.25em;
+    }
+
+    .summary li { margin: 7px 0; }
+
+    .back {
+      margin-top: 20px;
+      text-align: right;
+      font-size: 0.9rem;
+    }
+
+    .back a { color: var(--accent); }
+
+    footer {
+      padding: 16px 34px 22px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 0.85rem;
+    }
+
+    @media (max-width: 620px) {
+      body { font-size: 16px; }
+      .page { width: 100%; margin: 0; border-left: 0; border-right: 0; }
+      header { padding: 22px 20px 18px; }
+      nav { padding: 12px 20px; }
+      main { padding: 4px 20px 34px; }
+      footer { padding: 14px 20px 20px; }
+      .dialogue-line { grid-template-columns: 1fr; gap: 2px; }
+      .speaker { margin-bottom: 0; }
+      .vocabulary th { width: 42%; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page" id="top">
+    <header>
+      <p class="eyebrow">Radio English Conversation · Lesson 76</p>
+      <h1>発言パターン：提案④　控えめな提案</h1>
+      <p class="subtitle">音声内容を、復習しやすい学習テキストとして再構成</p>
+
+      <div class="key">
+        <p class="label">KEY SENTENCE</p>
+        <p class="english">What if we baked him a cake ourselves?</p>
+        <p class="ja">私たちでお父さんにケーキを焼いてあげるのはどうかな？</p>
+      </div>
+
+      <div class="lesson-point">
+        相手に考えを押しつけず、ひとつの案として控えめに提案する表現を学びます。
+        中心となる形は <strong>What if + 主語 + 過去形 ...?</strong> です。
+      </div>
+    </header>
+
+    <nav aria-label="ページ内メニュー">
+      <ul>
+        <li><a href="#dialogue">Dialogue</a></li>
+        <li><a href="#grammar">Grammar &amp; Vocabulary</a></li>
+        <li><a href="#essential">Essential Expressions</a></li>
+        <li><a href="#practical">Practical Usage</a></li>
+        <li><a href="#pronunciation">Pronunciation</a></li>
+        <li><a href="#words">Words &amp; Phrases</a></li>
+        <li><a href="#summary">まとめ</a></li>
+      </ul>
+    </nav>
+
+    <main>
+      <section id="dialogue">
+        <h2>Dialogue</h2>
+        <div class="dialogue">
+          <div class="dialogue-line">
+            <div class="speaker">Theo</div>
+            <div>
+              <div class="english">Dad's birthday is coming up next week. We should do something special.</div>
+              <div class="translation">来週はお父さんの誕生日だよ。何か特別なことをしよう。</div>
+            </div>
+          </div>
+          <div class="dialogue-line">
+            <div class="speaker">Jennifer</div>
+            <div>
+              <div class="english">Yeah, but Mom already booked dinner, right?</div>
+              <div class="translation">でも、お母さんがもうディナーを予約したんだよね？</div>
+            </div>
+          </div>
+          <div class="dialogue-line">
+            <div class="speaker">Theo</div>
+            <div>
+              <div class="english">True, but what if we baked him a cake ourselves?</div>
+              <div class="translation">そうだけど、僕たちでお父さんにケーキを焼くのはどう？</div>
+            </div>
+          </div>
+          <div class="dialogue-line">
+            <div class="speaker">Jennifer</div>
+            <div>
+              <div class="english">Us? You know we're not exactly great in the kitchen.</div>
+              <div class="translation">私たちが？　私たち、料理がそれほど得意というわけじゃないでしょ。</div>
+            </div>
+          </div>
+          <div class="dialogue-line">
+            <div class="speaker">Theo</div>
+            <div>
+              <div class="english">Just an idea, but he'd probably love something homemade more than anything fancy.</div>
+              <div class="translation">ちょっとした思いつきだけど、きっと凝ったものより手作りのものの方がお父さんは喜ぶよ。</div>
+            </div>
+          </div>
+          <div class="dialogue-line">
+            <div class="speaker">Jennifer</div>
+            <div>
+              <div class="english">Hmm, that's actually sweet. Okay, but if it comes out burnt, you're explaining it.</div>
+              <div class="translation">それ、確かに心がこもっていていいね。分かった。でも焦げて焼き上がったら、あなたが説明してよ。</div>
+            </div>
+          </div>
+          <div class="dialogue-line">
+            <div class="speaker">Theo</div>
+            <div>
+              <div class="english">Deal. Let's start with a practice cake.</div>
+              <div class="translation">いいよ。まずは練習用のケーキから始めよう。</div>
+            </div>
+          </div>
+        </div>
+        <p class="back"><a href="#top">ページ上部へ</a></p>
+      </section>
+
+      <section id="grammar">
+        <h2>Grammar and Vocabulary</h2>
+
+        <h3>1. coming up</h3>
+        <div class="example">
+          <div class="english">Dad's birthday is coming up next week.</div>
+          <p>「もうすぐ起こる」「予定が近づいている」という意味です。upには、出来事が近づいてくる感触があります。</p>
+        </div>
+
+        <h3>2. not exactly</h3>
+        <div class="example">
+          <div class="english">We're not exactly great in the kitchen.</div>
+          <p>exactlyのような強い表現をnotで否定すると、「必ずしも～というわけではない」「それほど～ではない」という控えめな否定になります。</p>
+        </div>
+
+        <h3>3. Us?</h3>
+        <p>ここでのusはweの目的格です。会話では、話し手が自分たちを指して「私たちが？」と確認するときに目的格が使われます。</p>
+
+        <h3>4. homemade / fancy / sweet</h3>
+        <div class="note">
+          <p><strong>homemade</strong>：手作りの</p>
+          <p><strong>fancy</strong>：手の込んだ、しゃれた</p>
+          <p><strong>sweet</strong>：本来は「甘い」ですが、人の考えや行為について「優しい」「心がこもっている」という意味でも使われます。</p>
+        </div>
+
+        <h3>5. come out + 形容詞</h3>
+        <div class="example">
+          <div class="english">If it comes out burnt, you're explaining it.</div>
+          <p>come out burntは「焦げた状態で出来上がる」という形です。後半の現在進行形は、「そうなったら、あなたが説明することに決まっている」という確実な成り行きを表します。</p>
+        </div>
+        <p class="back"><a href="#top">ページ上部へ</a></p>
+      </section>
+
+      <section id="essential">
+        <h2>Essential Expressions</h2>
+        <div class="key">
+          <p class="label">KEY SENTENCE</p>
+          <p class="english">What if we baked him a cake ourselves?</p>
+          <p class="ja">私たちで彼にケーキを焼いたらどうかな？</p>
+        </div>
+
+        <p>What if ...? は、相手にある状況を想像してもらいながら提案する表現です。過去形bakedを使うことで現実から距離を取り、押しつけがましさを弱めています。現在形を使うと、より現実味のある直接的な提案になります。</p>
+
+        <h3>ほかの控えめな提案</h3>
+        <div class="example">
+          <div class="english">What if we asked Emily for advice?</div>
+          <p>エミリーに助言を求めるのはどうかな？</p>
+        </div>
+        <div class="example">
+          <div class="english">It might be a good idea for us to discuss this together.</div>
+          <p>これを私たちで一緒に話し合うのもいいかもしれません。</p>
+        </div>
+        <div class="example">
+          <div class="english">Just an idea, but we could try leaving a little earlier tomorrow.</div>
+          <p>ちょっとした思いつきですが、明日は少し早めに出てみてもいいかもしれません。</p>
+        </div>
+        <p class="back"><a href="#top">ページ上部へ</a></p>
+      </section>
+
+      <section id="practical">
+        <h2>Practical Usage</h2>
+        <p>会議が長引き、全員が少し疲れている場面です。</p>
+        <div class="practice">
+          <div class="english">It might be a good idea for us to take a break for a while.</div>
+          <div class="english">We've been at this for a long time.</div>
+          <div class="english">We're all a bit tired.</div>
+          <p>しばらく休憩を取るのもいいかもしれません。私たちはもう長い間これに取り組んでいます。みんな少し疲れています。</p>
+        </div>
+
+        <h3>for us</h3>
+        <p><span class="english">It might be a good idea for us to ...</span> のfor usは、後ろのto不定詞の行為をする人を示します。この文では「私たちが休憩を取る」という関係を明確にしています。</p>
+
+        <h3>be at this</h3>
+        <p>「これに取り組んでいる」という意味です。<span class="english">We've been at this for a long time.</span> で「私たちは長い間これに取り組んでいます」となります。</p>
+        <p class="back"><a href="#top">ページ上部へ</a></p>
+      </section>
+
+      <section id="pronunciation">
+        <h2>Pronunciation Polish</h2>
+        <div class="practice">
+          <div class="english">What if we baked him a cake ourselves?</div>
+          <p>発音練習では、同じ文の繰り返しを並べず、学習上必要なポイントだけを残します。</p>
+        </div>
+        <ul class="summary">
+          <li><strong>baked him</strong>では、語末と次の語をなめらかにつなげます。</li>
+          <li><strong>him</strong>のhは、会話の流れの中で弱く発音されます。</li>
+          <li><strong>what if</strong>も単語ごとに切らず、ひとまとまりで発音します。</li>
+        </ul>
+        <p class="back"><a href="#top">ページ上部へ</a></p>
+      </section>
+
+      <section id="words">
+        <h2>Words and Phrases</h2>
+        <table class="vocabulary">
+          <tbody>
+            <tr><th>coming up</th><td>もうすぐ起こる、予定が近づく</td></tr>
+            <tr><th>book dinner</th><td>ディナーを予約する</td></tr>
+            <tr><th>not exactly</th><td>必ずしも～というわけではない</td></tr>
+            <tr><th>in the kitchen</th><td>料理の面で、台所仕事について</td></tr>
+            <tr><th>homemade</th><td>手作りの</td></tr>
+            <tr><th>fancy</th><td>手の込んだ、しゃれた</td></tr>
+            <tr><th>come out burnt</th><td>焦げた状態で出来上がる</td></tr>
+            <tr><th>practice cake</th><td>練習用のケーキ</td></tr>
+            <tr><th>take a break</th><td>休憩を取る</td></tr>
+            <tr><th>be at this</th><td>これに取り組んでいる</td></tr>
+          </tbody>
+        </table>
+        <p class="back"><a href="#top">ページ上部へ</a></p>
+      </section>
+
+      <section id="summary">
+        <h2>学習のまとめ</h2>
+        <ul class="summary">
+          <li><strong>What if + 過去形 ...?</strong> は、現実から少し距離を取った控えめな提案。</li>
+          <li><strong>It might be a good idea ...</strong> や <strong>Just an idea, but ...</strong> も、相手に配慮した提案に使えます。</li>
+          <li>復習用テキストでは、放送内の進行文、同じ英文の反復、締めの雑談を省き、本文・解説・実用表現を中心に読み返します。</li>
+        </ul>
+      </section>
+    </main>
+
+    <footer>
+      ラジオ番組の音声内容をもとに、時系列の文字起こしではなく、学習と復習を目的としたテキストとして整理しています。
+    </footer>
+  </div>
+</body>
+</html>
