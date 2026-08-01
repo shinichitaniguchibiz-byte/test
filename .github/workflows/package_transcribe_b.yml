@@ -1,0 +1,33 @@
+name: Package TRANSCRIBE_B
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - radio/TRANSCRIBE_B.py
+      - .github/workflows/package_transcribe_b.yml
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate Python syntax
+        run: python -m py_compile radio/TRANSCRIBE_B.py
+
+      - name: Create ZIP
+        run: zip -j 20260801_TRANSCRIBE_B_timing_summary.zip radio/TRANSCRIBE_B.py
+
+      - name: Upload ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: 20260801_TRANSCRIBE_B_timing_summary
+          path: 20260801_TRANSCRIBE_B_timing_summary.zip
+          if-no-files-found: error
+          retention-days: 30
