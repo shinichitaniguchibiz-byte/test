@@ -10,27 +10,31 @@ from pathlib import Path
 from typing import Iterable
 
 
-MODEL_NAME = "large-v3"
+MODEL_NAME = "turbo"
 DEVICE = "cuda"
 COMPUTE_TYPE = "float16"
 DEFAULT_INPUT_FILE = "b.m4a"
 DEFAULT_OUTPUT_DIRECTORY = "stt_test"
 JST = timezone(timedelta(hours=9), name="JST")
 
-HOTWORDS = (
-    "NHK ラジオ英会話 Lesson Grammar and Vocabulary Essential Expressions "
-    "Practical Usage Pronunciation Polish dialogue key sentence pronunciation "
-    "英語 日本語 文法 語彙 発音 音読 練習"
+KNOWN_HALLUCINATIONS = (
+    "English Subtitles by the Amara.org community",
+    "Subtitles by the Amara.org community",
+)
+
+EXPECTED_SECTIONS = (
+    "Grammar and Vocabulary",
+    "Essential Expressions",
+    "Practical Usage",
+    "Pronunciation Polish",
 )
 
 
 class TranscriptionError(RuntimeError):
-    """Raised when a usable transcript cannot be produced."""
+    pass
 
 
 class StepTimer:
-    """Measure and summarize each processing step."""
-
     def __init__(self) -> None:
         self.started_at = time.perf_counter()
         self.steps: list[tuple[str, float, str]] = []
@@ -58,6 +62,12 @@ class StepTimer:
     def total_seconds(self) -> float:
         return time.perf_counter() - self.started_at
 
+    def step_seconds(self, name: str) -> float:
+        for step_name, elapsed, _result in self.steps:
+            if step_name == name:
+                return elapsed
+        return 0.0
+
     def print_summary(self, overall_result: str) -> None:
         if self.current_name is not None:
             self.finish("FAILED" if overall_result == "FAILED" else overall_result)
@@ -76,8 +86,8 @@ class StepTimer:
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Transcribe mixed Japanese-English audio locally with an "
-            "accuracy-oriented faster-whisper configuration."
+            "Transcribe mixed Japanese-English lesson audio with the turbo "
+            "model, automatic multilingual recognition, and no prompt injection."
         )
     )
     parser.add_argument(
@@ -104,8 +114,6 @@ def resolve_path(script_directory: Path, value: str) -> Path:
 
 
 def ensure_stt_virtual_environment(script_directory: Path) -> None:
-    """Relaunch with .venv-stt before importing the ML libraries."""
-
     expected_python = script_directory / ".venv-stt" / "Scripts" / "python.exe"
     current_python = Path(sys.executable).resolve()
 
@@ -146,8 +154,7 @@ def validate_environment(input_file: Path, ctranslate2: object) -> None:
     if not input_file.is_file():
         raise FileNotFoundError(f"Input file was not found: {input_file}")
 
-    cuda_device_count = ctranslate2.get_cuda_device_count()
-    if cuda_device_count < 1:
+    if ctranslate2.get_cuda_device_count() < 1:
         raise TranscriptionError("CTranslate2 cannot detect a CUDA GPU.")
 
     supported_compute_types = ctranslate2.get_supported_compute_types("cuda")
@@ -182,23 +189,40 @@ def transcribe_audio(model: object, input_file: Path) -> tuple[list[object], obj
     segments_iterator, information = model.transcribe(
         str(input_file),
         task="transcribe",
+
+        # Detect the language for each internal segment so Japanese commentary
+        # and English examples can alternate without forcing either language.
         language=None,
         multilingual=True,
+
+        # Use a moderate beam for accuracy while retaining the turbo model's
+        # substantial speed advantage over large-v3.
         beam_size=5,
         best_of=5,
         patience=1.0,
-        temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+        temperature=(0.0, 0.2, 0.4, 0.6, 0.8),
         length_penalty=1.0,
+        repetition_penalty=1.05,
+
+        # Do not inject descriptive prompt text into the transcript.
+        initial_prompt=None,
+        hotwords=None,
+
+        # Preserve short English drills around pauses.
         vad_filter=False,
+
+        # Avoid cross-window repetition loops while allowing independent
+        # Japanese-English language decisions.
         condition_on_previous_text=False,
         prompt_reset_on_temperature=0.5,
+
+        # Plain text output does not require expensive word-level alignment.
         without_timestamps=False,
-        word_timestamps=True,
-        hallucination_silence_threshold=2.0,
+        word_timestamps=False,
+
         compression_ratio_threshold=2.4,
         log_prob_threshold=-1.0,
         no_speech_threshold=0.6,
-        hotwords=HOTWORDS,
         log_progress=True,
     )
 
@@ -209,17 +233,22 @@ def transcribe_audio(model: object, input_file: Path) -> tuple[list[object], obj
     return segments, information
 
 
+def normalize_segment_text(text: str) -> str:
+    text = text.replace("\u3000", " ").strip()
+    text = re.sub(r"[ \t]+", " ", text)
+
+    for hallucination in KNOWN_HALLUCINATIONS:
+        text = text.replace(hallucination, "")
+
+    return text.strip()
+
+
 def contains_latin_text(text: str) -> bool:
     return bool(re.search(r"[A-Za-z]", text))
 
 
 def ends_sentence(text: str) -> bool:
     return bool(re.search(r"[。！？!?]$", text.strip()))
-
-
-def normalize_segment_text(text: str) -> str:
-    text = text.replace("\u3000", " ").strip()
-    return re.sub(r"[ \t]+", " ", text)
 
 
 def append_text(current: str, new_text: str) -> str:
@@ -246,13 +275,13 @@ def format_transcript(segments: Iterable[object]) -> str:
         end = float(getattr(segment, "end", start))
         gap = 0.0 if previous_end is None else max(0.0, start - previous_end)
 
-        if current_paragraph and gap >= 1.25:
+        if current_paragraph and gap >= 1.0:
             paragraphs.append(current_paragraph.strip())
             current_paragraph = ""
 
         current_paragraph = append_text(current_paragraph, text)
 
-        if ends_sentence(text) or len(current_paragraph) >= 320:
+        if ends_sentence(text) or len(current_paragraph) >= 300:
             paragraphs.append(current_paragraph.strip())
             current_paragraph = ""
 
@@ -272,22 +301,33 @@ def format_transcript(segments: Iterable[object]) -> str:
 
 def detect_decoder_loop(text: str) -> str | None:
     compact = re.sub(r"\s+", "", text)
-
     for unit_length in range(2, 17):
         pattern = re.compile(rf"(.{{{unit_length}}})\1{{11,}}")
         match = pattern.search(compact)
         if match:
             return match.group(1)
-
     return None
+
+
+def print_quality_summary(text: str) -> None:
+    latin_characters = sum(
+        1 for character in text if character.isascii() and character.isalpha()
+    )
+    found_sections = [section for section in EXPECTED_SECTIONS if section in text]
+    missing_sections = [section for section in EXPECTED_SECTIONS if section not in text]
+
+    print("TRANSCRIPT_QUALITY_SUMMARY")
+    print(f"TEXT_CHARACTERS={len(text)}")
+    print(f"LATIN_CHARACTERS={latin_characters}")
+    print(f"EXPECTED_SECTIONS_FOUND={len(found_sections)}/{len(EXPECTED_SECTIONS)}")
+    print("FOUND_SECTIONS=" + (" | ".join(found_sections) if found_sections else "NONE"))
+    print("MISSING_SECTIONS=" + (" | ".join(missing_sections) if missing_sections else "NONE"))
 
 
 def write_text_atomically(output_file: Path, text: str) -> None:
     temporary_file = output_file.with_name(output_file.name + ".part")
-
     if temporary_file.exists():
         temporary_file.unlink()
-
     temporary_file.write_text(text, encoding="utf-8")
     temporary_file.replace(output_file)
 
@@ -326,9 +366,12 @@ def run() -> int:
         print(f"COMPUTE_TYPE={COMPUTE_TYPE}")
         print("LANGUAGE=auto")
         print("MULTILINGUAL=True")
+        print("BATCHED_INFERENCE=False")
         print("VAD_FILTER=False")
+        print("WORD_TIMESTAMPS=False")
         print("BEAM_SIZE=5")
-        print("CONDITION_ON_PREVIOUS_TEXT=False")
+        print("INITIAL_PROMPT=None")
+        print("HOTWORDS=None")
         print(f"OUTPUT_CREATED_AT={created_at.isoformat()}")
         print(f"INPUT={input_file}")
         print(f"OUTPUT={output_file}")
@@ -356,14 +399,7 @@ def run() -> int:
         timer.finish()
 
         audio_seconds = float(getattr(information, "duration", 0.0))
-        transcription_seconds = next(
-            (
-                elapsed
-                for name, elapsed, _result in timer.steps
-                if name == "transcribe_audio"
-            ),
-            0.0,
-        )
+        transcription_seconds = timer.step_seconds("transcribe_audio")
         realtime_factor = (
             transcription_seconds / audio_seconds if audio_seconds > 0 else 0.0
         )
@@ -373,6 +409,7 @@ def run() -> int:
         print(f"SEGMENT_COUNT={len(segments)}")
         print(f"AUDIO_SECONDS={audio_seconds:.3f}")
         print(f"REALTIME_FACTOR={realtime_factor:.4f}")
+        print_quality_summary(transcript)
 
         overall_result = "PASS"
         return 0
@@ -386,10 +423,7 @@ def run() -> int:
     except Exception as exception:
         timer.fail_current()
         print("TRANSCRIPTION_RESULT=FAILED", file=sys.stderr)
-        print(
-            f"ERROR={type(exception).__name__}: {exception}",
-            file=sys.stderr,
-        )
+        print(f"ERROR={type(exception).__name__}: {exception}", file=sys.stderr)
         if output_file is not None:
             print(f"OUTPUT_FILE_NOT_CREATED={output_file}", file=sys.stderr)
         overall_result = "FAILED"
