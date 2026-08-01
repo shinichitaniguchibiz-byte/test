@@ -1,62 +1,116 @@
 Purpose
 
-Convert a raw transcript of an NHK English-learning program into one complete and readable plain-text lesson transcript.
+Convert a raw Japanese-English radio lesson transcript into a complete, highly readable plain-text lesson document suitable for study and later reuse.
 
-Output rules
+Input
 
-Return plain text only. Do not use Markdown, asterisks, bullets, numbered lists, tables, code fences, HTML, XML, JSON, or decorative symbols. Do not add a preface, summary, correction report, or explanation of the editing process.
+You will receive one raw transcript produced from the original audio. The transcript may contain missing punctuation, broken sentence boundaries, inaccurate capitalization, mixed Japanese and English, repeated practice sentences, unclear speaker boundaries, recognition errors, or short fragments.
 
-Content rules
+Output format
 
-Preserve the full lesson flow. Do not summarize or omit dialogue, Japanese explanations, English examples, model answers, pronunciation drills, intentional repetitions, or the closing conversation. Keep Japanese in Japanese and English in English. Do not translate between them. Do not invent missing material. Correct only clear speech-recognition errors supported by nearby context, grammar explanations, or a reliable repetition of the same sentence elsewhere in the transcript.
+Return plain text only.
+Do not use Markdown.
+Do not use asterisks, bullets, numbered lists, tables, code fences, heading marks, decorative symbols, or emphasis marks.
+Do not add an introduction, explanation of your work, summary, notes to the user, or closing comment.
+Do not place the final text inside quotation marks.
 
-Section structure
+Core preservation rules
 
-Use ordinary section headings on their own lines, with one blank line before and after each major section. Typical headings are Lesson number and title, Dialogue, Grammar and Vocabulary, Essential Expressions, Practical Usage, Pronunciation Polish, and Closing Conversation. Use only headings supported by the source, and preserve the source order.
+Preserve all substantive content from the source transcript.
+Do not summarize, shorten, omit, simplify, or paraphrase the lesson.
+Do not translate Japanese into English.
+Do not translate English into Japanese.
+Do not invent missing dialogue, explanations, examples, names, grammar points, or answers.
+Do not silently replace uncertain material with likely content from general knowledge.
+Keep repeated English sentences and pronunciation drills when the repetition is part of the lesson.
+Remove only obvious speech-recognition artifacts, duplicated decoder loops, transcription instructions accidentally inserted into the transcript, and unrelated subtitle-credit hallucinations.
+When a passage cannot be restored with reasonable confidence from the source, write [不明瞭] at that position.
 
-Paragraph structure
+Text correction rules
 
-Join fragmented recognition segments into continuous and meaningful paragraphs. Do not create a new paragraph after every recognition segment. Keep sentences together while they explain the same word, grammatical point, expression, example, or pronunciation feature. Begin a new paragraph when the topic, example, exercise stage, speaker role, or lesson section changes. Restore normal punctuation, capitalization, apostrophes, and sentence boundaries. Japanese explanations must read as continuous natural Japanese prose. English explanations must read as continuous natural English prose.
+Correct punctuation, capitalization, spacing, and obvious sentence boundaries when the intended wording is clear from the transcript.
+Correct an obvious recognition error only when the surrounding source makes the correction highly reliable.
+Keep Japanese technical terminology, grammar terminology, personal names, lesson labels, and English examples as spoken.
+Do not modernize, rewrite, improve, or reinterpret the teacher's explanation.
+Keep the order of the original audio.
 
-Dialogue structure
+Document structure
 
-Place each speaker's utterance on a separate line. Use the speaker's name when clearly known. Otherwise use Speaker A, Speaker B, Speaker C, and so on consistently within that dialogue.
+Arrange the document in the following order when those parts are present in the source:
 
-Example:
+Lesson title and lesson number
+Topic or learning objective
+Key sentence
+Opening explanation
+Dialogue
+Dialogue explanation
+Grammar and Vocabulary
+Essential Expressions
+Pronunciation or reading practice within that section
+Practical Usage
+Model answer and explanation
+Pronunciation Polish
+Closing conversation
 
-Theo: Dad's birthday is coming up next week. We should do something special.
-Jennifer: Yeah, but Mom already booked dinner, right?
+Write each section title on its own line.
+Insert one blank line before and after each section title.
+Do not create a section that is not supported by the source.
+If a section title is spoken in Japanese but clearly corresponds to a standard English section title, use the standard English title.
 
-Keep one continuous exchange together as one dialogue block, followed by one blank line. When the dialogue is repeated later, reproduce it again in that position. Do not replace it with a note saying that it was repeated.
+Dialogue formatting
 
-English examples and pronunciation practice
+Treat dialogue as a sequence of speaker turns.
+Put each speaker turn on a separate line.
+Insert one blank line between speaker turns when this improves readability.
+Use speaker names only when the source clearly identifies them.
+When names are not reliable, use 話者A：, 話者B：, 話者C： in order of first appearance.
+Do not assign a speaker label to narration or teacher explanation.
+Keep each English speaker turn as a complete, naturally flowing utterance rather than splitting it into fragments.
+Keep consecutive sentences by the same speaker in the same turn unless the source clearly indicates a new turn.
 
-Place each complete key sentence, model sentence, answer, or pronunciation target on its own line. Preserve intentional repetitions exactly. If a sentence is spoken twice, print it twice. Do not merge repeated lines. For step-by-step pronunciation practice, keep each unit on its own line in spoken order.
+English example formatting
 
-Example:
+Keep an English example sentence on its own line when it is presented for study, repetition, translation, grammar explanation, or pronunciation practice.
+Keep repeated examples as separate lines in the original order.
+Join fragments that clearly form one English sentence.
+Do not merge separate repetitions into one line.
+Do not convert spoken English into katakana.
+Do not replace an English sentence with its Japanese meaning.
 
-baked him
-baked him
+Japanese explanation formatting
 
-What if
-What if
+Join consecutive Japanese explanation fragments into coherent paragraphs based on meaning.
+Do not place every short spoken phrase on a separate line.
+Start a new paragraph when the explanation changes topic, moves to another example, introduces a new grammar point, gives a translation, begins an exercise, or changes from explanation to dialogue.
+Keep each paragraph focused on one meaningful unit and preserve the teacher's original sequence.
+Use normal Japanese punctuation and paragraph flow.
 
-What if we baked him a
-What if we baked him a
+Japanese and English mixed passages
 
-cake ourselves
-cake ourselves
+When a Japanese explanation contains an English word, phrase, or sentence, keep the English in Latin letters and connect it naturally to the Japanese sentence.
+Use spaces around English expressions only where they improve readability.
+Do not translate or transliterate the English expression.
 
-Do not convert clear English words into katakana. When a repeated target sentence has one obvious recognition error, use the most reliable version repeated elsewhere in the lesson.
+Exercise formatting
 
-Japanese explanations
-
-Connect Japanese fragments into natural sentences and paragraphs while preserving the original explanation and teaching sequence. Keep English words in Roman letters when the speaker is explicitly explaining those words. Do not replace the original explanation with a newly written explanation.
+Keep the problem statement, hints, model answer, explanation, and reading practice in their original order.
+Place the complete model answer on its own line.
+Keep repeated model answers and chunked pronunciation practice when they are part of the audio.
 
 Final verification
 
-The output must be plain text only. All source sections must remain. Repeated English must remain repeated. Dialogue speakers must be separated line by line. Explanation fragments must be joined into meaningful paragraphs. Japanese and English must not be translated into each other. No unsupported sentence may be added.
+Before returning the result, verify all of the following:
 
-Source transcript
+The output is plain text only.
+No Markdown or decorative markup remains.
+No substantive source content has been intentionally omitted.
+No unsupported content has been invented.
+Japanese remains Japanese and English remains English.
+Dialogue turns are readable and consistently separated.
+Japanese explanations are grouped into meaningful paragraphs.
+English examples and repetitions are preserved.
+The final document reads as one continuous, coherent NHK-style English lesson transcript.
 
-{{TRANSCRIPT}}
+Source transcript begins below.
+
+{{RAW_TRANSCRIPT}}
