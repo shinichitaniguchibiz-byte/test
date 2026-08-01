@@ -19,10 +19,14 @@ COMPUTE_TYPE = "float16"
 DEFAULT_INPUT_FILE = "b.m4a"
 DEFAULT_OUTPUT_DIRECTORY = "stt_test"
 DEFAULT_BATCH_SIZE = 8
-DEFAULT_CONTEXT_SECONDS = 150
+DEFAULT_CONTEXT_SECONDS = 170
 DEFAULT_CLIP_SECONDS = 28.0
-CLOSING_REPAIR_SECONDS = 90
-MAX_LANGUAGE_REPAIRS = 12
+CLIP_OVERLAP_SECONDS = 4.0
+OPENING_REPAIR_SECONDS = 190
+CLOSING_REPAIR_SECONDS = 120
+REGION_WINDOW_SECONDS = 28.0
+REGION_OVERLAP_SECONDS = 5.0
+MAX_LANGUAGE_REPAIRS = 18
 SAMPLE_RATE = 16000
 JST = timezone(timedelta(hours=9), name="JST")
 
@@ -34,9 +38,9 @@ FIXED_HOTWORDS = (
 KNOWN_HALLUCINATION_PATTERNS = (
     r"English Subtitles by the Amara\.org community",
     r"Subtitles by the Amara\.org community",
-    r"日本語の解説と英語のダイアログ.{0,100}文字起こし",
+    r"日本語の解説と英語のダイアログ.{0,120}文字起こし",
     r"同じ英語の繰り返しも残し(?:てください)?(?:[、, ]*同じ英語の繰り返しも残し(?:てください)?)*",
-    r"英語の繰り返しと英語の繰り返しも残し.{0,100}",
+    r"英語の繰り返しと英語の繰り返しも残し.{0,120}",
 )
 
 SECTION_ALIASES: dict[str, tuple[str, ...]] = {
@@ -129,7 +133,7 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Create a complete AI-handoff transcript from mixed Japanese-English "
-            "lesson audio using full-coverage batched transcription and targeted repair."
+            "lesson audio using overlapping full-coverage transcription and repair."
         )
     )
     parser.add_argument("--input", default=DEFAULT_INPUT_FILE)
@@ -201,8 +205,10 @@ def validate_environment(
         raise ValueError("--batch-size must be at least 1.")
     if context_seconds < 60:
         raise ValueError("--context-seconds must be at least 60.")
-    if not 10.0 <= clip_seconds <= 29.5:
-        raise ValueError("--clip-seconds must be between 10.0 and 29.5.")
+    if not 12.0 <= clip_seconds <= 29.5:
+        raise ValueError("--clip-seconds must be between 12.0 and 29.5.")
+    if clip_seconds <= CLIP_OVERLAP_SECONDS + 4.0:
+        raise ValueError("--clip-seconds is too short for the configured overlap.")
 
     if ctranslate2.get_cuda_device_count() < 1:
         raise TranscriptionError("CTranslate2 cannot detect a CUDA GPU.")
@@ -268,10 +274,12 @@ def to_record(segment: object, offset: float = 0.0) -> SegmentRecord:
     )
 
 
+def normalize_for_comparison(text: str) -> str:
+    return re.sub(r"[^0-9A-Za-zぁ-んァ-ヶ一-龯々]+", "", text.lower())
+
+
 def normalize_english(text: str) -> str:
-    return " ".join(
-        re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", text.lower())
-    )
+    return " ".join(re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", text.lower()))
 
 
 def english_word_count(text: str) -> int:
@@ -284,6 +292,11 @@ def japanese_character_count(text: str) -> int:
 
 def latin_character_count(text: str) -> int:
     return len(re.findall(r"[A-Za-z]", text))
+
+
+def average_logprob(records: Iterable[SegmentRecord]) -> float:
+    values = [record.avg_logprob for record in records]
+    return sum(values) / len(values) if values else -10.0
 
 
 def extract_english_candidates(text: str) -> list[str]:
@@ -353,7 +366,8 @@ def transcribe_window(
     start_seconds: float,
     end_seconds: float,
     hotwords: str,
-    language: str | None = None,
+    language: str | None,
+    beam_size: int = 5,
 ) -> list[SegmentRecord]:
     audio_duration = len(audio) / SAMPLE_RATE
     start_seconds = max(0.0, start_seconds)
@@ -370,8 +384,8 @@ def transcribe_window(
         task="transcribe",
         language=language,
         multilingual=True,
-        beam_size=5,
-        best_of=5,
+        beam_size=beam_size,
+        best_of=max(beam_size, 3),
         patience=1.0,
         temperature=(0.0, 0.2, 0.4),
         vad_filter=False,
@@ -379,10 +393,45 @@ def transcribe_window(
         without_timestamps=False,
         word_timestamps=False,
         hotwords=hotwords,
+        compression_ratio_threshold=2.4,
+        log_prob_threshold=-1.0,
+        no_speech_threshold=0.6,
         log_progress=False,
     )
 
     return [to_record(segment, start_seconds) for segment in iterator]
+
+
+def transcribe_overlapping_region(
+    model: object,
+    audio: object,
+    start_seconds: float,
+    end_seconds: float,
+    hotwords: str,
+    language: str | None,
+) -> list[SegmentRecord]:
+    records: list[SegmentRecord] = []
+    current = start_seconds
+    step = REGION_WINDOW_SECONDS - REGION_OVERLAP_SECONDS
+
+    while current < end_seconds:
+        window_end = min(end_seconds, current + REGION_WINDOW_SECONDS)
+        records.extend(
+            transcribe_window(
+                model=model,
+                audio=audio,
+                start_seconds=current,
+                end_seconds=window_end,
+                hotwords=hotwords,
+                language=language,
+                beam_size=5,
+            )
+        )
+        if window_end >= end_seconds:
+            break
+        current += step
+
+    return deduplicate_overlaps(records)
 
 
 def build_full_coverage_clips(
@@ -391,10 +440,15 @@ def build_full_coverage_clips(
 ) -> list[dict[str, float]]:
     clips: list[dict[str, float]] = []
     start = 0.0
+    step = clip_seconds - CLIP_OVERLAP_SECONDS
+
     while start < audio_seconds:
         end = min(audio_seconds, start + clip_seconds)
         clips.append({"start": start, "end": end})
-        start = end
+        if end >= audio_seconds:
+            break
+        start += step
+
     return clips
 
 
@@ -432,7 +486,7 @@ def transcribe_batched_once(
     records = [to_record(segment) for segment in iterator]
     if not records:
         raise TranscriptionError("Whisper returned no transcription segments.")
-    return records, information
+    return deduplicate_overlaps(records), information
 
 
 def transcribe_batched_with_fallback(
@@ -478,12 +532,10 @@ def replace_window(
     end: float,
 ) -> list[SegmentRecord]:
     retained = [
-        item
-        for item in base
-        if item.end <= start or item.start >= end
+        item for item in base if item.end <= start or item.start >= end
     ]
     retained.extend(replacement)
-    return sorted(retained, key=lambda item: (item.start, item.end))
+    return deduplicate_overlaps(retained)
 
 
 def deduplicate_overlaps(records: Iterable[SegmentRecord]) -> list[SegmentRecord]:
@@ -498,16 +550,18 @@ def deduplicate_overlaps(records: Iterable[SegmentRecord]) -> list[SegmentRecord
 
         previous = result[-1]
         overlap = min(previous.end, current.end) - max(previous.start, current.start)
-        if overlap <= 0.15:
+        if overlap <= 0.10:
             result.append(current)
             continue
 
-        left = normalize_english(previous.text) or previous.text
-        right = normalize_english(current.text) or current.text
-        similarity = SequenceMatcher(None, left, right).ratio()
+        left = normalize_for_comparison(previous.text)
+        right = normalize_for_comparison(current.text)
+        similarity = SequenceMatcher(None, left, right).ratio() if left and right else 0.0
 
-        if similarity >= 0.88 or left in right or right in left:
-            if current.avg_logprob > previous.avg_logprob or len(current.text) > len(previous.text):
+        if similarity >= 0.84 or (left and left in right) or (right and right in left):
+            previous_score = previous.avg_logprob + min(len(previous.text), 180) / 900.0
+            current_score = current.avg_logprob + min(len(current.text), 180) / 900.0
+            if current_score > previous_score:
                 result[-1] = current
             continue
 
@@ -535,6 +589,7 @@ def repair_probable_language_errors(
     records: list[SegmentRecord],
     repeated_phrases: list[str],
     hotwords: str,
+    audio_seconds: float,
 ) -> tuple[list[SegmentRecord], int]:
     repaired = list(records)
     repair_count = 0
@@ -555,15 +610,16 @@ def repair_probable_language_errors(
             index + 1 < len(repaired)
             and japanese_character_count(repaired[index + 1].text) >= 4
         )
+        near_end = record.start >= max(0.0, audio_seconds - 45.0)
 
         candidate = (
             japanese == 0
-            and 3 <= words <= 35
-            and duration >= 1.8
-            and (previous_has_japanese or next_has_japanese)
-            and record.avg_logprob <= -0.45
+            and 2 <= words <= 40
+            and duration >= 1.0
+            and (previous_has_japanese or next_has_japanese or near_end)
             and not resembles_known_english(text, repeated_phrases)
             and not any(section.lower() in text.lower() for section in SECTION_ALIASES)
+            and (record.avg_logprob <= -0.35 or words <= 5 or near_end)
         )
         if not candidate:
             continue
@@ -571,19 +627,24 @@ def repair_probable_language_errors(
         japanese_records = transcribe_window(
             model=model,
             audio=audio,
-            start_seconds=max(0.0, record.start - 0.5),
-            end_seconds=record.end + 0.5,
+            start_seconds=max(0.0, record.start - 0.8),
+            end_seconds=min(audio_seconds, record.end + 0.8),
             hotwords=hotwords,
             language="ja",
+            beam_size=5,
         )
         if not japanese_records:
             continue
 
         repaired_text = " ".join(item.text for item in japanese_records).strip()
         repaired_japanese = japanese_character_count(repaired_text)
-        repaired_logprob = sum(item.avg_logprob for item in japanese_records) / len(japanese_records)
+        repaired_logprob = average_logprob(japanese_records)
 
-        if repaired_japanese >= 6 and repaired_logprob >= record.avg_logprob - 0.05:
+        if (
+            repaired_japanese >= 6
+            and repaired_logprob >= record.avg_logprob - 0.15
+            and normalize_for_comparison(repaired_text) != normalize_for_comparison(text)
+        ):
             repaired[index] = SegmentRecord(
                 start=record.start,
                 end=record.end,
@@ -594,7 +655,7 @@ def repair_probable_language_errors(
             )
             repair_count += 1
 
-    return repaired, repair_count
+    return deduplicate_overlaps(repaired), repair_count
 
 
 def remove_known_hallucinations(text: str) -> tuple[str, int]:
@@ -622,7 +683,7 @@ def canonicalize_repeated_phrase(
             best_phrase = phrase
             best_ratio = ratio
 
-    if best_phrase is not None and best_ratio >= 0.80:
+    if best_phrase is not None and best_ratio >= 0.82:
         return best_phrase
     return text
 
@@ -669,7 +730,7 @@ def format_transcript(
             continue
 
         gap = 0.0 if previous_end is None else max(0.0, record.start - previous_end)
-        if gap >= 0.85 and lines and lines[-1] != "":
+        if gap >= 1.10 and lines and lines[-1] != "":
             lines.append("")
 
         lines.append(text)
@@ -806,7 +867,10 @@ def run() -> int:
         print("VAD_FILTER=False")
         print("FULL_AUDIO_CLIPS=True")
         print(f"CLIP_SECONDS={arguments.clip_seconds:.1f}")
+        print(f"CLIP_OVERLAP_SECONDS={CLIP_OVERLAP_SECONDS:.1f}")
         print(f"CONTEXT_SECONDS={arguments.context_seconds}")
+        print(f"OPENING_REPAIR_SECONDS={OPENING_REPAIR_SECONDS}")
+        print(f"CLOSING_REPAIR_SECONDS={CLOSING_REPAIR_SECONDS}")
         print("BATCH_CANDIDATES=" + ",".join(str(value) for value in batch_candidates))
         print(f"OUTPUT_CREATED_AT={created_at.isoformat()}")
         print(f"INPUT={input_file}")
@@ -823,16 +887,16 @@ def run() -> int:
         timer.finish()
 
         timer.start("learn_opening_context")
-        opening_end = min(audio_seconds, float(arguments.context_seconds))
-        opening_records = transcribe_window(
+        context_end = min(audio_seconds, float(arguments.context_seconds))
+        context_records = transcribe_overlapping_region(
             model=model,
             audio=audio,
             start_seconds=0.0,
-            end_seconds=opening_end,
+            end_seconds=context_end,
             hotwords=FIXED_HOTWORDS,
             language=None,
         )
-        repeated_phrases = extract_repeated_phrases(opening_records)
+        repeated_phrases = extract_repeated_phrases(context_records)
         hotwords = build_hotwords(repeated_phrases)
         timer.finish()
 
@@ -854,7 +918,16 @@ def run() -> int:
         )
         timer.finish()
 
-        timer.start("replace_opening_with_accurate_pass")
+        timer.start("repair_opening_region")
+        opening_end = min(audio_seconds, float(OPENING_REPAIR_SECONDS))
+        opening_records = transcribe_overlapping_region(
+            model=model,
+            audio=audio,
+            start_seconds=0.0,
+            end_seconds=opening_end,
+            hotwords=hotwords,
+            language=None,
+        )
         records = replace_window(
             base=records,
             replacement=opening_records,
@@ -863,15 +936,15 @@ def run() -> int:
         )
         timer.finish()
 
-        timer.start("replace_closing_with_accurate_pass")
+        timer.start("repair_closing_region")
         closing_start = max(opening_end, audio_seconds - CLOSING_REPAIR_SECONDS)
-        closing_records = transcribe_window(
+        closing_records = transcribe_overlapping_region(
             model=model,
             audio=audio,
             start_seconds=closing_start,
             end_seconds=audio_seconds,
             hotwords=hotwords,
-            language=None,
+            language="ja",
         )
         records = replace_window(
             base=records,
@@ -879,7 +952,6 @@ def run() -> int:
             start=closing_start,
             end=audio_seconds,
         )
-        records = deduplicate_overlaps(records)
         timer.finish()
 
         timer.start("repair_probable_language_errors")
@@ -889,6 +961,7 @@ def run() -> int:
             records=records,
             repeated_phrases=repeated_phrases,
             hotwords=hotwords,
+            audio_seconds=audio_seconds,
         )
         timer.finish()
 
