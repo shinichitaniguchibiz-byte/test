@@ -5,14 +5,13 @@ import gc
 import importlib.metadata
 import json
 import logging
-import math
 import os
 import re
 import subprocess
 import sys
 import time
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -24,13 +23,11 @@ COMPUTE_TYPE = "float16"
 SAMPLE_RATE = 16000
 DEFAULT_INPUT_FILE = "b.m4a"
 DEFAULT_OUTPUT_DIRECTORY = "stt_test"
-DEFAULT_MAX_COMPLEMENTARY_WINDOWS = 8
+DEFAULT_BATCH_SIZE = 8
+DEFAULT_OPENING_AUDIT_SECONDS = 210.0
 DEFAULT_MAX_REPAIR_WINDOWS = 1
-PRIMARY_WINDOW_SECONDS = 29.5
-PRIMARY_WINDOW_OVERLAP_SECONDS = 2.5
+OPENING_AUDIT_PADDING_SECONDS = 2.5
 REPAIR_PADDING_SECONDS = 4.0
-MIN_REPAIR_COVERAGE_RATIO = 0.92
-MAX_REPAIR_COVERAGE_RATIO = 1.55
 JST = timezone(timedelta(hours=9), name="JST")
 
 RUNTIME_PACKAGES = (
@@ -60,31 +57,26 @@ MODEL_REQUIRED_FILES = (
 )
 
 TRANSCRIPTION_GLOSSARY = (
-    "Miller, Theo, Jennifer, ミラー, セオ, ジェニファー, "
     "Grammar and Vocabulary, Essential Expressions, Practical Usage, "
-    "Pronunciation Polish, 仮定法, 目的格, 不定詞, 意味上の主語, "
-    "現在進行形, 説明型オーバーラッピング, 接近のニュアンス, "
-    "控えめな提案, come out, not exactly, what if, for us, be at this, "
-    "Suppose, Imagine, weakened H sound, linking"
+    "Pronunciation Polish, lesson, dialogue, key sentence, example, "
+    "pronunciation, 仮定法, 目的格, 不定詞, 意味上の主語, 現在進行形, "
+    "説明型オーバーラッピング, come out, not exactly, what if, for us"
 )
 
-SECTION_ALIASES: dict[str, tuple[str, ...]] = {
+STRICT_SECTION_ALIASES: dict[str, tuple[str, ...]] = {
     "Grammar and Vocabulary": (
         "Grammar and Vocabulary",
         "文法と語彙",
     ),
     "Essential Expressions": (
         "Essential Expressions",
-        "重要表現",
         "エッセンシャル・エクスプレッションズ",
+        "重要表現",
     ),
     "Practical Usage": (
         "Practical Usage",
-        "Practical",
         "プラクティカル・ユーセージ",
         "プラクティカルユーセージ",
-        "プラクティカル",
-        "ユーセージ",
     ),
     "Pronunciation Polish": (
         "Pronunciation Polish",
@@ -92,21 +84,6 @@ SECTION_ALIASES: dict[str, tuple[str, ...]] = {
         "発音練習",
     ),
 }
-
-STRONG_REPAIR_REASONS = {
-    "low_logprob",
-    "high_compression",
-    "replacement_character",
-    "decoder_loop",
-    "low_text_rate",
-}
-
-DISCOURSE_PREFIX_PATTERN = re.compile(
-    r"^(?:one\s+more\s+time|more\s+time|full\s+sentence|"
-    r"today'?s\s+sentence\s+is|great\s+work|let'?s\s+go|"
-    r"okay|ok|deal)[\s,.:;!?-]*",
-    flags=re.IGNORECASE,
-)
 
 
 class TranscriptionError(RuntimeError):
@@ -121,23 +98,6 @@ class OutputPaths:
     metrics: Path
 
 
-@dataclass(frozen=True)
-class PrimaryWindow:
-    index: int
-    start: float
-    end: float
-    keep_start: float
-    keep_end: float
-
-
-@dataclass
-class WordRecord:
-    start: float
-    end: float
-    text: str
-    probability: float
-
-
 @dataclass
 class SegmentRecord:
     start: float
@@ -147,39 +107,23 @@ class SegmentRecord:
     compression_ratio: float
     no_speech_prob: float
     source: str
-    detected_language: str
-    words: list[WordRecord] = field(default_factory=list)
 
 
 @dataclass
-class WindowResult:
-    window: PrimaryWindow
-    detected_language: str
-    segments: list[SegmentRecord]
-
-
-@dataclass
-class ComplementaryWindow:
-    window: PrimaryWindow
-    original_language: str
-    forced_language: str
-    priority: float
-    reasons: tuple[str, ...]
-
-
-@dataclass
-class ComplementaryDecision:
-    window_index: int
-    forced_language: str
-    candidate_text: str
+class OpeningAuditDecision:
     accepted: bool
     reason: str
-    anchor_similarity: float
-    section_match: bool
-    average_word_probability: float
-    avg_logprob: float
-    start: float
-    end: float
+    core_end: float
+    baseline_text: str
+    audit_text: str
+    coverage_ratio: float
+    token_recall: float
+    baseline_score: float
+    audit_score: float
+    baseline_anchor_hits: int
+    audit_anchor_hits: int
+    baseline_section_hits: int
+    audit_section_hits: int
 
 
 @dataclass
@@ -198,7 +142,6 @@ class RepairWindow:
     core_end: float
     slice_start: float
     slice_end: float
-    severity: float
     reasons: tuple[str, ...]
     segment_indexes: tuple[int, ...]
 
@@ -208,18 +151,14 @@ class RepairDecision:
     window_index: int
     accepted: bool
     reason: str
-    baseline_score: float
-    repair_score: float
-    coverage_ratio: float
-    token_recall: float
-    baseline_suspicious_events: int
-    repair_suspicious_events: int
-    baseline_section_hits: int
-    repair_section_hits: int
-    baseline_anchor_hits: int
-    repair_anchor_hits: int
     baseline_text: str
     repair_text: str
+    coverage_ratio: float
+    token_recall: float
+    baseline_score: float
+    repair_score: float
+    baseline_suspicious_events: int
+    repair_suspicious_events: int
     core_start: float
     core_end: float
     slice_start: float
@@ -270,7 +209,6 @@ class StepTimer:
     def print_summary(self, overall_result: str) -> None:
         if self.current_name is not None:
             self.finish("FAILED" if overall_result == "FAILED" else overall_result)
-
         print()
         print("PROCESS_TIME_SUMMARY")
         for index, step in enumerate(self.steps, start=1):
@@ -333,17 +271,18 @@ class TeeContext:
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Create a faithful full transcript using one full-coverage Turbo pass, "
-            "a small complementary-language Turbo pass, and rare guarded large-v3 repairs."
+            "Create a faithful full transcript using a fast batched Turbo pass, "
+            "one guarded opening audit, and rare large-v3 anomaly repair."
         )
     )
     parser.add_argument("--input", default=DEFAULT_INPUT_FILE)
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIRECTORY)
     parser.add_argument("--language", default="auto")
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument(
-        "--max-complementary-windows",
-        type=int,
-        default=DEFAULT_MAX_COMPLEMENTARY_WINDOWS,
+        "--opening-audit-seconds",
+        type=float,
+        default=DEFAULT_OPENING_AUDIT_SECONDS,
     )
     parser.add_argument(
         "--max-repair-windows",
@@ -374,12 +313,10 @@ def make_output_paths(output_directory: Path, run_id: str) -> OutputPaths:
 def ensure_stt_virtual_environment(script_directory: Path) -> None:
     expected_python = script_directory / ".venv-stt" / "Scripts" / "python.exe"
     current_python = Path(sys.executable).resolve()
-
     if not expected_python.is_file():
         raise FileNotFoundError(
             f"The transcription virtual environment was not found: {expected_python}"
         )
-
     if current_python == expected_python.resolve():
         return
 
@@ -394,7 +331,6 @@ def ensure_stt_virtual_environment(script_directory: Path) -> None:
     print("PYTHON_ENVIRONMENT_SWITCH")
     print(f"FROM={current_python}")
     print(f"TO={expected_python}")
-
     completed = subprocess.run(
         [str(expected_python), str(Path(__file__).resolve()), *sys.argv[1:]],
         cwd=str(script_directory),
@@ -442,7 +378,6 @@ def check_and_update_runtime_packages(script_directory: Path) -> dict[str, objec
         "SOFTWARE_VERSIONS_BEFORE="
         + json.dumps(before, ensure_ascii=False, sort_keys=True)
     )
-
     completed = run_command(
         [
             sys.executable,
@@ -466,14 +401,12 @@ def check_and_update_runtime_packages(script_directory: Path) -> dict[str, objec
             "The latest transcription software could not be checked or installed. "
             + details
         )
-
     after = installed_package_versions()
     changed = {
         package: {"before": before.get(package), "after": after.get(package)}
         for package in RUNTIME_PACKAGES
         if before.get(package) != after.get(package)
     }
-
     print(
         "SOFTWARE_VERSIONS_AFTER="
         + json.dumps(after, ensure_ascii=False, sort_keys=True)
@@ -508,7 +441,6 @@ def get_model_revision(repository: str) -> str:
             f"The latest model revision could not be checked: {repository}. "
             f"{type(exception).__name__}: {exception}"
         ) from exception
-
     revision = str(information.sha or "").strip()
     if not revision:
         raise TranscriptionError(
@@ -567,7 +499,6 @@ def check_model(
                 f"The latest model files could not be downloaded: {repository}. "
                 f"{type(exception).__name__}: {exception}"
             ) from exception
-
         if not model_files_are_complete(model_directory):
             missing = [
                 name
@@ -608,58 +539,26 @@ def ensure_repair_model(
 
 def validate_environment(
     input_file: Path,
-    max_complementary_windows: int,
+    batch_size: int,
+    opening_audit_seconds: float,
     max_repair_windows: int,
     ctranslate2: object,
 ) -> None:
     if not input_file.is_file():
         raise FileNotFoundError(f"Input file was not found: {input_file}")
-    if max_complementary_windows < 0 or max_complementary_windows > 16:
-        raise ValueError("--max-complementary-windows must be between 0 and 16.")
-    if max_repair_windows < 0 or max_repair_windows > 6:
-        raise ValueError("--max-repair-windows must be between 0 and 6.")
+    if batch_size < 1 or batch_size > 32:
+        raise ValueError("--batch-size must be between 1 and 32.")
+    if opening_audit_seconds < 0 or opening_audit_seconds > 600:
+        raise ValueError("--opening-audit-seconds must be between 0 and 600.")
+    if max_repair_windows < 0 or max_repair_windows > 4:
+        raise ValueError("--max-repair-windows must be between 0 and 4.")
     if ctranslate2.get_cuda_device_count() < 1:
         raise TranscriptionError("CTranslate2 cannot detect a CUDA GPU.")
-
     supported = ctranslate2.get_supported_compute_types("cuda")
     if COMPUTE_TYPE not in supported:
         raise TranscriptionError(
             f"{COMPUTE_TYPE} is not supported. Supported types: {sorted(supported)}"
         )
-
-
-def build_primary_windows(audio_seconds: float) -> list[PrimaryWindow]:
-    if audio_seconds <= 0:
-        raise TranscriptionError("The decoded audio has zero duration.")
-
-    step = PRIMARY_WINDOW_SECONDS - PRIMARY_WINDOW_OVERLAP_SECONDS
-    raw: list[tuple[float, float]] = []
-    start = 0.0
-    while start < audio_seconds:
-        end = min(audio_seconds, start + PRIMARY_WINDOW_SECONDS)
-        raw.append((start, end))
-        if end >= audio_seconds:
-            break
-        start += step
-
-    windows: list[PrimaryWindow] = []
-    for index, (start, end) in enumerate(raw):
-        keep_start = 0.0 if index == 0 else (start + raw[index - 1][1]) / 2.0
-        keep_end = (
-            audio_seconds
-            if index == len(raw) - 1
-            else (end + raw[index + 1][0]) / 2.0
-        )
-        windows.append(
-            PrimaryWindow(
-                index=index,
-                start=start,
-                end=end,
-                keep_start=keep_start,
-                keep_end=keep_end,
-            )
-        )
-    return windows
 
 
 def load_model(WhisperModel: object, model_path: Path, source: str) -> object:
@@ -684,133 +583,26 @@ def clean_text(text: str) -> str:
     return re.sub(r"[ \t]+", " ", text).strip()
 
 
-def word_midpoint(word: WordRecord) -> float:
-    return (word.start + word.end) / 2.0
-
-
-def build_segment_from_words(
-    original: object,
-    words: list[WordRecord],
+def segment_from_object(
+    segment: object,
+    *,
     source: str,
-    detected_language: str,
+    offset: float = 0.0,
 ) -> SegmentRecord | None:
-    if not words:
-        return None
-    text = clean_text("".join(word.text for word in words))
+    text = clean_text(str(getattr(segment, "text", "")))
     if not text:
         return None
+    start = max(0.0, float(getattr(segment, "start", 0.0)) + offset)
+    end = max(start, float(getattr(segment, "end", start)) + offset)
     return SegmentRecord(
-        start=words[0].start,
-        end=words[-1].end,
+        start=start,
+        end=end,
         text=text,
-        avg_logprob=float(getattr(original, "avg_logprob", -1.0)),
-        compression_ratio=float(getattr(original, "compression_ratio", 0.0)),
-        no_speech_prob=float(getattr(original, "no_speech_prob", 0.0)),
+        avg_logprob=float(getattr(segment, "avg_logprob", -1.0)),
+        compression_ratio=float(getattr(segment, "compression_ratio", 0.0)),
+        no_speech_prob=float(getattr(segment, "no_speech_prob", 0.0)),
         source=source,
-        detected_language=detected_language,
-        words=words,
     )
-
-
-def transcribe_window(
-    model: object,
-    audio: object,
-    window: PrimaryWindow,
-    language: str | None,
-    source: str,
-) -> WindowResult:
-    start_sample = int(window.start * SAMPLE_RATE)
-    end_sample = int(window.end * SAMPLE_RATE)
-    audio_slice = audio[start_sample:end_sample]
-
-    iterator, information = model.transcribe(
-        audio_slice,
-        task="transcribe",
-        language=language,
-        multilingual=True,
-        beam_size=3,
-        best_of=3,
-        patience=1.0,
-        temperature=(0.0, 0.2),
-        vad_filter=False,
-        condition_on_previous_text=False,
-        without_timestamps=False,
-        word_timestamps=True,
-        hotwords=TRANSCRIPTION_GLOSSARY,
-        compression_ratio_threshold=2.4,
-        log_prob_threshold=-1.0,
-        no_speech_threshold=0.6,
-        log_progress=False,
-    )
-
-    detected_language = str(getattr(information, "language", language or "unknown"))
-    records: list[SegmentRecord] = []
-    for segment in iterator:
-        absolute_words: list[WordRecord] = []
-        for word in getattr(segment, "words", []) or []:
-            word_start = float(getattr(word, "start", 0.0) or 0.0) + window.start
-            word_end = float(getattr(word, "end", 0.0) or 0.0) + window.start
-            absolute_word = WordRecord(
-                start=max(0.0, word_start),
-                end=max(0.0, word_end),
-                text=str(getattr(word, "word", "")),
-                probability=float(getattr(word, "probability", 0.0) or 0.0),
-            )
-            midpoint = word_midpoint(absolute_word)
-            if midpoint < window.keep_start:
-                continue
-            if midpoint >= window.keep_end and window.index >= 0:
-                continue
-            absolute_words.append(absolute_word)
-
-        record = build_segment_from_words(
-            segment,
-            absolute_words,
-            source,
-            detected_language,
-        )
-        if record is not None:
-            records.append(record)
-
-    return WindowResult(
-        window=window,
-        detected_language=detected_language,
-        segments=records,
-    )
-
-
-def transcribe_primary_full_coverage(
-    model: object,
-    audio: object,
-    windows: list[PrimaryWindow],
-    language: str | None,
-) -> tuple[list[SegmentRecord], list[WindowResult], Counter[str]]:
-    records: list[SegmentRecord] = []
-    results: list[WindowResult] = []
-    language_counts: Counter[str] = Counter()
-
-    for position, window in enumerate(windows, start=1):
-        print(
-            f"PRIMARY_WINDOW={position}/{len(windows)} "
-            f"INDEX={window.index:03d} START={window.start:.3f} "
-            f"END={window.end:.3f} KEEP_START={window.keep_start:.3f} "
-            f"KEEP_END={window.keep_end:.3f}"
-        )
-        result = transcribe_window(
-            model,
-            audio,
-            window,
-            language,
-            "turbo_auto",
-        )
-        records.extend(result.segments)
-        results.append(result)
-        language_counts[result.detected_language] += 1
-
-    records.sort(key=lambda item: (item.start, item.end))
-    if not records:
-        raise TranscriptionError("The primary model returned no transcript segments.")
-    return records, results, language_counts
 
 
 def normalize_for_comparison(text: str) -> str:
@@ -829,35 +621,6 @@ def latin_character_count(text: str) -> int:
     return len(re.findall(r"[A-Za-z]", text))
 
 
-def count_unicode_scripts(text: str) -> dict[str, int]:
-    counts = {
-        "latin": 0,
-        "japanese_kana": 0,
-        "cjk": 0,
-        "hangul": 0,
-        "cyrillic": 0,
-        "arabic": 0,
-        "devanagari": 0,
-    }
-    for character in text:
-        code = ord(character)
-        if 0x0041 <= code <= 0x024F:
-            counts["latin"] += 1
-        elif 0x3040 <= code <= 0x30FF:
-            counts["japanese_kana"] += 1
-        elif 0x3400 <= code <= 0x9FFF:
-            counts["cjk"] += 1
-        elif 0xAC00 <= code <= 0xD7AF:
-            counts["hangul"] += 1
-        elif 0x0400 <= code <= 0x052F:
-            counts["cyrillic"] += 1
-        elif 0x0600 <= code <= 0x06FF:
-            counts["arabic"] += 1
-        elif 0x0900 <= code <= 0x097F:
-            counts["devanagari"] += 1
-    return counts
-
-
 def detect_decoder_loop(text: str) -> bool:
     compact = re.sub(r"\s+", "", text)
     for unit_length in range(2, 17):
@@ -866,68 +629,24 @@ def detect_decoder_loop(text: str) -> bool:
     return False
 
 
-def section_hits(text: str) -> dict[str, bool]:
+def strict_section_hits(text: str) -> dict[str, bool]:
     lower_text = text.lower()
     return {
         canonical: any(alias.lower() in lower_text for alias in aliases)
-        for canonical, aliases in SECTION_ALIASES.items()
+        for canonical, aliases in STRICT_SECTION_ALIASES.items()
     }
-
-
-def contains_section_reference(text: str) -> bool:
-    lower_text = text.lower()
-    for canonical, aliases in SECTION_ALIASES.items():
-        if canonical.lower() in lower_text:
-            return True
-        if any(alias.lower() in lower_text for alias in aliases):
-            return True
-    return False
-
-
-def strip_discourse_prefix(text: str) -> str:
-    result = clean_text(text)
-    previous = None
-    while result and result != previous:
-        previous = result
-        result = DISCOURSE_PREFIX_PATTERN.sub("", result).strip()
-    return result
 
 
 def split_english_candidates(text: str) -> list[str]:
     candidates: list[str] = []
     for piece in re.split(r"(?<=[.!?])\s+|[\r\n]+", text):
-        piece = strip_discourse_prefix(piece)
-        word_count = len(english_words(piece))
-        if 5 <= word_count <= 28 and latin_character_count(piece) >= 18:
+        piece = clean_text(piece)
+        if 5 <= len(english_words(piece)) <= 30 and latin_character_count(piece) >= 18:
             candidates.append(piece)
     return candidates
 
 
-def cluster_representative(cluster: list[str]) -> str:
-    if len(cluster) == 1:
-        return cluster[0]
-    best_text = cluster[0]
-    best_score = -1.0
-    for candidate in cluster:
-        normalized_candidate = normalize_for_comparison(candidate)
-        similarities = [
-            SequenceMatcher(
-                None,
-                normalized_candidate,
-                normalize_for_comparison(other),
-            ).ratio()
-            for other in cluster
-            if other != candidate
-        ]
-        score = sum(similarities) / max(len(similarities), 1)
-        score -= len(candidate) / 10000.0
-        if score > best_score:
-            best_score = score
-            best_text = candidate
-    return strip_discourse_prefix(best_text)
-
-
-def discover_repeated_english_anchors(segments: Iterable[SegmentRecord]) -> list[str]:
+def discover_repeated_anchors(segments: Iterable[SegmentRecord]) -> list[str]:
     candidates: list[str] = []
     for segment in segments:
         candidates.extend(split_english_candidates(segment.text))
@@ -946,20 +665,19 @@ def discover_repeated_english_anchors(segments: Iterable[SegmentRecord]) -> list
             if ratio > best_ratio:
                 best_index = index
                 best_ratio = ratio
-        if best_index is not None and best_ratio >= 0.80:
+        if best_index is not None and best_ratio >= 0.82:
             clusters[best_index].append(candidate)
         else:
             clusters.append([candidate])
 
-    anchors: list[tuple[int, str]] = []
+    results: list[tuple[int, str]] = []
     for cluster in clusters:
         if len(cluster) < 2:
             continue
-        representative = cluster_representative(cluster)
-        if len(english_words(representative)) >= 5:
-            anchors.append((len(cluster), representative))
-    anchors.sort(key=lambda item: (-item[0], -len(item[1])))
-    return [text for _count, text in anchors[:12]]
+        representative = min(cluster, key=lambda value: len(value))
+        results.append((len(cluster), representative))
+    results.sort(key=lambda item: (-item[0], -len(item[1])))
+    return [text for _count, text in results[:10]]
 
 
 def anchor_exact_hits(text: str, anchors: Iterable[str]) -> int:
@@ -971,145 +689,15 @@ def anchor_exact_hits(text: str, anchors: Iterable[str]) -> int:
     )
 
 
-def candidate_anchor_similarity(text: str, anchors: Iterable[str]) -> float:
-    pieces = split_english_candidates(text)
-    if not pieces:
-        pieces = [strip_discourse_prefix(text)]
-    best = 0.0
-    for piece in pieces:
-        normalized_piece = normalize_for_comparison(piece)
-        if not normalized_piece:
-            continue
-        for anchor in anchors:
-            normalized_anchor = normalize_for_comparison(anchor)
-            if not normalized_anchor:
-                continue
-            ratio = SequenceMatcher(None, normalized_piece, normalized_anchor).ratio()
-            if normalized_piece in normalized_anchor or normalized_anchor in normalized_piece:
-                ratio = max(ratio, 0.90)
-            best = max(best, ratio)
-    return best
-
-
-def script_profile(text: str) -> tuple[int, int]:
-    return japanese_character_count(text), latin_character_count(text)
-
-
-def segment_average_word_probability(segment: SegmentRecord) -> float:
-    probabilities = [word.probability for word in segment.words]
-    return sum(probabilities) / len(probabilities) if probabilities else 0.0
-
-
-def language_fit(text: str, language: str) -> bool:
-    japanese, latin = script_profile(text)
-    if language == "en":
-        return latin >= 12 and latin >= max(12, japanese * 2)
-    if language == "ja":
-        return japanese >= 8 and japanese >= max(8, latin // 2)
-    return len(text) >= 12
-
-
-def window_text(result: WindowResult) -> str:
-    return clean_text(" ".join(segment.text for segment in result.segments))
-
-
-def select_complementary_windows(
-    results: list[WindowResult],
-    language_counts: Counter[str],
-    max_windows: int,
-) -> tuple[list[ComplementaryWindow], list[str]]:
-    if max_windows == 0:
-        return [], []
-
-    dominant_languages = [
-        language
-        for language, _count in language_counts.most_common()
-        if language not in {"", "unknown"}
-    ][:2]
-    if len(dominant_languages) < 2:
-        return [], dominant_languages
-
-    selected: list[ComplementaryWindow] = []
-    for index, result in enumerate(results):
-        reasons: list[str] = []
-        priority = 0.0
-        text = window_text(result)
-        japanese, latin = script_profile(text)
-
-        previous_language = results[index - 1].detected_language if index > 0 else None
-        next_language = (
-            results[index + 1].detected_language
-            if index + 1 < len(results)
-            else None
-        )
-        if previous_language and previous_language != result.detected_language:
-            reasons.append("previous_language_boundary")
-            priority += 2.0
-        if next_language and next_language != result.detected_language:
-            reasons.append("next_language_boundary")
-            priority += 2.0
-        if japanese >= 6 and latin >= 12:
-            reasons.append("mixed_script_window")
-            priority += 2.5
-        duration = max(result.window.keep_end - result.window.keep_start, 0.1)
-        if len(text) / duration < 2.0:
-            reasons.append("low_text_rate")
-            priority += 1.5
-        if result.window.start < 190.0 and result.detected_language == "ja" and "en" in dominant_languages:
-            reasons.append("early_target_language_recovery")
-            priority += 1.6
-        if "practical" in text.lower() and "usage" not in text.lower():
-            reasons.append("partial_section_heading")
-            priority += 2.0
-
-        if not reasons:
-            continue
-        forced_language = (
-            dominant_languages[1]
-            if result.detected_language == dominant_languages[0]
-            else dominant_languages[0]
-        )
-        if forced_language == result.detected_language:
-            continue
-        selected.append(
-            ComplementaryWindow(
-                window=result.window,
-                original_language=result.detected_language,
-                forced_language=forced_language,
-                priority=priority,
-                reasons=tuple(sorted(set(reasons))),
-            )
-        )
-
-    selected.sort(key=lambda item: (-item.priority, item.window.start))
-    selected = selected[:max_windows]
-    selected.sort(key=lambda item: item.window.start)
-    return selected, dominant_languages
-
-
-def time_overlap(left: SegmentRecord, right: SegmentRecord) -> float:
-    return max(0.0, min(left.end, right.end) - max(left.start, right.start))
-
-
-def same_script_family(left: SegmentRecord, right: SegmentRecord) -> bool:
-    left_japanese, left_latin = script_profile(left.text)
-    right_japanese, right_latin = script_profile(right.text)
-    left_family = "ja" if left_japanese > left_latin else "latin"
-    right_family = "ja" if right_japanese > right_latin else "latin"
-    return left_family == right_family
-
-
-def deduplicate_overlapping_segments(
-    segments: Iterable[SegmentRecord],
-) -> list[SegmentRecord]:
+def deduplicate_segments(segments: Iterable[SegmentRecord]) -> list[SegmentRecord]:
     result: list[SegmentRecord] = []
     for candidate in sorted(segments, key=lambda item: (item.start, item.end)):
         duplicate_index: int | None = None
-        for index in range(len(result) - 1, max(-1, len(result) - 6), -1):
+        for index in range(len(result) - 1, max(-1, len(result) - 5), -1):
             previous = result[index]
             if candidate.start - previous.end > 1.0:
                 break
-            overlap = time_overlap(previous, candidate)
+            overlap = min(previous.end, candidate.end) - max(previous.start, candidate.start)
             if overlap <= 0.05:
                 continue
             left = normalize_for_comparison(previous.text)
@@ -1117,7 +705,7 @@ def deduplicate_overlapping_segments(
             if not left or not right:
                 continue
             similarity = SequenceMatcher(None, left, right).ratio()
-            if similarity >= 0.88 or left in right or right in left:
+            if similarity >= 0.90 or left in right or right in left:
                 duplicate_index = index
                 break
         if duplicate_index is None:
@@ -1131,177 +719,309 @@ def deduplicate_overlapping_segments(
     return sorted(result, key=lambda item: (item.start, item.end))
 
 
-def has_nearby_language_support(
-    candidate: SegmentRecord,
-    baseline: list[SegmentRecord],
-    language: str,
-) -> bool:
-    for segment in baseline:
-        if segment.end < candidate.start - 6.0:
+def format_transcript(segments: Iterable[SegmentRecord]) -> str:
+    lines: list[str] = []
+    previous_end: float | None = None
+    for segment in sorted(segments, key=lambda item: (item.start, item.end)):
+        text = clean_text(segment.text)
+        if not text:
             continue
-        if segment.start > candidate.end + 6.0:
-            break
-        if language_fit(segment.text, language):
-            return True
-    return False
+        if previous_end is not None and segment.start - previous_end >= 1.1:
+            if lines and lines[-1] != "":
+                lines.append("")
+        lines.append(text)
+        previous_end = segment.end
+
+    compact: list[str] = []
+    for line in lines:
+        if line == "" and compact and compact[-1] == "":
+            continue
+        compact.append(line)
+    transcript = "\n".join(compact).strip()
+    if not transcript:
+        raise TranscriptionError("The final transcript is empty.")
+    return transcript + "\n"
 
 
-def merge_complementary_candidate(
-    baseline: list[SegmentRecord],
-    candidate: SegmentRecord,
-) -> tuple[list[SegmentRecord], bool, str]:
-    overlapping_same_script: list[tuple[int, SegmentRecord]] = []
-    for index, existing in enumerate(baseline):
-        if time_overlap(existing, candidate) <= 0.05:
-            continue
-        if same_script_family(existing, candidate):
-            overlapping_same_script.append((index, existing))
-
-    candidate_normalized = normalize_for_comparison(candidate.text)
-    indexes_to_remove: set[int] = set()
-    for index, existing in overlapping_same_script:
-        existing_normalized = normalize_for_comparison(existing.text)
-        if not candidate_normalized or not existing_normalized:
-            continue
-        similarity = SequenceMatcher(
-            None,
-            candidate_normalized,
-            existing_normalized,
-        ).ratio()
-        if existing_normalized in candidate_normalized and len(candidate.text) >= len(existing.text) * 1.15:
-            indexes_to_remove.add(index)
-            continue
-        if candidate_normalized in existing_normalized or similarity >= 0.65:
-            return baseline, False, "same_language_content_already_present"
-        return baseline, False, "conflicting_same_language_overlap"
-
-    merged = [
-        segment
-        for index, segment in enumerate(baseline)
-        if index not in indexes_to_remove
-    ]
-    merged.append(candidate)
-    merged = deduplicate_overlapping_segments(merged)
-    return merged, True, (
-        "longer_candidate_replaced_partial_segment"
-        if indexes_to_remove
-        else "complementary_content_added"
+def is_cuda_memory_error(exception: BaseException) -> bool:
+    message = str(exception).lower()
+    return any(
+        term in message
+        for term in (
+            "out of memory",
+            "cuda_error_out_of_memory",
+            "failed to allocate",
+            "memory allocation",
+        )
     )
 
 
-def run_complementary_recovery(
+def batch_candidates(initial: int) -> list[int]:
+    values: list[int] = []
+    current = initial
+    while current >= 1:
+        if current not in values:
+            values.append(current)
+        if current == 1:
+            break
+        current = max(1, current // 2)
+    return values
+
+
+def transcribe_batched_baseline(
+    model: object,
+    BatchedInferencePipeline: object,
+    audio: object,
+    language: str | None,
+    requested_batch_size: int,
+) -> tuple[list[SegmentRecord], int, str]:
+    pipeline = BatchedInferencePipeline(model=model)
+    last_exception: BaseException | None = None
+
+    for batch_size in batch_candidates(requested_batch_size):
+        print("PRIMARY_TRANSCRIPTION_ATTEMPT")
+        print(f"BATCH_SIZE={batch_size}")
+        try:
+            iterator, information = pipeline.transcribe(
+                audio,
+                task="transcribe",
+                language=language,
+                multilingual=True,
+                beam_size=5,
+                best_of=5,
+                patience=1.0,
+                temperature=0.0,
+                vad_filter=True,
+                vad_parameters={
+                    "min_silence_duration_ms": 180,
+                    "speech_pad_ms": 500,
+                    "min_speech_duration_ms": 80,
+                },
+                condition_on_previous_text=False,
+                without_timestamps=False,
+                word_timestamps=False,
+                hotwords=TRANSCRIPTION_GLOSSARY,
+                batch_size=batch_size,
+                log_progress=True,
+            )
+            records = [
+                record
+                for segment in iterator
+                if (record := segment_from_object(segment, source="turbo_batched"))
+                is not None
+            ]
+            if not records:
+                raise TranscriptionError("The primary model returned no transcript segments.")
+            detected_language = str(getattr(information, "language", language or "unknown"))
+            return deduplicate_segments(records), batch_size, detected_language
+        except Exception as exception:
+            last_exception = exception
+            if not is_cuda_memory_error(exception):
+                raise
+            print(f"GPU_MEMORY_RETRY=BATCH_SIZE_{batch_size}")
+            gc.collect()
+
+    raise TranscriptionError(
+        "The primary transcription failed at every batch size."
+    ) from last_exception
+
+
+def transcribe_slice(
     model: object,
     audio: object,
-    baseline_segments: list[SegmentRecord],
-    selected_windows: list[ComplementaryWindow],
-    anchors: list[str],
-) -> tuple[list[SegmentRecord], list[ComplementaryDecision]]:
-    final_segments = list(baseline_segments)
-    decisions: list[ComplementaryDecision] = []
-
-    for position, selected in enumerate(selected_windows, start=1):
-        print(
-            f"COMPLEMENTARY_WINDOW={position}/{len(selected_windows)} "
-            f"INDEX={selected.window.index:03d} "
-            f"ORIGINAL_LANGUAGE={selected.original_language} "
-            f"FORCED_LANGUAGE={selected.forced_language} "
-            f"REASONS={','.join(selected.reasons)}"
+    *,
+    start: float,
+    end: float,
+    language: str | None,
+    source: str,
+    beam_size: int,
+) -> list[SegmentRecord]:
+    start_sample = int(max(0.0, start) * SAMPLE_RATE)
+    end_sample = int(max(start, end) * SAMPLE_RATE)
+    audio_slice = audio[start_sample:end_sample]
+    iterator, _information = model.transcribe(
+        audio_slice,
+        task="transcribe",
+        language=language,
+        multilingual=True,
+        beam_size=beam_size,
+        best_of=beam_size,
+        patience=1.0,
+        temperature=(0.0, 0.2, 0.4),
+        vad_filter=False,
+        condition_on_previous_text=False,
+        without_timestamps=False,
+        word_timestamps=False,
+        hotwords=TRANSCRIPTION_GLOSSARY,
+        compression_ratio_threshold=2.4,
+        log_prob_threshold=-1.0,
+        no_speech_threshold=0.6,
+        log_progress=False,
+    )
+    records = [
+        record
+        for segment in iterator
+        if (
+            record := segment_from_object(
+                segment,
+                source=source,
+                offset=start,
+            )
         )
-        result = transcribe_window(
-            model,
-            audio,
-            selected.window,
-            selected.forced_language,
-            f"turbo_forced_{selected.forced_language}",
-        )
-        for candidate in result.segments:
-            anchor_similarity = candidate_anchor_similarity(candidate.text, anchors)
-            section_match = contains_section_reference(candidate.text)
-            average_probability = segment_average_word_probability(candidate)
-            fit = language_fit(candidate.text, selected.forced_language)
-            high_confidence = (
-                candidate.avg_logprob >= -0.45
-                and average_probability >= 0.55
-                and len(candidate.text) >= 12
-            )
-            nearby_support = has_nearby_language_support(
-                candidate,
-                final_segments,
-                selected.forced_language,
-            )
-
-            accepted = False
-            reason = "candidate_rejected"
-            if not fit:
-                reason = "script_language_fit_rejected"
-            elif detect_decoder_loop(candidate.text):
-                reason = "decoder_loop_rejected"
-            elif not (
-                anchor_similarity >= 0.72
-                or section_match
-                or (high_confidence and nearby_support)
-            ):
-                reason = "insufficient_cross_pass_evidence"
-            else:
-                final_segments, accepted, reason = merge_complementary_candidate(
-                    final_segments,
-                    candidate,
-                )
-
-            decisions.append(
-                ComplementaryDecision(
-                    window_index=selected.window.index,
-                    forced_language=selected.forced_language,
-                    candidate_text=candidate.text,
-                    accepted=accepted,
-                    reason=reason,
-                    anchor_similarity=anchor_similarity,
-                    section_match=section_match,
-                    average_word_probability=average_probability,
-                    avg_logprob=candidate.avg_logprob,
-                    start=candidate.start,
-                    end=candidate.end,
-                )
-            )
-            print(
-                f"COMPLEMENTARY_DECISION WINDOW={selected.window.index:03d} "
-                f"ACCEPTED={'YES' if accepted else 'NO'} "
-                f"LANGUAGE={selected.forced_language} "
-                f"ANCHOR_SIMILARITY={anchor_similarity:.3f} "
-                f"SECTION_MATCH={'YES' if section_match else 'NO'} "
-                f"AVG_WORD_PROBABILITY={average_probability:.3f} "
-                f"REASON={reason}"
-            )
-
-    return deduplicate_overlapping_segments(final_segments), decisions
+        is not None
+    ]
+    return deduplicate_segments(records)
 
 
-def detect_suspicion_events(
+def average_logprob(segments: Iterable[SegmentRecord]) -> float:
+    values = [segment.avg_logprob for segment in segments]
+    return sum(values) / len(values) if values else -10.0
+
+
+def quality_score(text: str, segments: list[SegmentRecord]) -> float:
+    confidence = max(0.0, min(1.0, (average_logprob(segments) + 1.2) / 1.2))
+    length_score = min(len(text) / 240.0, 1.0)
+    penalty = 0.0
+    if "�" in text:
+        penalty += 0.5
+    if detect_decoder_loop(text):
+        penalty += 0.8
+    return max(0.0, confidence * 0.78 + length_score * 0.22 - penalty)
+
+
+def comparison_tokens(text: str) -> list[str]:
+    return [
+        token.lower()
+        for token in re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?|[ぁ-んァ-ヶ一-龯々]", text)
+    ]
+
+
+def token_recall(baseline_text: str, candidate_text: str) -> float:
+    baseline_tokens = comparison_tokens(baseline_text)
+    available = Counter(comparison_tokens(candidate_text))
+    if not baseline_tokens:
+        return 1.0
+    matched = 0
+    for token in baseline_tokens:
+        if available[token] > 0:
+            matched += 1
+            available[token] -= 1
+    return matched / len(baseline_tokens)
+
+
+def opening_core_end(
     segments: list[SegmentRecord],
-) -> list[SuspicionEvent]:
-    events: list[SuspicionEvent] = []
+    requested_seconds: float,
+    audio_seconds: float,
+) -> float:
+    if requested_seconds <= 0:
+        return 0.0
+    limit = min(requested_seconds, audio_seconds)
+    candidates = [segment.end for segment in segments if segment.end <= limit]
+    if not candidates:
+        return limit
+    return max(candidates)
 
+
+def segments_before(
+    segments: Iterable[SegmentRecord],
+    end_time: float,
+) -> list[SegmentRecord]:
+    return [
+        segment
+        for segment in segments
+        if (segment.start + segment.end) / 2.0 <= end_time
+    ]
+
+
+def decide_opening_audit(
+    baseline_segments: list[SegmentRecord],
+    audit_segments: list[SegmentRecord],
+    anchors: list[str],
+    core_end: float,
+) -> OpeningAuditDecision:
+    baseline_text = format_transcript(baseline_segments).strip()
+    audit_text = format_transcript(audit_segments).strip() if audit_segments else ""
+    coverage_ratio = len(audit_text) / max(len(baseline_text), 1)
+    recall = token_recall(baseline_text, audit_text)
+    baseline_score = quality_score(baseline_text, baseline_segments)
+    audit_score = quality_score(audit_text, audit_segments)
+    baseline_anchor_hits = anchor_exact_hits(baseline_text, anchors)
+    audit_anchor_hits = anchor_exact_hits(audit_text, anchors)
+    baseline_section_hits = sum(strict_section_hits(baseline_text).values())
+    audit_section_hits = sum(strict_section_hits(audit_text).values())
+
+    accepted = False
+    reason = "baseline_retained"
+    if not audit_text:
+        reason = "audit_empty"
+    elif "�" in audit_text or detect_decoder_loop(audit_text):
+        reason = "audit_anomaly_rejected"
+    elif not 0.98 <= coverage_ratio <= 1.50:
+        reason = "audit_coverage_guard_rejected"
+    elif recall < 0.80:
+        reason = "audit_content_recall_rejected"
+    elif audit_anchor_hits < baseline_anchor_hits:
+        reason = "audit_anchor_guard_rejected"
+    elif audit_section_hits < baseline_section_hits:
+        reason = "audit_section_guard_rejected"
+    elif coverage_ratio >= 1.03 and audit_score >= baseline_score - 0.08:
+        accepted = True
+        reason = "opening_coverage_improved"
+    elif audit_score >= baseline_score + 0.12 and coverage_ratio >= 0.99:
+        accepted = True
+        reason = "opening_confidence_improved"
+
+    return OpeningAuditDecision(
+        accepted=accepted,
+        reason=reason,
+        core_end=core_end,
+        baseline_text=baseline_text,
+        audit_text=audit_text,
+        coverage_ratio=coverage_ratio,
+        token_recall=recall,
+        baseline_score=baseline_score,
+        audit_score=audit_score,
+        baseline_anchor_hits=baseline_anchor_hits,
+        audit_anchor_hits=audit_anchor_hits,
+        baseline_section_hits=baseline_section_hits,
+        audit_section_hits=audit_section_hits,
+    )
+
+
+def apply_opening_audit(
+    segments: list[SegmentRecord],
+    audit_segments: list[SegmentRecord],
+    core_end: float,
+) -> list[SegmentRecord]:
+    retained = [
+        segment
+        for segment in segments
+        if (segment.start + segment.end) / 2.0 > core_end
+    ]
+    return deduplicate_segments([*audit_segments, *retained])
+
+
+def detect_strong_events(segments: list[SegmentRecord]) -> list[SuspicionEvent]:
+    events: list[SuspicionEvent] = []
     for index, segment in enumerate(segments):
         duration = max(segment.end - segment.start, 0.1)
-        japanese, latin = script_profile(segment.text)
-        words = len(english_words(segment.text))
-
-        if segment.avg_logprob < -0.72:
+        if segment.avg_logprob < -0.90:
             events.append(
                 SuspicionEvent(
                     segment.start,
                     segment.end,
-                    2.2,
+                    2.5,
                     "low_logprob",
                     (index,),
                 )
             )
-        if segment.compression_ratio > 2.35:
+        if segment.compression_ratio > 2.50:
             events.append(
                 SuspicionEvent(
                     segment.start,
                     segment.end,
-                    2.3,
+                    2.8,
                     "high_compression",
                     (index,),
                 )
@@ -1326,91 +1046,60 @@ def detect_suspicion_events(
                     (index,),
                 )
             )
-        if duration >= 3.0 and len(segment.text) / duration < 1.2:
+        if duration >= 5.0 and len(segment.text) / duration < 0.9:
             events.append(
                 SuspicionEvent(
                     segment.start,
                     segment.end,
-                    1.8,
-                    "low_text_rate",
+                    2.0,
+                    "very_low_text_rate",
                     (index,),
                 )
             )
-
-        previous = segments[index - 1] if index > 0 else None
-        following = segments[index + 1] if index + 1 < len(segments) else None
-        if previous is not None and following is not None:
-            previous_japanese, previous_latin = script_profile(previous.text)
-            following_japanese, following_latin = script_profile(following.text)
-            english_island = (
-                japanese == 0
-                and 1 <= words <= 5
-                and previous_japanese >= 8
-                and following_japanese >= 8
-            )
-            japanese_island = (
-                latin == 0
-                and 1 <= japanese <= 6
-                and previous_latin >= 20
-                and following_latin >= 20
-            )
-            if english_island or japanese_island:
-                events.append(
-                    SuspicionEvent(
-                        segment.start,
-                        segment.end,
-                        2.0,
-                        "isolated_script_switch",
-                        (index,),
-                    )
-                )
-
     return events
 
 
-def merge_repair_events(
+def build_repair_windows(
     events: list[SuspicionEvent],
     segments: list[SegmentRecord],
     audio_seconds: float,
     max_windows: int,
 ) -> list[RepairWindow]:
-    if max_windows == 0:
+    if max_windows == 0 or not events:
         return []
-
-    strong_events = [event for event in events if event.reason in STRONG_REPAIR_REASONS]
     grouped: list[list[SuspicionEvent]] = []
-    for event in sorted(strong_events, key=lambda item: (item.start, item.end)):
+    for event in sorted(events, key=lambda item: (item.start, item.end)):
         if not grouped or event.start > max(item.end for item in grouped[-1]) + 1.0:
             grouped.append([event])
         else:
             grouped[-1].append(event)
 
-    windows: list[RepairWindow] = []
+    candidates: list[tuple[float, RepairWindow]] = []
     for group in grouped:
         indexes = sorted(
             {index for event in group for index in event.segment_indexes}
         )
-        if not indexes:
-            continue
         core_start = min(segments[index].start for index in indexes)
         core_end = max(segments[index].end for index in indexes)
         reasons = tuple(sorted({event.reason for event in group}))
         severity = sum(event.severity for event in group)
-        windows.append(
-            RepairWindow(
-                index=0,
-                core_start=core_start,
-                core_end=core_end,
-                slice_start=max(0.0, core_start - REPAIR_PADDING_SECONDS),
-                slice_end=min(audio_seconds, core_end + REPAIR_PADDING_SECONDS),
-                severity=severity,
-                reasons=reasons,
-                segment_indexes=tuple(indexes),
+        candidates.append(
+            (
+                severity,
+                RepairWindow(
+                    index=0,
+                    core_start=core_start,
+                    core_end=core_end,
+                    slice_start=max(0.0, core_start - REPAIR_PADDING_SECONDS),
+                    slice_end=min(audio_seconds, core_end + REPAIR_PADDING_SECONDS),
+                    reasons=reasons,
+                    segment_indexes=tuple(indexes),
+                ),
             )
         )
 
-    windows.sort(key=lambda item: (-item.severity, item.core_start))
-    selected = windows[:max_windows]
+    candidates.sort(key=lambda item: (-item[0], item[1].core_start))
+    selected = [item[1] for item in candidates[:max_windows]]
     selected.sort(key=lambda item: item.core_start)
     return [
         RepairWindow(
@@ -1419,7 +1108,6 @@ def merge_repair_events(
             core_end=window.core_end,
             slice_start=window.slice_start,
             slice_end=window.slice_end,
-            severity=window.severity,
             reasons=window.reasons,
             segment_indexes=window.segment_indexes,
         )
@@ -1432,170 +1120,54 @@ def segments_in_core(
     core_start: float,
     core_end: float,
 ) -> list[SegmentRecord]:
-    selected: list[SegmentRecord] = []
-    for segment in segments:
-        midpoint = (segment.start + segment.end) / 2.0
-        if core_start <= midpoint <= core_end:
-            selected.append(segment)
-    return selected
-
-
-def join_segment_text(segments: Iterable[SegmentRecord]) -> str:
-    return clean_text(" ".join(segment.text for segment in segments))
-
-
-def transcribe_repair_window(
-    model: object,
-    audio: object,
-    window: RepairWindow,
-    language: str | None,
-) -> list[SegmentRecord]:
-    start_sample = int(window.slice_start * SAMPLE_RATE)
-    end_sample = int(window.slice_end * SAMPLE_RATE)
-    audio_slice = audio[start_sample:end_sample]
-
-    iterator, information = model.transcribe(
-        audio_slice,
-        task="transcribe",
-        language=language,
-        multilingual=True,
-        beam_size=5,
-        best_of=5,
-        patience=1.0,
-        temperature=(0.0, 0.2, 0.4),
-        vad_filter=False,
-        condition_on_previous_text=False,
-        without_timestamps=False,
-        word_timestamps=True,
-        hotwords=TRANSCRIPTION_GLOSSARY,
-        compression_ratio_threshold=2.4,
-        log_prob_threshold=-1.0,
-        no_speech_threshold=0.6,
-        log_progress=False,
-    )
-
-    detected_language = str(getattr(information, "language", language or "unknown"))
-    records: list[SegmentRecord] = []
-    for segment in iterator:
-        words: list[WordRecord] = []
-        for word in getattr(segment, "words", []) or []:
-            word_start = float(getattr(word, "start", 0.0) or 0.0) + window.slice_start
-            word_end = float(getattr(word, "end", 0.0) or 0.0) + window.slice_start
-            absolute_word = WordRecord(
-                start=max(0.0, word_start),
-                end=max(0.0, word_end),
-                text=str(getattr(word, "word", "")),
-                probability=float(getattr(word, "probability", 0.0) or 0.0),
-            )
-            midpoint = word_midpoint(absolute_word)
-            if window.core_start <= midpoint <= window.core_end:
-                words.append(absolute_word)
-        record = build_segment_from_words(
-            segment,
-            words,
-            "large_v3",
-            detected_language,
-        )
-        if record is not None:
-            records.append(record)
-    return records
-
-
-def average_logprob(segments: Iterable[SegmentRecord]) -> float:
-    values = [segment.avg_logprob for segment in segments]
-    return sum(values) / len(values) if values else -10.0
-
-
-def local_suspicion_count(text: str) -> int:
-    count = 0
-    if not text.strip():
-        count += 2
-    if "�" in text:
-        count += 2
-    if detect_decoder_loop(text):
-        count += 3
-    return count
-
-
-def quality_score(text: str, segments: list[SegmentRecord]) -> float:
-    confidence = max(0.0, min(1.0, (average_logprob(segments) + 1.2) / 1.2))
-    length_score = min(len(text) / 180.0, 1.0)
-    suspicion_penalty = min(local_suspicion_count(text) * 0.22, 0.75)
-    return max(0.0, confidence * 0.75 + length_score * 0.25 - suspicion_penalty)
-
-
-def token_recall(baseline_text: str, repair_text: str) -> float:
-    baseline_tokens = [token.lower() for token in re.findall(r"\w+", baseline_text)]
-    repair_tokens = Counter(token.lower() for token in re.findall(r"\w+", repair_text))
-    if not baseline_tokens:
-        return 1.0
-    matched = 0
-    available = Counter(repair_tokens)
-    for token in baseline_tokens:
-        if available[token] > 0:
-            matched += 1
-            available[token] -= 1
-    return matched / len(baseline_tokens)
+    return [
+        segment
+        for segment in segments
+        if core_start <= (segment.start + segment.end) / 2.0 <= core_end
+    ]
 
 
 def decide_repair(
     window: RepairWindow,
     baseline_segments: list[SegmentRecord],
     repair_segments: list[SegmentRecord],
-    anchors: list[str],
 ) -> RepairDecision:
-    baseline_text = join_segment_text(baseline_segments)
-    repair_text = join_segment_text(repair_segments)
-    baseline_score = quality_score(baseline_text, baseline_segments)
-    repair_score = quality_score(repair_text, repair_segments)
+    baseline_text = format_transcript(baseline_segments).strip()
+    repair_text = format_transcript(repair_segments).strip() if repair_segments else ""
     coverage_ratio = len(repair_text) / max(len(baseline_text), 1)
     recall = token_recall(baseline_text, repair_text)
-    baseline_suspicious = local_suspicion_count(baseline_text)
-    repair_suspicious = local_suspicion_count(repair_text)
-    baseline_sections = sum(section_hits(baseline_text).values())
-    repair_sections = sum(section_hits(repair_text).values())
-    baseline_anchors = anchor_exact_hits(baseline_text, anchors)
-    repair_anchors = anchor_exact_hits(repair_text, anchors)
+    baseline_score = quality_score(baseline_text, baseline_segments)
+    repair_score = quality_score(repair_text, repair_segments)
+    baseline_suspicious = len(detect_strong_events(baseline_segments))
+    repair_suspicious = len(detect_strong_events(repair_segments))
 
     accepted = False
     reason = "baseline_retained"
-    coverage_ok = MIN_REPAIR_COVERAGE_RATIO <= coverage_ratio <= MAX_REPAIR_COVERAGE_RATIO
-    content_guards_ok = (
-        repair_sections >= baseline_sections
-        and repair_anchors >= baseline_anchors
-        and recall >= 0.70
-    )
-    clear_improvement = (
-        repair_suspicious < baseline_suspicious
-        or repair_score >= baseline_score + 0.15
-    )
-
     if not repair_text:
         reason = "repair_empty"
-    elif not coverage_ok:
-        reason = "coverage_guard_rejected"
-    elif not content_guards_ok:
-        reason = "content_guard_rejected"
-    elif clear_improvement:
+    elif not 0.92 <= coverage_ratio <= 1.50:
+        reason = "repair_coverage_guard_rejected"
+    elif recall < 0.75:
+        reason = "repair_content_recall_rejected"
+    elif repair_suspicious < baseline_suspicious and repair_score >= baseline_score - 0.05:
         accepted = True
-        reason = "guarded_quality_improvement"
+        reason = "strong_anomaly_reduced"
+    elif repair_score >= baseline_score + 0.15 and repair_suspicious <= baseline_suspicious:
+        accepted = True
+        reason = "repair_quality_improved"
 
     return RepairDecision(
         window_index=window.index,
         accepted=accepted,
         reason=reason,
-        baseline_score=baseline_score,
-        repair_score=repair_score,
-        coverage_ratio=coverage_ratio,
-        token_recall=recall,
-        baseline_suspicious_events=baseline_suspicious,
-        repair_suspicious_events=repair_suspicious,
-        baseline_section_hits=baseline_sections,
-        repair_section_hits=repair_sections,
-        baseline_anchor_hits=baseline_anchors,
-        repair_anchor_hits=repair_anchors,
         baseline_text=baseline_text,
         repair_text=repair_text,
+        coverage_ratio=coverage_ratio,
+        token_recall=recall,
+        baseline_score=baseline_score,
+        repair_score=repair_score,
+        baseline_suspicious_events=baseline_suspicious,
+        repair_suspicious_events=repair_suspicious,
         core_start=window.core_start,
         core_end=window.core_end,
         slice_start=window.slice_start,
@@ -1606,68 +1178,83 @@ def decide_repair(
 
 def apply_repair(
     segments: list[SegmentRecord],
-    window: RepairWindow,
     replacement: list[SegmentRecord],
+    window: RepairWindow,
 ) -> list[SegmentRecord]:
-    retained: list[SegmentRecord] = []
-    for segment in segments:
-        midpoint = (segment.start + segment.end) / 2.0
-        if window.core_start <= midpoint <= window.core_end:
-            continue
-        retained.append(segment)
-    retained.extend(replacement)
-    return deduplicate_overlapping_segments(retained)
-
-
-def format_transcript(segments: Iterable[SegmentRecord]) -> str:
-    lines: list[str] = []
-    previous_end: float | None = None
-
-    for segment in sorted(segments, key=lambda item: (item.start, item.end)):
-        text = clean_text(segment.text)
-        if not text:
-            continue
-        if previous_end is not None and segment.start - previous_end >= 1.1:
-            if lines and lines[-1] != "":
-                lines.append("")
-        lines.append(text)
-        previous_end = segment.end
-
-    compact: list[str] = []
-    for line in lines:
-        if line == "" and compact and compact[-1] == "":
-            continue
-        compact.append(line)
-    transcript = "\n".join(compact).strip()
-    if not transcript:
-        raise TranscriptionError("The final transcript is empty.")
-    return transcript + "\n"
+    retained = [
+        segment
+        for segment in segments
+        if not window.core_start
+        <= (segment.start + segment.end) / 2.0
+        <= window.core_end
+    ]
+    return deduplicate_segments([*retained, *replacement])
 
 
 def transcript_indicators(
     text: str,
     segments: list[SegmentRecord],
-    events: list[SuspicionEvent],
     anchors: list[str],
 ) -> dict[str, object]:
-    reasons = Counter(event.reason for event in events)
-    sections = section_hits(text)
-    strong_events = [event for event in events if event.reason in STRONG_REPAIR_REASONS]
+    sections = strict_section_hits(text)
+    events = detect_strong_events(segments)
     return {
         "text_characters": len(text),
         "segment_count": len(segments),
         "japanese_characters": japanese_character_count(text),
         "latin_characters": latin_character_count(text),
-        "script_counts": count_unicode_scripts(text),
         "replacement_characters": text.count("�"),
         "decoder_loop": detect_decoder_loop(text),
-        "section_hits": sections,
-        "section_count": sum(sections.values()),
+        "strict_section_hits": sections,
+        "strict_section_count": sum(sections.values()),
         "anchor_exact_hits": anchor_exact_hits(text, anchors),
-        "suspicious_event_count": len(events),
-        "strong_suspicious_event_count": len(strong_events),
-        "suspicious_reason_counts": dict(reasons),
+        "strong_suspicious_event_count": len(events),
+        "strong_suspicious_reason_counts": dict(
+            Counter(event.reason for event in events)
+        ),
     }
+
+
+def automatic_review_status(
+    indicators: dict[str, object],
+    audio_seconds: float,
+) -> str:
+    if bool(indicators["decoder_loop"]):
+        return "RERUN_RECOMMENDED"
+    if int(indicators["replacement_characters"]) > 0:
+        return "RERUN_RECOMMENDED"
+    if int(indicators["strong_suspicious_event_count"]) > 1:
+        return "REVIEW_REQUIRED"
+    if int(indicators["text_characters"]) < int(audio_seconds * 4.2):
+        return "REVIEW_REQUIRED"
+    return "ACCEPT_FOR_AI_POST_CORRECTION"
+
+
+def secondary_processing_effect(
+    opening_decision: OpeningAuditDecision | None,
+    repair_decisions: list[RepairDecision],
+    baseline_indicators: dict[str, object],
+    final_indicators: dict[str, object],
+) -> str:
+    opening_accepted = bool(opening_decision and opening_decision.accepted)
+    repair_accepted = any(item.accepted for item in repair_decisions)
+    if not opening_accepted and not repair_accepted:
+        return "NO_MEASURABLE_GAIN"
+    anomaly_change = (
+        int(final_indicators["strong_suspicious_event_count"])
+        - int(baseline_indicators["strong_suspicious_event_count"])
+    )
+    character_change = (
+        int(final_indicators["text_characters"])
+        - int(baseline_indicators["text_characters"])
+    )
+    anchor_change = (
+        int(final_indicators["anchor_exact_hits"])
+        - int(baseline_indicators["anchor_exact_hits"])
+    )
+    if anomaly_change < 0 or character_change >= 40 or anchor_change > 0:
+        return "MEASURABLE_GAIN"
+    return "CHANGE_ACCEPTED_WITHOUT_MEASURABLE_GLOBAL_GAIN"
 
 
 def levenshtein_distance(left: list[str], right: list[str]) -> int:
@@ -1714,7 +1301,6 @@ def calculate_reference_metrics(
     final_cer = character_error_rate(final_text)
     baseline_wer = english_word_error_rate(baseline_text)
     final_wer = english_word_error_rate(final_text)
-
     return {
         "status": "MEASURED",
         "baseline_cer": baseline_cer,
@@ -1745,21 +1331,26 @@ def write_json_atomically(path: Path, data: dict[str, object]) -> None:
     )
 
 
-def complementary_decision_to_dict(
-    decision: ComplementaryDecision,
+def opening_decision_to_dict(
+    decision: OpeningAuditDecision | None,
 ) -> dict[str, object]:
+    if decision is None:
+        return {"status": "NOT_RUN"}
     return {
-        "window_index": decision.window_index,
-        "forced_language": decision.forced_language,
+        "status": "RUN",
         "accepted": decision.accepted,
         "decision_reason": decision.reason,
-        "candidate_text": decision.candidate_text,
-        "anchor_similarity": round(decision.anchor_similarity, 6),
-        "section_match": decision.section_match,
-        "average_word_probability": round(decision.average_word_probability, 6),
-        "avg_logprob": round(decision.avg_logprob, 6),
-        "start": round(decision.start, 3),
-        "end": round(decision.end, 3),
+        "core_end": round(decision.core_end, 3),
+        "coverage_ratio": round(decision.coverage_ratio, 6),
+        "token_recall": round(decision.token_recall, 6),
+        "baseline_score": round(decision.baseline_score, 6),
+        "audit_score": round(decision.audit_score, 6),
+        "baseline_anchor_hits": decision.baseline_anchor_hits,
+        "audit_anchor_hits": decision.audit_anchor_hits,
+        "baseline_section_hits": decision.baseline_section_hits,
+        "audit_section_hits": decision.audit_section_hits,
+        "baseline_text": decision.baseline_text,
+        "audit_text": decision.audit_text,
     }
 
 
@@ -1768,41 +1359,20 @@ def repair_decision_to_dict(decision: RepairDecision) -> dict[str, object]:
         "window_index": decision.window_index,
         "accepted": decision.accepted,
         "decision_reason": decision.reason,
-        "baseline_score": round(decision.baseline_score, 6),
-        "repair_score": round(decision.repair_score, 6),
         "coverage_ratio": round(decision.coverage_ratio, 6),
         "token_recall": round(decision.token_recall, 6),
+        "baseline_score": round(decision.baseline_score, 6),
+        "repair_score": round(decision.repair_score, 6),
         "baseline_suspicious_events": decision.baseline_suspicious_events,
         "repair_suspicious_events": decision.repair_suspicious_events,
-        "baseline_section_hits": decision.baseline_section_hits,
-        "repair_section_hits": decision.repair_section_hits,
-        "baseline_anchor_hits": decision.baseline_anchor_hits,
-        "repair_anchor_hits": decision.repair_anchor_hits,
-        "baseline_text": decision.baseline_text,
-        "repair_text": decision.repair_text,
         "core_start": round(decision.core_start, 3),
         "core_end": round(decision.core_end, 3),
         "slice_start": round(decision.slice_start, 3),
         "slice_end": round(decision.slice_end, 3),
         "reasons": list(decision.reasons),
+        "baseline_text": decision.baseline_text,
+        "repair_text": decision.repair_text,
     }
-
-
-def automatic_review_status(
-    indicators: dict[str, object],
-    audio_seconds: float,
-) -> str:
-    if bool(indicators["decoder_loop"]):
-        return "RERUN_RECOMMENDED"
-    if int(indicators["replacement_characters"]) > 0:
-        return "RERUN_RECOMMENDED"
-    if int(indicators["section_count"]) < 3:
-        return "REVIEW_REQUIRED"
-    if int(indicators["strong_suspicious_event_count"]) > 2:
-        return "REVIEW_REQUIRED"
-    if int(indicators["text_characters"]) < int(audio_seconds * 4.5):
-        return "REVIEW_REQUIRED"
-    return "ACCEPT_FOR_AI_POST_CORRECTION"
 
 
 def run_child() -> int:
@@ -1847,7 +1417,7 @@ def run_child() -> int:
             timer.start("import_transcription_libraries")
             import ctranslate2
             import faster_whisper
-            from faster_whisper import WhisperModel
+            from faster_whisper import BatchedInferencePipeline, WhisperModel
             from faster_whisper.audio import decode_audio
             timer.finish()
 
@@ -1867,14 +1437,15 @@ def run_child() -> int:
                 label="REPAIR",
                 download_now=False,
             )
-            print("REPAIR_MODEL_DOWNLOAD_POLICY=DOWNLOAD_ONLY_IF_STRONG_REPAIR_WINDOWS_EXIST")
+            print("REPAIR_MODEL_DOWNLOAD_POLICY=DOWNLOAD_ONLY_IF_STRONG_ANOMALY_EXISTS")
             print("MODEL_VERSION_CHECK_RESULT=PASS")
             timer.finish()
 
             timer.start("validate_environment")
             validate_environment(
                 input_file,
-                arguments.max_complementary_windows,
+                arguments.batch_size,
+                arguments.opening_audit_seconds,
                 arguments.max_repair_windows,
                 ctranslate2,
             )
@@ -1883,12 +1454,11 @@ def run_child() -> int:
             timer.finish()
 
             print("TRANSCRIPTION_CONFIGURATION")
-            print("TRANSCRIPTION_MODE=FULL_COVERAGE_TURBO_COMPLEMENTARY_LANGUAGE_RECOVERY")
-            print("PRIMARY_AUDIO_COVERAGE=NO_VAD_OVERLAPPED_WINDOWS")
-            print("PRIMARY_BOUNDARY_POLICY=WORD_TIMESTAMP_CORE_OWNERSHIP")
-            print("COMPLEMENTARY_POLICY=TURBO_FORCED_ALTERNATE_LANGUAGE_ADD_ONLY")
+            print("TRANSCRIPTION_MODE=BATCHED_TURBO_GUARDED_OPENING_AUDIT")
+            print("PRIMARY_POLICY=FAST_BATCHED_VAD_FULL_PROGRAM_PASS")
+            print("OPENING_AUDIT_POLICY=NO_VAD_ADD_COVERAGE_ONLY_WITH_CONTENT_GUARDS")
+            print("COMPLEMENTARY_LANGUAGE_RECOVERY=DISABLED_NO_MEASURABLE_GAIN")
             print("LARGE_V3_POLICY=RARE_STRONG_ANOMALIES_ONLY")
-            print("REPEATED_PHRASE_INCONSISTENCY_REPAIR=DISABLED")
             print("EDUCATIONAL_FORMATTING_APPLIED=NO")
             print("CONTENT_REMOVAL_APPLIED=NO")
             print("PARAPHRASING_APPLIED=NO")
@@ -1899,121 +1469,144 @@ def run_child() -> int:
             print(f"CUDA_DEVICES={ctranslate2.get_cuda_device_count()}")
             print(f"COMPUTE_TYPE={COMPUTE_TYPE}")
             print(f"LANGUAGE={arguments.language}")
-            print(f"MAX_COMPLEMENTARY_WINDOWS={arguments.max_complementary_windows}")
+            print(f"BATCH_SIZE_REQUESTED={arguments.batch_size}")
+            print(f"OPENING_AUDIT_SECONDS={arguments.opening_audit_seconds:.1f}")
             print(f"MAX_REPAIR_WINDOWS={arguments.max_repair_windows}")
-            print(f"PRIMARY_WINDOW_SECONDS={PRIMARY_WINDOW_SECONDS:.1f}")
-            print(f"PRIMARY_WINDOW_OVERLAP_SECONDS={PRIMARY_WINDOW_OVERLAP_SECONDS:.1f}")
-            print(f"REPAIR_PADDING_SECONDS={REPAIR_PADDING_SECONDS:.1f}")
             print("PRIMARY_MODEL=large-v3-turbo")
-            print("COMPLEMENTARY_MODEL=large-v3-turbo")
+            print("OPENING_AUDIT_MODEL=large-v3-turbo")
             print("REPAIR_MODEL=large-v3")
-            print("JAPANESE_SPECIALIST_MODEL=DISABLED_PENDING_VALID_BENCHMARK")
             print(f"INPUT={input_file}")
             print(f"REFERENCE={reference_file or 'NONE'}")
 
             timer.start("decode_audio")
             audio = decode_audio(str(input_file), sampling_rate=SAMPLE_RATE)
             audio_seconds = len(audio) / SAMPLE_RATE
-            primary_windows = build_primary_windows(audio_seconds)
             timer.finish()
-
             print(f"AUDIO_SECONDS={audio_seconds:.3f}")
-            print(f"PRIMARY_WINDOW_COUNT={len(primary_windows)}")
 
-            timer.start("primary_full_coverage_transcription")
+            timer.start("load_primary_model")
             primary_model = load_model(
                 WhisperModel,
                 Path(str(primary_model_information["directory"])),
                 "turbo",
             )
+            timer.finish()
+
             requested_language = None if arguments.language == "auto" else arguments.language
-            baseline_segments, primary_results, detected_languages = (
-                transcribe_primary_full_coverage(
+
+            timer.start("primary_batched_transcription")
+            baseline_segments, batch_size_used, detected_language = (
+                transcribe_batched_baseline(
                     primary_model,
+                    BatchedInferencePipeline,
                     audio,
-                    primary_windows,
                     requested_language,
+                    arguments.batch_size,
                 )
             )
-            baseline_segments = deduplicate_overlapping_segments(baseline_segments)
             baseline_text = format_transcript(baseline_segments)
             timer.finish()
 
             timer.start("discover_repeated_content")
-            anchors = discover_repeated_english_anchors(baseline_segments)
-            complementary_windows, dominant_languages = select_complementary_windows(
-                primary_results,
-                detected_languages,
-                arguments.max_complementary_windows,
-            )
-            timer.finish()
-
-            print(f"BASELINE_SEGMENT_COUNT={len(baseline_segments)}")
-            print(f"BASELINE_TEXT_CHARACTERS={len(baseline_text)}")
-            print(f"DETECTED_LANGUAGE_COUNTS={json.dumps(detected_languages, sort_keys=True)}")
-            print(f"DOMINANT_LANGUAGES={json.dumps(dominant_languages)}")
-            print(f"REPEATED_PHRASE_ANCHORS={json.dumps(anchors, ensure_ascii=False)}")
-            print(f"COMPLEMENTARY_WINDOW_COUNT={len(complementary_windows)}")
-            for selected in complementary_windows:
-                print(
-                    f"COMPLEMENTARY_PLAN INDEX={selected.window.index:03d} "
-                    f"START={selected.window.start:.3f} END={selected.window.end:.3f} "
-                    f"ORIGINAL_LANGUAGE={selected.original_language} "
-                    f"FORCED_LANGUAGE={selected.forced_language} "
-                    f"PRIORITY={selected.priority:.2f} "
-                    f"REASONS={','.join(selected.reasons)}"
-                )
-
-            timer.start("complementary_language_recovery")
-            complementary_segments, complementary_decisions = run_complementary_recovery(
-                primary_model,
-                audio,
+            anchors = discover_repeated_anchors(baseline_segments)
+            baseline_indicators = transcript_indicators(
+                baseline_text,
                 baseline_segments,
-                complementary_windows,
                 anchors,
             )
-            del primary_model
-            gc.collect()
-            complementary_text = format_transcript(complementary_segments)
             timer.finish()
 
+            print(f"PRIMARY_BATCH_SIZE_USED={batch_size_used}")
+            print(f"DETECTED_LANGUAGE={detected_language}")
+            print(f"BASELINE_SEGMENT_COUNT={len(baseline_segments)}")
+            print(f"BASELINE_TEXT_CHARACTERS={len(baseline_text)}")
+            print(f"REPEATED_PHRASE_ANCHORS={json.dumps(anchors, ensure_ascii=False)}")
+
+            timer.start("opening_no_vad_audit")
+            opening_decision: OpeningAuditDecision | None = None
+            post_opening_segments = list(baseline_segments)
+            core_end = opening_core_end(
+                baseline_segments,
+                arguments.opening_audit_seconds,
+                audio_seconds,
+            )
+            if core_end > 0:
+                audit_slice_end = min(
+                    audio_seconds,
+                    core_end + OPENING_AUDIT_PADDING_SECONDS,
+                )
+                opening_audit_segments = transcribe_slice(
+                    primary_model,
+                    audio,
+                    start=0.0,
+                    end=audit_slice_end,
+                    language=requested_language,
+                    source="turbo_opening_no_vad",
+                    beam_size=5,
+                )
+                opening_audit_segments = segments_before(
+                    opening_audit_segments,
+                    core_end,
+                )
+                baseline_opening_segments = segments_before(
+                    baseline_segments,
+                    core_end,
+                )
+                opening_decision = decide_opening_audit(
+                    baseline_opening_segments,
+                    opening_audit_segments,
+                    anchors,
+                    core_end,
+                )
+                print(
+                    "OPENING_AUDIT_DECISION "
+                    f"ACCEPTED={'YES' if opening_decision.accepted else 'NO'} "
+                    f"CORE_END={opening_decision.core_end:.3f} "
+                    f"COVERAGE_RATIO={opening_decision.coverage_ratio:.3f} "
+                    f"TOKEN_RECALL={opening_decision.token_recall:.3f} "
+                    f"BASELINE_SCORE={opening_decision.baseline_score:.3f} "
+                    f"AUDIT_SCORE={opening_decision.audit_score:.3f} "
+                    f"REASON={opening_decision.reason}"
+                )
+                if opening_decision.accepted:
+                    post_opening_segments = apply_opening_audit(
+                        baseline_segments,
+                        opening_audit_segments,
+                        core_end,
+                    )
+            else:
+                print("OPENING_AUDIT_DECISION=NOT_RUN")
+            timer.finish()
+
+            del primary_model
+            gc.collect()
+
             timer.start("detect_strong_repair_windows")
-            complementary_events = detect_suspicion_events(complementary_segments)
-            repair_windows = merge_repair_events(
-                complementary_events,
-                complementary_segments,
+            post_opening_text = format_transcript(post_opening_segments)
+            strong_events = detect_strong_events(post_opening_segments)
+            repair_windows = build_repair_windows(
+                strong_events,
+                post_opening_segments,
                 audio_seconds,
                 arguments.max_repair_windows,
             )
             timer.finish()
 
-            print(f"COMPLEMENTARY_ACCEPTED_SEGMENTS={sum(item.accepted for item in complementary_decisions)}")
-            print(f"COMPLEMENTARY_TEXT_CHARACTERS={len(complementary_text)}")
-            print(f"SUSPICIOUS_EVENT_COUNT={len(complementary_events)}")
+            print(f"STRONG_SUSPICIOUS_EVENT_COUNT={len(strong_events)}")
             print(
-                "SUSPICIOUS_EVENT_REASONS="
+                "STRONG_SUSPICIOUS_EVENT_REASONS="
                 + json.dumps(
-                    Counter(event.reason for event in complementary_events),
+                    Counter(event.reason for event in strong_events),
                     ensure_ascii=False,
                     sort_keys=True,
                 )
             )
             print(f"STRONG_REPAIR_WINDOW_COUNT={len(repair_windows)}")
-            for window in repair_windows:
-                print(
-                    f"STRONG_REPAIR_WINDOW INDEX={window.index:02d} "
-                    f"SLICE_START={window.slice_start:.3f} "
-                    f"SLICE_END={window.slice_end:.3f} "
-                    f"CORE_START={window.core_start:.3f} "
-                    f"CORE_END={window.core_end:.3f} "
-                    f"REASONS={','.join(window.reasons)}"
-                )
 
             timer.start("selective_large_v3_repairs")
-            final_segments = list(complementary_segments)
+            final_segments = list(post_opening_segments)
             repair_decisions: list[RepairDecision] = []
             repair_model_updated = False
-
             if repair_windows:
                 repair_model_information = ensure_repair_model(
                     script_directory,
@@ -2036,63 +1629,62 @@ def run_child() -> int:
                         window.core_start,
                         window.core_end,
                     )
-                    repair_core = transcribe_repair_window(
+                    repair_slice = transcribe_slice(
                         repair_model,
                         audio,
-                        window,
-                        requested_language,
+                        start=window.slice_start,
+                        end=window.slice_end,
+                        language=requested_language,
+                        source="large_v3",
+                        beam_size=5,
+                    )
+                    repair_core = segments_in_core(
+                        repair_slice,
+                        window.core_start,
+                        window.core_end,
                     )
                     decision = decide_repair(
                         window,
                         baseline_core,
                         repair_core,
-                        anchors,
                     )
                     repair_decisions.append(decision)
                     print(
                         f"SELECTIVE_REPAIR_DECISION INDEX={window.index:02d} "
                         f"ACCEPTED={'YES' if decision.accepted else 'NO'} "
-                        f"BASELINE_SCORE={decision.baseline_score:.3f} "
-                        f"REPAIR_SCORE={decision.repair_score:.3f} "
                         f"COVERAGE_RATIO={decision.coverage_ratio:.3f} "
                         f"TOKEN_RECALL={decision.token_recall:.3f} "
+                        f"BASELINE_SCORE={decision.baseline_score:.3f} "
+                        f"REPAIR_SCORE={decision.repair_score:.3f} "
                         f"REASON={decision.reason}"
                     )
                     if decision.accepted:
                         final_segments = apply_repair(
                             final_segments,
-                            window,
                             repair_core,
+                            window,
                         )
                 del repair_model
                 gc.collect()
             timer.finish()
 
             timer.start("assemble_final_transcript")
-            final_segments = deduplicate_overlapping_segments(final_segments)
+            final_segments = deduplicate_segments(final_segments)
             final_text = format_transcript(final_segments)
-            final_events = detect_suspicion_events(final_segments)
-            baseline_indicators = transcript_indicators(
-                baseline_text,
-                baseline_segments,
-                detect_suspicion_events(baseline_segments),
-                anchors,
-            )
-            complementary_indicators = transcript_indicators(
-                complementary_text,
-                complementary_segments,
-                complementary_events,
-                anchors,
-            )
             final_indicators = transcript_indicators(
                 final_text,
                 final_segments,
-                final_events,
                 anchors,
             )
             review_status = automatic_review_status(
                 final_indicators,
                 audio_seconds,
+            )
+            effect = secondary_processing_effect(
+                opening_decision,
+                repair_decisions,
+                baseline_indicators,
+                final_indicators,
             )
             timer.finish()
 
@@ -2108,17 +1700,15 @@ def run_child() -> int:
                 )
             timer.finish()
 
-            timer.start("write_output_files")
+            timer.start("write_transcript")
             write_text_atomically(output_paths.transcript, final_text)
+            timer.finish()
 
-            primary_seconds = timer.seconds_for("primary_full_coverage_transcription")
-            complementary_seconds = timer.seconds_for("complementary_language_recovery")
+            primary_seconds = timer.seconds_for("primary_batched_transcription")
+            opening_seconds = timer.seconds_for("opening_no_vad_audit")
             repair_seconds = timer.seconds_for("selective_large_v3_repairs")
-            total_seconds = timer.total_seconds
-            accepted_complementary = sum(
-                item.accepted for item in complementary_decisions
-            )
             accepted_repairs = sum(item.accepted for item in repair_decisions)
+            opening_accepted = bool(opening_decision and opening_decision.accepted)
 
             metrics = {
                 "run_id": run_id,
@@ -2130,58 +1720,29 @@ def run_child() -> int:
                     "metrics": str(output_paths.metrics),
                 },
                 "configuration": {
-                    "mode": "full_coverage_turbo_complementary_language_recovery",
+                    "mode": "batched_turbo_guarded_opening_audit",
                     "language": arguments.language,
-                    "max_complementary_windows": arguments.max_complementary_windows,
+                    "batch_size_requested": arguments.batch_size,
+                    "batch_size_used": batch_size_used,
+                    "opening_audit_seconds": arguments.opening_audit_seconds,
                     "max_repair_windows": arguments.max_repair_windows,
-                    "primary_window_seconds": PRIMARY_WINDOW_SECONDS,
-                    "primary_window_overlap_seconds": PRIMARY_WINDOW_OVERLAP_SECONDS,
-                    "repair_padding_seconds": REPAIR_PADDING_SECONDS,
-                    "repeated_phrase_inconsistency_repair": False,
+                    "complementary_language_recovery": "disabled_no_measurable_gain",
                 },
                 "software": software_metrics,
                 "models": {
-                    "primary_and_complementary": primary_model_information,
+                    "primary": primary_model_information,
                     "repair": repair_model_information,
                     "repair_model_updated_during_run": repair_model_updated,
-                    "kotoba_specialist_status": "disabled_pending_valid_benchmark",
                 },
                 "audio_seconds": audio_seconds,
-                "primary_window_count": len(primary_windows),
-                "detected_language_counts": dict(detected_languages),
-                "dominant_languages": dominant_languages,
+                "detected_language": detected_language,
                 "repeated_phrase_anchors": anchors,
                 "baseline": baseline_indicators,
-                "after_complementary_recovery": complementary_indicators,
-                "final": final_indicators,
-                "complementary_recovery": {
-                    "planned_window_count": len(complementary_windows),
-                    "accepted_segment_count": accepted_complementary,
-                    "added_text_characters": len(complementary_text) - len(baseline_text),
-                    "plans": [
-                        {
-                            "window_index": item.window.index,
-                            "start": round(item.window.start, 3),
-                            "end": round(item.window.end, 3),
-                            "original_language": item.original_language,
-                            "forced_language": item.forced_language,
-                            "priority": round(item.priority, 3),
-                            "reasons": list(item.reasons),
-                        }
-                        for item in complementary_windows
-                    ],
-                    "decisions": [
-                        complementary_decision_to_dict(item)
-                        for item in complementary_decisions
-                    ],
-                },
+                "opening_audit": opening_decision_to_dict(opening_decision),
                 "strong_repair_detection": {
-                    "event_count": len(
-                        [
-                            event
-                            for event in complementary_events
-                            if event.reason in STRONG_REPAIR_REASONS
-                        ]
+                    "event_count": len(strong_events),
+                    "reason_counts": dict(
+                        Counter(event.reason for event in strong_events)
                     ),
                     "window_count": len(repair_windows),
                     "windows": [
@@ -2191,7 +1752,6 @@ def run_child() -> int:
                             "core_end": round(window.core_end, 3),
                             "slice_start": round(window.slice_start, 3),
                             "slice_end": round(window.slice_end, 3),
-                            "severity": round(window.severity, 3),
                             "reasons": list(window.reasons),
                         }
                         for window in repair_windows
@@ -2201,36 +1761,45 @@ def run_child() -> int:
                     repair_decision_to_dict(item)
                     for item in repair_decisions
                 ],
-                "accepted_large_v3_repair_count": accepted_repairs,
+                "final": final_indicators,
                 "reference_accuracy": reference_metrics,
                 "automatic_review": {
                     "status": review_status,
-                    "scope": "STRUCTURAL_COVERAGE_AND_CROSS_PASS_ONLY",
+                    "scope": "STRUCTURAL_COVERAGE_AND_STRONG_ANOMALIES_ONLY",
                     "is_accuracy_measurement": False,
+                },
+                "secondary_processing": {
+                    "effect": effect,
+                    "opening_audit_accepted": opening_accepted,
+                    "large_v3_repairs_accepted": accepted_repairs,
+                    "text_character_change": (
+                        int(final_indicators["text_characters"])
+                        - int(baseline_indicators["text_characters"])
+                    ),
+                    "anchor_exact_hit_change": (
+                        int(final_indicators["anchor_exact_hits"])
+                        - int(baseline_indicators["anchor_exact_hits"])
+                    ),
+                    "strong_suspicious_event_change": (
+                        int(final_indicators["strong_suspicious_event_count"])
+                        - int(baseline_indicators["strong_suspicious_event_count"])
+                    ),
                 },
                 "performance": {
                     "primary_seconds": primary_seconds,
-                    "complementary_seconds": complementary_seconds,
+                    "opening_audit_seconds": opening_seconds,
                     "large_v3_repair_seconds": repair_seconds,
-                    "total_seconds": total_seconds,
+                    "secondary_seconds": opening_seconds + repair_seconds,
+                    "total_seconds": timer.total_seconds,
                     "primary_realtime_factor": primary_seconds / audio_seconds,
-                    "total_realtime_factor": total_seconds / audio_seconds,
-                    "audio_minutes_per_processing_minute": audio_seconds / max(total_seconds, 0.001),
-                    "complementary_seconds_per_accepted_segment": (
-                        complementary_seconds / accepted_complementary
-                        if accepted_complementary
-                        else None
-                    ),
-                    "large_v3_seconds_per_accepted_repair": (
-                        repair_seconds / accepted_repairs
-                        if accepted_repairs
-                        else None
+                    "total_realtime_factor": timer.total_seconds / audio_seconds,
+                    "audio_minutes_per_processing_minute": (
+                        audio_seconds / max(timer.total_seconds, 0.001)
                     ),
                 },
                 "timings": timer.steps,
             }
             write_json_atomically(output_paths.metrics, metrics)
-            timer.finish()
 
             total_seconds = timer.total_seconds
             print("TRANSCRIPTION_RESULT=PASS")
@@ -2238,21 +1807,37 @@ def run_child() -> int:
             print(f"LOG_FILE={output_paths.log}")
             print(f"METRICS_FILE={output_paths.metrics}")
             print(f"PRIMARY_SECONDS={primary_seconds:.3f}")
-            print(f"COMPLEMENTARY_SECONDS={complementary_seconds:.3f}")
+            print(f"OPENING_AUDIT_SECONDS={opening_seconds:.3f}")
             print(f"LARGE_V3_REPAIR_SECONDS={repair_seconds:.3f}")
+            print(f"SECONDARY_SECONDS={opening_seconds + repair_seconds:.3f}")
             print(f"TOTAL_SECONDS={total_seconds:.3f}")
             print(f"TOTAL_PROCESS_REALTIME_FACTOR={total_seconds / audio_seconds:.4f}")
-            print(f"COMPLEMENTARY_WINDOWS_PROCESSED={len(complementary_windows)}")
-            print(f"COMPLEMENTARY_SEGMENTS_ACCEPTED={accepted_complementary}")
+            print(f"OPENING_AUDIT_ACCEPTED={'YES' if opening_accepted else 'NO'}")
             print(f"LARGE_V3_WINDOWS_PROCESSED={len(repair_windows)}")
             print(f"LARGE_V3_REPAIRS_ACCEPTED={accepted_repairs}")
             print(f"BASELINE_TEXT_CHARACTERS={len(baseline_text)}")
             print(f"FINAL_TEXT_CHARACTERS={len(final_text)}")
-            print(f"BASELINE_SECTION_COUNT={baseline_indicators['section_count']}/4")
-            print(f"FINAL_SECTION_COUNT={final_indicators['section_count']}/4")
-            print(f"BASELINE_ANCHOR_EXACT_HITS={baseline_indicators['anchor_exact_hits']}")
-            print(f"FINAL_ANCHOR_EXACT_HITS={final_indicators['anchor_exact_hits']}")
-            print(f"FINAL_STRONG_SUSPICIOUS_EVENTS={final_indicators['strong_suspicious_event_count']}")
+            print(
+                f"BASELINE_STRICT_SECTION_COUNT="
+                f"{baseline_indicators['strict_section_count']}/4"
+            )
+            print(
+                f"FINAL_STRICT_SECTION_COUNT="
+                f"{final_indicators['strict_section_count']}/4"
+            )
+            print(
+                f"BASELINE_ANCHOR_EXACT_HITS="
+                f"{baseline_indicators['anchor_exact_hits']}"
+            )
+            print(
+                f"FINAL_ANCHOR_EXACT_HITS="
+                f"{final_indicators['anchor_exact_hits']}"
+            )
+            print(
+                f"FINAL_STRONG_SUSPICIOUS_EVENTS="
+                f"{final_indicators['strong_suspicious_event_count']}"
+            )
+            print(f"SECONDARY_PROCESSING_EFFECT={effect}")
             print(f"REFERENCE_ACCURACY={reference_metrics['status']}")
             print(f"AUTOMATIC_REVIEW_STATUS={review_status}")
             print("AUTOMATIC_REVIEW_STATUS_IS_ACCURACY_MEASUREMENT=NO")
