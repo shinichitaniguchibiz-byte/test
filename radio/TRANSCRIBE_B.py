@@ -2,15 +2,12 @@ from __future__ import annotations
 
 import argparse
 import re
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
-
-import ctranslate2
-import faster_whisper
-from faster_whisper import WhisperModel
 
 
 MODEL_NAME = "large-v3"
@@ -20,8 +17,6 @@ DEFAULT_INPUT_FILE = "b.m4a"
 DEFAULT_OUTPUT_DIRECTORY = "stt_test"
 JST = timezone(timedelta(hours=9), name="JST")
 
-# Vocabulary hints only. These are intentionally generic so that the program
-# can be used for other Japanese-English lessons as well.
 HOTWORDS = (
     "NHK ラジオ英会話 Lesson Grammar and Vocabulary Essential Expressions "
     "Practical Usage Pronunciation Polish dialogue key sentence pronunciation "
@@ -31,6 +26,51 @@ HOTWORDS = (
 
 class TranscriptionError(RuntimeError):
     """Raised when a usable transcript cannot be produced."""
+
+
+class StepTimer:
+    """Measure and summarize each processing step."""
+
+    def __init__(self) -> None:
+        self.started_at = time.perf_counter()
+        self.steps: list[tuple[str, float, str]] = []
+        self.current_name: str | None = None
+        self.current_started_at: float | None = None
+
+    def start(self, name: str) -> None:
+        if self.current_name is not None:
+            self.finish("PASS")
+        self.current_name = name
+        self.current_started_at = time.perf_counter()
+
+    def finish(self, result: str = "PASS") -> None:
+        if self.current_name is None or self.current_started_at is None:
+            return
+        elapsed = time.perf_counter() - self.current_started_at
+        self.steps.append((self.current_name, elapsed, result))
+        self.current_name = None
+        self.current_started_at = None
+
+    def fail_current(self) -> None:
+        self.finish("FAILED")
+
+    @property
+    def total_seconds(self) -> float:
+        return time.perf_counter() - self.started_at
+
+    def print_summary(self, overall_result: str) -> None:
+        if self.current_name is not None:
+            self.finish("FAILED" if overall_result == "FAILED" else overall_result)
+
+        print()
+        print("PROCESS_TIME_SUMMARY")
+        for index, (name, elapsed, result) in enumerate(self.steps, start=1):
+            print(
+                f"STEP_{index:02d}={name} | RESULT={result} | "
+                f"ELAPSED_SECONDS={elapsed:.3f}"
+            )
+        print(f"TOTAL_ELAPSED_SECONDS={self.total_seconds:.3f}")
+        print(f"OVERALL_RESULT={overall_result}")
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -63,6 +103,32 @@ def resolve_path(script_directory: Path, value: str) -> Path:
     return (script_directory / path).resolve()
 
 
+def ensure_stt_virtual_environment(script_directory: Path) -> None:
+    """Relaunch with .venv-stt before importing the ML libraries."""
+
+    expected_python = script_directory / ".venv-stt" / "Scripts" / "python.exe"
+    current_python = Path(sys.executable).resolve()
+
+    if not expected_python.is_file():
+        raise FileNotFoundError(
+            f"The transcription virtual environment was not found: {expected_python}"
+        )
+
+    if current_python == expected_python.resolve():
+        return
+
+    print("PYTHON_ENVIRONMENT_SWITCH")
+    print(f"FROM={current_python}")
+    print(f"TO={expected_python}")
+
+    completed = subprocess.run(
+        [str(expected_python), str(Path(__file__).resolve()), *sys.argv[1:]],
+        cwd=str(script_directory),
+        check=False,
+    )
+    raise SystemExit(completed.returncode)
+
+
 def create_output_path(output_directory: Path, created_at: datetime) -> Path:
     output_directory.mkdir(parents=True, exist_ok=True)
     timestamp = created_at.astimezone(JST).strftime("%Y%m%d_%H%M%S")
@@ -76,7 +142,7 @@ def create_output_path(output_directory: Path, created_at: datetime) -> Path:
     return candidate
 
 
-def validate_environment(input_file: Path) -> None:
+def validate_environment(input_file: Path, ctranslate2: object) -> None:
     if not input_file.is_file():
         raise FileNotFoundError(f"Input file was not found: {input_file}")
 
@@ -92,7 +158,7 @@ def validate_environment(input_file: Path) -> None:
         )
 
 
-def load_model() -> WhisperModel:
+def load_model(WhisperModel: object) -> object:
     print("MODEL_LOAD_START")
     print(f"MODEL={MODEL_NAME}")
     print(f"COMPUTE_TYPE={COMPUTE_TYPE}")
@@ -110,39 +176,25 @@ def load_model() -> WhisperModel:
     return model
 
 
-def transcribe_audio(model: WhisperModel, input_file: Path) -> tuple[list[object], object]:
+def transcribe_audio(model: object, input_file: Path) -> tuple[list[object], object]:
     print("TRANSCRIPTION_START")
 
     segments_iterator, information = model.transcribe(
         str(input_file),
         task="transcribe",
-
-        # Detect the language automatically and re-evaluate it for internal
-        # segments. This is required for Japanese explanations alternating
-        # with English dialogue and pronunciation exercises.
         language=None,
         multilingual=True,
-
-        # Accuracy-oriented decoding with fallback for difficult sections.
         beam_size=5,
         best_of=5,
         patience=1.0,
         temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
         length_penalty=1.0,
-
-        # Retain short phrases and pauses used in pronunciation drills.
         vad_filter=False,
-
-        # This reduces the decoder repetition loop seen in the earlier test.
         condition_on_previous_text=False,
         prompt_reset_on_temperature=0.5,
-
-        # Timestamps are used internally to create readable paragraphs, but
-        # only a plain UTF-8 text file is written.
         without_timestamps=False,
         word_timestamps=True,
         hallucination_silence_threshold=2.0,
-
         compression_ratio_threshold=2.4,
         log_prob_threshold=-1.0,
         no_speech_threshold=0.6,
@@ -167,8 +219,7 @@ def ends_sentence(text: str) -> bool:
 
 def normalize_segment_text(text: str) -> str:
     text = text.replace("\u3000", " ").strip()
-    text = re.sub(r"[ \t]+", " ", text)
-    return text
+    return re.sub(r"[ \t]+", " ", text)
 
 
 def append_text(current: str, new_text: str) -> str:
@@ -195,8 +246,6 @@ def format_transcript(segments: Iterable[object]) -> str:
         end = float(getattr(segment, "end", start))
         gap = 0.0 if previous_end is None else max(0.0, start - previous_end)
 
-        # A clear pause starts a new paragraph. Short pauses remain in the same
-        # paragraph so repeated English practice phrases are not discarded.
         if current_paragraph and gap >= 1.25:
             paragraphs.append(current_paragraph.strip())
             current_paragraph = ""
@@ -224,8 +273,6 @@ def format_transcript(segments: Iterable[object]) -> str:
 def detect_decoder_loop(text: str) -> str | None:
     compact = re.sub(r"\s+", "", text)
 
-    # Only flag very long, obvious loops. Normal repetition exercises such as
-    # repeating one sentence two or three times are preserved.
     for unit_length in range(2, 17):
         pattern = re.compile(rf"(.{{{unit_length}}})\1{{11,}}")
         match = pattern.search(compact)
@@ -245,17 +292,30 @@ def write_text_atomically(output_file: Path, text: str) -> None:
     temporary_file.replace(output_file)
 
 
-def main() -> int:
-    arguments = parse_arguments()
-    script_directory = Path(__file__).resolve().parent
-    created_at = datetime.now(JST)
-
-    input_file = resolve_path(script_directory, arguments.input)
-    output_directory = resolve_path(script_directory, arguments.output_dir)
-    output_file = create_output_path(output_directory, created_at)
+def run() -> int:
+    timer = StepTimer()
+    overall_result = "FAILED"
+    output_file: Path | None = None
 
     try:
-        validate_environment(input_file)
+        timer.start("parse_arguments_and_paths")
+        arguments = parse_arguments()
+        script_directory = Path(__file__).resolve().parent
+        created_at = datetime.now(JST)
+        input_file = resolve_path(script_directory, arguments.input)
+        output_directory = resolve_path(script_directory, arguments.output_dir)
+        output_file = create_output_path(output_directory, created_at)
+        timer.finish()
+
+        timer.start("import_transcription_libraries")
+        import ctranslate2
+        import faster_whisper
+        from faster_whisper import WhisperModel
+        timer.finish()
+
+        timer.start("validate_environment")
+        validate_environment(input_file, ctranslate2)
+        timer.finish()
 
         print("TRANSCRIPTION_CONFIGURATION")
         print(f"PYTHON={sys.executable}")
@@ -273,45 +333,76 @@ def main() -> int:
         print(f"INPUT={input_file}")
         print(f"OUTPUT={output_file}")
 
-        model = load_model()
-        started_at = time.perf_counter()
+        timer.start("load_model")
+        model = load_model(WhisperModel)
+        timer.finish()
 
+        timer.start("transcribe_audio")
         segments, information = transcribe_audio(model, input_file)
-        transcript = format_transcript(segments)
+        timer.finish()
 
+        timer.start("format_and_validate_transcript")
+        transcript = format_transcript(segments)
         repeated_unit = detect_decoder_loop(transcript)
         if repeated_unit is not None:
             raise TranscriptionError(
                 "An obvious decoder repetition loop was detected: "
                 f"{repeated_unit!r}"
             )
+        timer.finish()
 
+        timer.start("write_output_file")
         write_text_atomically(output_file, transcript)
+        timer.finish()
 
-        elapsed_seconds = time.perf_counter() - started_at
         audio_seconds = float(getattr(information, "duration", 0.0))
+        transcription_seconds = next(
+            (
+                elapsed
+                for name, elapsed, _result in timer.steps
+                if name == "transcribe_audio"
+            ),
+            0.0,
+        )
         realtime_factor = (
-            elapsed_seconds / audio_seconds if audio_seconds > 0 else 0.0
+            transcription_seconds / audio_seconds if audio_seconds > 0 else 0.0
         )
 
+        print("TRANSCRIPTION_RESULT=PASS")
+        print(f"OUTPUT_FILE={output_file}")
+        print(f"SEGMENT_COUNT={len(segments)}")
+        print(f"AUDIO_SECONDS={audio_seconds:.3f}")
+        print(f"REALTIME_FACTOR={realtime_factor:.4f}")
+
+        overall_result = "PASS"
+        return 0
+
     except KeyboardInterrupt:
+        timer.fail_current()
         print("TRANSCRIPTION_RESULT=CANCELLED", file=sys.stderr)
+        overall_result = "CANCELLED"
         return 130
+
     except Exception as exception:
+        timer.fail_current()
         print("TRANSCRIPTION_RESULT=FAILED", file=sys.stderr)
         print(
             f"ERROR={type(exception).__name__}: {exception}",
             file=sys.stderr,
         )
+        if output_file is not None:
+            print(f"OUTPUT_FILE_NOT_CREATED={output_file}", file=sys.stderr)
+        overall_result = "FAILED"
         return 1
 
-    print("TRANSCRIPTION_RESULT=PASS")
-    print(f"OUTPUT_FILE={output_file}")
-    print(f"SEGMENT_COUNT={len(segments)}")
-    print(f"AUDIO_SECONDS={audio_seconds:.3f}")
-    print(f"ELAPSED_SECONDS={elapsed_seconds:.3f}")
-    print(f"REALTIME_FACTOR={realtime_factor:.4f}")
-    return 0
+    finally:
+        timer.print_summary(overall_result)
+
+
+def main() -> int:
+    script_directory = Path(__file__).resolve().parent
+    ensure_stt_virtual_environment(script_directory)
+    return run()
 
 
 if __name__ == "__main__":
