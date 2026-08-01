@@ -19,14 +19,24 @@ COMPUTE_TYPE = "float16"
 DEFAULT_INPUT_FILE = "b.m4a"
 DEFAULT_OUTPUT_DIRECTORY = "stt_test"
 DEFAULT_BATCH_SIZE = 8
-DEFAULT_CONTEXT_SECONDS = 120
-MAX_REPAIR_SEGMENTS = 8
+DEFAULT_CONTEXT_SECONDS = 150
+DEFAULT_CLIP_SECONDS = 28.0
+CLOSING_REPAIR_SECONDS = 90
+MAX_LANGUAGE_REPAIRS = 12
 SAMPLE_RATE = 16000
 JST = timezone(timedelta(hours=9), name="JST")
 
 FIXED_HOTWORDS = (
-    "Lesson, Grammar and Vocabulary, Essential Expressions, Practical Usage, "
+    "Grammar and Vocabulary, Essential Expressions, Practical Usage, "
     "Pronunciation Polish"
+)
+
+KNOWN_HALLUCINATION_PATTERNS = (
+    r"English Subtitles by the Amara\.org community",
+    r"Subtitles by the Amara\.org community",
+    r"日本語の解説と英語のダイアログ.{0,100}文字起こし",
+    r"同じ英語の繰り返しも残し(?:てください)?(?:[、, ]*同じ英語の繰り返しも残し(?:てください)?)*",
+    r"英語の繰り返しと英語の繰り返しも残し.{0,100}",
 )
 
 SECTION_ALIASES: dict[str, tuple[str, ...]] = {
@@ -36,8 +46,8 @@ SECTION_ALIASES: dict[str, tuple[str, ...]] = {
     ),
     "Essential Expressions": (
         "Essential Expressions",
-        "重要表現",
         "エッセンシャル・エクスプレッションズ",
+        "重要表現",
     ),
     "Practical Usage": (
         "Practical Usage",
@@ -51,17 +61,9 @@ SECTION_ALIASES: dict[str, tuple[str, ...]] = {
     ),
 }
 
-KNOWN_HALLUCINATION_PATTERNS = (
-    r"English Subtitles by the Amara\.org community",
-    r"Subtitles by the Amara\.org community",
-    r"日本語の解説と英語のダイアログ.{0,120}文字起こし",
-    r"同じ英語の繰り返しも残し(?:てください)?(?:[、, ]*同じ英語の繰り返しも残し(?:てください)?)*",
-    r"英語の繰り返しと英語の繰り返しも残し.{0,120}",
-)
-
 
 class TranscriptionError(RuntimeError):
-    """Raised when a usable transcript cannot be produced."""
+    pass
 
 
 @dataclass
@@ -98,15 +100,15 @@ class StepTimer:
     def fail_current(self) -> None:
         self.finish("FAILED")
 
+    @property
+    def total_seconds(self) -> float:
+        return time.perf_counter() - self.started_at
+
     def step_seconds(self, name: str) -> float:
         for step_name, elapsed, _result in self.steps:
             if step_name == name:
                 return elapsed
         return 0.0
-
-    @property
-    def total_seconds(self) -> float:
-        return time.perf_counter() - self.started_at
 
     def print_summary(self, overall_result: str) -> None:
         if self.current_name is not None:
@@ -126,16 +128,18 @@ class StepTimer:
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Create an AI-handoff transcript from Japanese-English lesson audio."
+            "Create a complete AI-handoff transcript from mixed Japanese-English "
+            "lesson audio using full-coverage batched transcription and targeted repair."
         )
     )
     parser.add_argument("--input", default=DEFAULT_INPUT_FILE)
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIRECTORY)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument(
-        "--context-seconds",
-        type=int,
-        default=DEFAULT_CONTEXT_SECONDS,
+        "--context-seconds", type=int, default=DEFAULT_CONTEXT_SECONDS
+    )
+    parser.add_argument(
+        "--clip-seconds", type=float, default=DEFAULT_CLIP_SECONDS
     )
     return parser.parse_args()
 
@@ -188,18 +192,26 @@ def validate_environment(
     input_file: Path,
     batch_size: int,
     context_seconds: int,
+    clip_seconds: float,
     ctranslate2: object,
 ) -> None:
     if not input_file.is_file():
         raise FileNotFoundError(f"Input file was not found: {input_file}")
     if batch_size < 1:
         raise ValueError("--batch-size must be at least 1.")
-    if context_seconds < 30:
-        raise ValueError("--context-seconds must be at least 30.")
+    if context_seconds < 60:
+        raise ValueError("--context-seconds must be at least 60.")
+    if not 10.0 <= clip_seconds <= 29.5:
+        raise ValueError("--clip-seconds must be between 10.0 and 29.5.")
+
     if ctranslate2.get_cuda_device_count() < 1:
         raise TranscriptionError("CTranslate2 cannot detect a CUDA GPU.")
-    if COMPUTE_TYPE not in ctranslate2.get_supported_compute_types("cuda"):
-        raise TranscriptionError(f"{COMPUTE_TYPE} is not supported by the GPU.")
+
+    supported = ctranslate2.get_supported_compute_types("cuda")
+    if COMPUTE_TYPE not in supported:
+        raise TranscriptionError(
+            f"{COMPUTE_TYPE} is not supported. Supported types: {sorted(supported)}"
+        )
 
 
 def build_batch_candidates(initial_batch_size: int) -> list[int]:
@@ -231,6 +243,7 @@ def load_model(WhisperModel: object) -> object:
     print("MODEL_LOAD_START")
     print(f"MODEL={MODEL_NAME}")
     print(f"COMPUTE_TYPE={COMPUTE_TYPE}")
+
     model = WhisperModel(
         MODEL_NAME,
         device=DEVICE,
@@ -238,15 +251,16 @@ def load_model(WhisperModel: object) -> object:
         compute_type=COMPUTE_TYPE,
         flash_attention=False,
     )
+
     print("FLASH_ATTENTION=False")
     print("MODEL_LOAD_COMPLETE")
     return model
 
 
-def to_record(segment: object, offset_seconds: float = 0.0) -> SegmentRecord:
+def to_record(segment: object, offset: float = 0.0) -> SegmentRecord:
     return SegmentRecord(
-        start=float(getattr(segment, "start", 0.0)) + offset_seconds,
-        end=float(getattr(segment, "end", 0.0)) + offset_seconds,
+        start=float(getattr(segment, "start", 0.0)) + offset,
+        end=float(getattr(segment, "end", 0.0)) + offset,
         text=str(getattr(segment, "text", "")).strip(),
         avg_logprob=float(getattr(segment, "avg_logprob", -1.0)),
         compression_ratio=float(getattr(segment, "compression_ratio", 0.0)),
@@ -255,7 +269,9 @@ def to_record(segment: object, offset_seconds: float = 0.0) -> SegmentRecord:
 
 
 def normalize_english(text: str) -> str:
-    return " ".join(re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", text.lower()))
+    return " ".join(
+        re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", text.lower())
+    )
 
 
 def english_word_count(text: str) -> int:
@@ -275,7 +291,7 @@ def extract_english_candidates(text: str) -> list[str]:
     for piece in re.split(r"(?<=[.!?])\s+|[\r\n]+", text):
         piece = re.sub(r"\s+", " ", piece).strip(" -–—\t")
         words = english_word_count(piece)
-        if not 4 <= words <= 24:
+        if words < 4 or words > 24:
             continue
         compact_length = len(re.sub(r"\s+", "", piece))
         if compact_length == 0:
@@ -284,24 +300,6 @@ def extract_english_candidates(text: str) -> list[str]:
             continue
         candidates.append(piece)
     return candidates
-
-
-def choose_representative(items: list[str]) -> str:
-    if len(items) == 1:
-        return items[0]
-
-    best = items[0]
-    best_score = -1.0
-    for candidate in items:
-        normalized = normalize_english(candidate)
-        score = sum(
-            SequenceMatcher(None, normalized, normalize_english(other)).ratio()
-            for other in items
-        ) / len(items)
-        if score > best_score:
-            best = candidate
-            best_score = score
-    return best
 
 
 def extract_repeated_phrases(records: Iterable[SegmentRecord]) -> list[str]:
@@ -314,7 +312,8 @@ def extract_repeated_phrases(records: Iterable[SegmentRecord]) -> list[str]:
         normalized = normalize_english(candidate)
         if not normalized:
             continue
-        matched_index: int | None = None
+
+        best_index: int | None = None
         best_ratio = 0.0
         for index, cluster in enumerate(clusters):
             ratio = SequenceMatcher(
@@ -323,65 +322,95 @@ def extract_repeated_phrases(records: Iterable[SegmentRecord]) -> list[str]:
                 normalize_english(cluster[0]),
             ).ratio()
             if ratio > best_ratio:
-                matched_index = index
+                best_index = index
                 best_ratio = ratio
-        if matched_index is not None and best_ratio >= 0.82:
-            clusters[matched_index].append(candidate)
+
+        if best_index is not None and best_ratio >= 0.82:
+            clusters[best_index].append(candidate)
         else:
             clusters.append([candidate])
 
     repeated: list[tuple[int, str]] = []
     for cluster in clusters:
-        if len(cluster) >= 2:
-            repeated.append((len(cluster), choose_representative(cluster)))
-    repeated.sort(key=lambda item: (-item[0], -english_word_count(item[1])))
+        if len(cluster) < 2:
+            continue
+        representative = max(cluster, key=lambda value: len(normalize_english(value)))
+        repeated.append((len(cluster), representative))
+
+    repeated.sort(key=lambda item: (-item[0], -len(item[1])))
     return [phrase for _count, phrase in repeated[:8]]
 
 
 def build_hotwords(repeated_phrases: Iterable[str]) -> str:
     values = [FIXED_HOTWORDS]
     values.extend(repeated_phrases)
-    return ", ".join(values)[:800]
+    return ", ".join(values)[:700]
 
 
-def run_context_pass(
+def transcribe_window(
     model: object,
     audio: object,
-    context_seconds: int,
-) -> list[str]:
-    sample_count = min(len(audio), context_seconds * SAMPLE_RATE)
-    context_audio = audio[:sample_count]
-    segments_iterator, _information = model.transcribe(
-        context_audio,
+    start_seconds: float,
+    end_seconds: float,
+    hotwords: str,
+    language: str | None = None,
+) -> list[SegmentRecord]:
+    audio_duration = len(audio) / SAMPLE_RATE
+    start_seconds = max(0.0, start_seconds)
+    end_seconds = min(audio_duration, end_seconds)
+    if end_seconds <= start_seconds:
+        return []
+
+    start_sample = int(start_seconds * SAMPLE_RATE)
+    end_sample = int(end_seconds * SAMPLE_RATE)
+    audio_slice = audio[start_sample:end_sample]
+
+    iterator, _information = model.transcribe(
+        audio_slice,
         task="transcribe",
-        language=None,
+        language=language,
         multilingual=True,
-        beam_size=3,
-        best_of=3,
-        temperature=0.0,
+        beam_size=5,
+        best_of=5,
+        patience=1.0,
+        temperature=(0.0, 0.2, 0.4),
         vad_filter=False,
         condition_on_previous_text=False,
         without_timestamps=False,
         word_timestamps=False,
-        hotwords=FIXED_HOTWORDS,
+        hotwords=hotwords,
         log_progress=False,
     )
-    records = [to_record(segment) for segment in segments_iterator]
-    return extract_repeated_phrases(records)
+
+    return [to_record(segment, start_seconds) for segment in iterator]
 
 
-def transcribe_full_once(
+def build_full_coverage_clips(
+    audio_seconds: float,
+    clip_seconds: float,
+) -> list[dict[str, float]]:
+    clips: list[dict[str, float]] = []
+    start = 0.0
+    while start < audio_seconds:
+        end = min(audio_seconds, start + clip_seconds)
+        clips.append({"start": start, "end": end})
+        start = end
+    return clips
+
+
+def transcribe_batched_once(
     model: object,
     BatchedInferencePipeline: object,
     audio: object,
+    clips: list[dict[str, float]],
     batch_size: int,
     hotwords: str,
 ) -> tuple[list[SegmentRecord], object]:
     pipeline = BatchedInferencePipeline(model=model)
-    segments_iterator, information = pipeline.transcribe(
+    iterator, information = pipeline.transcribe(
         audio,
         task="transcribe",
-        language=None,
+        language="ja",
         multilingual=True,
         beam_size=5,
         best_of=5,
@@ -391,48 +420,43 @@ def transcribe_full_once(
         no_repeat_ngram_size=0,
         temperature=0.0,
         hotwords=hotwords,
-        vad_filter=True,
-        vad_parameters={
-            "threshold": 0.20,
-            "min_speech_duration_ms": 50,
-            "min_silence_duration_ms": 700,
-            "speech_pad_ms": 500,
-        },
-        condition_on_previous_text=False,
+        vad_filter=False,
+        clip_timestamps=clips,
+        chunk_length=30,
         without_timestamps=False,
         word_timestamps=False,
-        compression_ratio_threshold=2.4,
-        log_prob_threshold=-1.0,
-        no_speech_threshold=0.6,
         batch_size=batch_size,
         log_progress=True,
     )
 
-    records = [to_record(segment) for segment in segments_iterator]
+    records = [to_record(segment) for segment in iterator]
     if not records:
         raise TranscriptionError("Whisper returned no transcription segments.")
     return records, information
 
 
-def transcribe_full_with_fallback(
+def transcribe_batched_with_fallback(
     model: object,
     BatchedInferencePipeline: object,
     audio: object,
+    clips: list[dict[str, float]],
     batch_candidates: Iterable[int],
     hotwords: str,
 ) -> tuple[list[SegmentRecord], object, int]:
     last_exception: BaseException | None = None
+
     for batch_size in batch_candidates:
         print()
         print("TRANSCRIPTION_ATTEMPT")
         print(f"BATCH_SIZE={batch_size}")
         try:
-            records, information = transcribe_full_once(
-                model,
-                BatchedInferencePipeline,
-                audio,
-                batch_size,
-                hotwords,
+            records, information = transcribe_batched_once(
+                model=model,
+                BatchedInferencePipeline=BatchedInferencePipeline,
+                audio=audio,
+                clips=clips,
+                batch_size=batch_size,
+                hotwords=hotwords,
             )
             return records, information, batch_size
         except Exception as exception:
@@ -441,176 +465,133 @@ def transcribe_full_with_fallback(
                 raise
             print(f"GPU_MEMORY_RETRY=BATCH_SIZE_{batch_size}")
             gc.collect()
+
     raise TranscriptionError(
         "Transcription failed even at the smallest batch size."
     ) from last_exception
 
 
-def transcribe_slice(
-    model: object,
-    audio: object,
-    start_seconds: float,
-    end_seconds: float,
-    language: str | None,
-    hotwords: str,
-) -> SegmentRecord:
-    padded_start = max(0.0, start_seconds - 0.75)
-    padded_end = min(len(audio) / SAMPLE_RATE, end_seconds + 0.75)
-    start_sample = int(padded_start * SAMPLE_RATE)
-    end_sample = int(padded_end * SAMPLE_RATE)
-    audio_slice = audio[start_sample:end_sample]
-
-    segments_iterator, _information = model.transcribe(
-        audio_slice,
-        task="transcribe",
-        language=language,
-        multilingual=(language is None),
-        beam_size=5,
-        best_of=5,
-        patience=1.0,
-        temperature=(0.0, 0.2, 0.4),
-        vad_filter=False,
-        condition_on_previous_text=False,
-        without_timestamps=True,
-        word_timestamps=False,
-        hotwords=hotwords,
-        log_progress=False,
-    )
-
-    texts: list[str] = []
-    logprobs: list[float] = []
-    for segment in segments_iterator:
-        text = str(getattr(segment, "text", "")).strip()
-        if text:
-            texts.append(text)
-            logprobs.append(float(getattr(segment, "avg_logprob", -1.0)))
-
-    return SegmentRecord(
-        start=start_seconds,
-        end=end_seconds,
-        text=" ".join(texts).strip(),
-        avg_logprob=(sum(logprobs) / len(logprobs) if logprobs else -10.0),
-        compression_ratio=0.0,
-        no_speech_prob=0.0,
-    )
+def replace_window(
+    base: list[SegmentRecord],
+    replacement: list[SegmentRecord],
+    start: float,
+    end: float,
+) -> list[SegmentRecord]:
+    retained = [
+        item
+        for item in base
+        if item.end <= start or item.start >= end
+    ]
+    retained.extend(replacement)
+    return sorted(retained, key=lambda item: (item.start, item.end))
 
 
-def canonicalize_learned_phrase(
-    text: str,
-    repeated_phrases: Iterable[str],
-) -> str:
+def deduplicate_overlaps(records: Iterable[SegmentRecord]) -> list[SegmentRecord]:
+    result: list[SegmentRecord] = []
+
+    for current in sorted(records, key=lambda item: (item.start, item.end)):
+        if not current.text.strip():
+            continue
+        if not result:
+            result.append(current)
+            continue
+
+        previous = result[-1]
+        overlap = min(previous.end, current.end) - max(previous.start, current.start)
+        if overlap <= 0.15:
+            result.append(current)
+            continue
+
+        left = normalize_english(previous.text) or previous.text
+        right = normalize_english(current.text) or current.text
+        similarity = SequenceMatcher(None, left, right).ratio()
+
+        if similarity >= 0.88 or left in right or right in left:
+            if current.avg_logprob > previous.avg_logprob or len(current.text) > len(previous.text):
+                result[-1] = current
+            continue
+
+        result.append(current)
+
+    return result
+
+
+def resembles_known_english(text: str, repeated_phrases: Iterable[str]) -> bool:
     normalized = normalize_english(text)
-    if not normalized or english_word_count(text) < 4:
-        return text
-
-    best_phrase: str | None = None
-    best_ratio = 0.0
+    if not normalized:
+        return False
     for phrase in repeated_phrases:
-        ratio = SequenceMatcher(
-            None,
-            normalized,
-            normalize_english(phrase),
-        ).ratio()
-        if ratio > best_ratio:
-            best_phrase = phrase
-            best_ratio = ratio
-
-    if best_phrase is not None and best_ratio >= 0.76:
-        return best_phrase
-    return text
+        phrase_normalized = normalize_english(phrase)
+        if not phrase_normalized:
+            continue
+        if SequenceMatcher(None, normalized, phrase_normalized).ratio() >= 0.72:
+            return True
+    return False
 
 
-def is_probable_wrong_language(record: SegmentRecord) -> bool:
-    duration = max(0.0, record.end - record.start)
-    return (
-        duration >= 6.0
-        and english_word_count(record.text) >= 16
-        and japanese_character_count(record.text) <= 4
-        and record.avg_logprob <= -0.55
-    )
-
-
-def should_repair(record: SegmentRecord) -> bool:
-    lowered = record.text.lower()
-    return (
-        record.avg_logprob <= -0.80
-        or record.compression_ratio >= 2.35
-        or is_probable_wrong_language(record)
-        or "macaque" in lowered
-    )
-
-
-def choose_repair_candidate(
-    original: SegmentRecord,
-    automatic: SegmentRecord,
-    japanese: SegmentRecord,
-    repeated_phrases: Iterable[str],
-) -> SegmentRecord:
-    automatic.text = canonicalize_learned_phrase(
-        automatic.text,
-        repeated_phrases,
-    )
-
-    if is_probable_wrong_language(original):
-        if (
-            japanese_character_count(japanese.text)
-            >= max(10, japanese_character_count(original.text) + 8)
-            and japanese.avg_logprob >= original.avg_logprob - 0.25
-        ):
-            return japanese
-
-    if "macaque" in original.text.lower() and "macaque" not in automatic.text.lower():
-        if automatic.text:
-            return automatic
-
-    candidates = [original, automatic]
-    candidates = [candidate for candidate in candidates if candidate.text.strip()]
-    return max(candidates, key=lambda candidate: candidate.avg_logprob)
-
-
-def repair_suspicious_segments(
+def repair_probable_language_errors(
     model: object,
     audio: object,
     records: list[SegmentRecord],
+    repeated_phrases: list[str],
     hotwords: str,
-    repeated_phrases: Iterable[str],
 ) -> tuple[list[SegmentRecord], int]:
-    repaired: list[SegmentRecord] = []
+    repaired = list(records)
     repair_count = 0
 
-    for record in records:
-        if repair_count >= MAX_REPAIR_SEGMENTS or not should_repair(record):
-            record.text = canonicalize_learned_phrase(
-                record.text,
-                repeated_phrases,
-            )
-            repaired.append(record)
+    for index, record in enumerate(list(repaired)):
+        if repair_count >= MAX_LANGUAGE_REPAIRS:
+            break
+
+        text = record.text.strip()
+        words = english_word_count(text)
+        japanese = japanese_character_count(text)
+        duration = max(0.0, record.end - record.start)
+
+        previous_has_japanese = (
+            index > 0 and japanese_character_count(repaired[index - 1].text) >= 4
+        )
+        next_has_japanese = (
+            index + 1 < len(repaired)
+            and japanese_character_count(repaired[index + 1].text) >= 4
+        )
+
+        candidate = (
+            japanese == 0
+            and 3 <= words <= 35
+            and duration >= 1.8
+            and (previous_has_japanese or next_has_japanese)
+            and record.avg_logprob <= -0.45
+            and not resembles_known_english(text, repeated_phrases)
+            and not any(section.lower() in text.lower() for section in SECTION_ALIASES)
+        )
+        if not candidate:
             continue
 
-        automatic = transcribe_slice(
-            model,
-            audio,
-            record.start,
-            record.end,
-            None,
-            hotwords,
+        japanese_records = transcribe_window(
+            model=model,
+            audio=audio,
+            start_seconds=max(0.0, record.start - 0.5),
+            end_seconds=record.end + 0.5,
+            hotwords=hotwords,
+            language="ja",
         )
-        japanese = transcribe_slice(
-            model,
-            audio,
-            record.start,
-            record.end,
-            "ja",
-            hotwords,
-        )
-        selected = choose_repair_candidate(
-            record,
-            automatic,
-            japanese,
-            repeated_phrases,
-        )
-        repaired.append(selected)
-        if selected.text != record.text:
+        if not japanese_records:
+            continue
+
+        repaired_text = " ".join(item.text for item in japanese_records).strip()
+        repaired_japanese = japanese_character_count(repaired_text)
+        repaired_logprob = sum(item.avg_logprob for item in japanese_records) / len(japanese_records)
+
+        if repaired_japanese >= 6 and repaired_logprob >= record.avg_logprob - 0.05:
+            repaired[index] = SegmentRecord(
+                start=record.start,
+                end=record.end,
+                text=repaired_text,
+                avg_logprob=repaired_logprob,
+                compression_ratio=record.compression_ratio,
+                no_speech_prob=record.no_speech_prob,
+            )
             repair_count += 1
 
     return repaired, repair_count
@@ -618,51 +599,92 @@ def repair_suspicious_segments(
 
 def remove_known_hallucinations(text: str) -> tuple[str, int]:
     result = text
-    removed = 0
+    count_total = 0
     for pattern in KNOWN_HALLUCINATION_PATTERNS:
         result, count = re.subn(pattern, "", result, flags=re.IGNORECASE)
-        removed += count
-    return re.sub(r"[ \t]+", " ", result).strip(), removed
+        count_total += count
+    return re.sub(r"[ \t]+", " ", result).strip(), count_total
 
 
-def split_section_heading(text: str) -> tuple[str | None, str]:
+def canonicalize_repeated_phrase(
+    text: str,
+    repeated_phrases: Iterable[str],
+) -> str:
+    normalized = normalize_english(text)
+    if english_word_count(text) < 4 or not normalized:
+        return text
+
+    best_phrase: str | None = None
+    best_ratio = 0.0
+    for phrase in repeated_phrases:
+        ratio = SequenceMatcher(None, normalized, normalize_english(phrase)).ratio()
+        if ratio > best_ratio:
+            best_phrase = phrase
+            best_ratio = ratio
+
+    if best_phrase is not None and best_ratio >= 0.80:
+        return best_phrase
+    return text
+
+
+def split_heading(text: str) -> tuple[str | None, str]:
     stripped = text.strip()
     for canonical, aliases in SECTION_ALIASES.items():
         for alias in aliases:
             match = re.match(re.escape(alias), stripped, flags=re.IGNORECASE)
             if match:
-                remainder = stripped[match.end() :].lstrip(" ：:-–—")
+                remainder = stripped[match.end():].lstrip(" ：:-–—")
                 return canonical, remainder
     return None, stripped
 
 
-def format_transcript(records: Iterable[SegmentRecord]) -> tuple[str, int]:
-    paragraphs: list[str] = []
-    removed_hallucinations = 0
+def format_transcript(
+    records: Iterable[SegmentRecord],
+    repeated_phrases: list[str],
+) -> tuple[str, int]:
+    lines: list[str] = []
+    previous_end: float | None = None
+    removed_total = 0
     last_heading: str | None = None
 
     for record in records:
-        text = record.text.replace("\u3000", " ").strip()
-        text, removed = remove_known_hallucinations(text)
-        removed_hallucinations += removed
+        text, removed = remove_known_hallucinations(record.text)
+        removed_total += removed
         if not text:
             continue
 
-        heading, remainder = split_section_heading(text)
+        text = canonicalize_repeated_phrase(text, repeated_phrases)
+        heading, remainder = split_heading(text)
+
         if heading is not None:
+            if lines and lines[-1] != "":
+                lines.append("")
             if heading != last_heading:
-                paragraphs.append(heading)
+                lines.append(heading)
+                lines.append("")
                 last_heading = heading
             if remainder:
-                paragraphs.append(remainder)
-        else:
-            paragraphs.append(text)
+                lines.append(remainder)
+            previous_end = record.end
+            continue
 
-    transcript = "\n\n".join(paragraph for paragraph in paragraphs if paragraph)
-    transcript = re.sub(r"\n{3,}", "\n\n", transcript).strip()
+        gap = 0.0 if previous_end is None else max(0.0, record.start - previous_end)
+        if gap >= 0.85 and lines and lines[-1] != "":
+            lines.append("")
+
+        lines.append(text)
+        previous_end = record.end
+
+    compact_lines: list[str] = []
+    for line in lines:
+        if line == "" and compact_lines and compact_lines[-1] == "":
+            continue
+        compact_lines.append(line)
+
+    transcript = "\n".join(compact_lines).strip()
     if not transcript:
         raise TranscriptionError("The transcription text is empty.")
-    return transcript + "\n", removed_hallucinations
+    return transcript + "\n", removed_total
 
 
 def detect_decoder_loop(text: str) -> str | None:
@@ -682,37 +704,31 @@ def find_sections(text: str) -> list[str]:
     return found
 
 
-def count_learned_phrase_occurrences(
-    text: str,
-    repeated_phrases: Iterable[str],
-) -> int:
+def count_phrase_occurrences(text: str, phrases: Iterable[str]) -> int:
     normalized_text = normalize_english(text)
-    count = 0
-    for phrase in repeated_phrases:
-        normalized_phrase = normalize_english(phrase)
-        if normalized_phrase:
-            count += normalized_text.count(normalized_phrase)
-    return count
+    return sum(
+        normalized_text.count(normalize_english(phrase))
+        for phrase in phrases
+        if normalize_english(phrase)
+    )
 
 
 def print_quality_summary(
     text: str,
     audio_seconds: float,
     repeated_phrases: list[str],
-    repaired_segments: int,
     removed_hallucinations: int,
+    repaired_languages: int,
 ) -> bool:
     found_sections = find_sections(text)
     missing_sections = [
         section for section in SECTION_ALIASES if section not in found_sections
     ]
-    minimum_characters = max(2500, int(audio_seconds * 4.5))
+    phrase_occurrences = count_phrase_occurrences(text, repeated_phrases)
+    minimum_characters = max(3500, int(audio_seconds * 5.0))
     decoder_loop = detect_decoder_loop(text)
-    phrase_occurrences = count_learned_phrase_occurrences(
-        text,
-        repeated_phrases,
-    )
-    handoff_ready = (
+
+    ready = (
         len(found_sections) == len(SECTION_ALIASES)
         and len(text) >= minimum_characters
         and decoder_loop is None
@@ -729,19 +745,19 @@ def print_quality_summary(
     print("MISSING_SECTIONS=" + (" | ".join(missing_sections) if missing_sections else "NONE"))
     print(f"DISCOVERED_REPEATED_PHRASES={len(repeated_phrases)}")
     print(f"REPEATED_PHRASE_OCCURRENCES={phrase_occurrences}")
-    print(f"SUSPICIOUS_SEGMENTS_REPAIRED={repaired_segments}")
+    print(f"LANGUAGE_ERRORS_REPAIRED={repaired_languages}")
     print(f"KNOWN_HALLUCINATIONS_REMOVED={removed_hallucinations}")
     print(f"DECODER_LOOP={'NONE' if decoder_loop is None else decoder_loop}")
-    print(f"AI_HANDOFF_READY={'YES' if handoff_ready else 'NO'}")
-    return handoff_ready
+    print(f"AI_HANDOFF_READY={'YES' if ready else 'NO'}")
+    return ready
 
 
 def write_text_atomically(output_file: Path, text: str) -> None:
-    temporary_file = output_file.with_name(output_file.name + ".part")
-    if temporary_file.exists():
-        temporary_file.unlink()
-    temporary_file.write_text(text, encoding="utf-8")
-    temporary_file.replace(output_file)
+    temporary = output_file.with_name(output_file.name + ".part")
+    if temporary.exists():
+        temporary.unlink()
+    temporary.write_text(text, encoding="utf-8")
+    temporary.replace(output_file)
 
 
 def run() -> int:
@@ -769,10 +785,11 @@ def run() -> int:
 
         timer.start("validate_environment")
         validate_environment(
-            input_file,
-            arguments.batch_size,
-            arguments.context_seconds,
-            ctranslate2,
+            input_file=input_file,
+            batch_size=arguments.batch_size,
+            context_seconds=arguments.context_seconds,
+            clip_seconds=arguments.clip_seconds,
+            ctranslate2=ctranslate2,
         )
         timer.finish()
 
@@ -783,13 +800,12 @@ def run() -> int:
         print(f"CUDA_DEVICES={ctranslate2.get_cuda_device_count()}")
         print(f"MODEL={MODEL_NAME}")
         print(f"COMPUTE_TYPE={COMPUTE_TYPE}")
-        print("LANGUAGE=auto")
+        print("LANGUAGE_BASE=ja")
         print("MULTILINGUAL=True")
         print("BATCHED_INFERENCE=True")
-        print("VAD_FILTER=True")
-        print("VAD_THRESHOLD=0.20")
-        print("WORD_TIMESTAMPS=False")
-        print("INITIAL_PROMPT=None")
+        print("VAD_FILTER=False")
+        print("FULL_AUDIO_CLIPS=True")
+        print(f"CLIP_SECONDS={arguments.clip_seconds:.1f}")
         print(f"CONTEXT_SECONDS={arguments.context_seconds}")
         print("BATCH_CANDIDATES=" + ",".join(str(value) for value in batch_candidates))
         print(f"OUTPUT_CREATED_AT={created_at.isoformat()}")
@@ -799,18 +815,24 @@ def run() -> int:
         timer.start("decode_audio")
         audio = decode_audio(str(input_file), sampling_rate=SAMPLE_RATE)
         audio_seconds = len(audio) / SAMPLE_RATE
+        clips = build_full_coverage_clips(audio_seconds, arguments.clip_seconds)
         timer.finish()
 
         timer.start("load_model")
         model = load_model(WhisperModel)
         timer.finish()
 
-        timer.start("learn_repeated_phrases")
-        repeated_phrases = run_context_pass(
-            model,
-            audio,
-            arguments.context_seconds,
+        timer.start("learn_opening_context")
+        opening_end = min(audio_seconds, float(arguments.context_seconds))
+        opening_records = transcribe_window(
+            model=model,
+            audio=audio,
+            start_seconds=0.0,
+            end_seconds=opening_end,
+            hotwords=FIXED_HOTWORDS,
+            language=None,
         )
+        repeated_phrases = extract_repeated_phrases(opening_records)
         hotwords = build_hotwords(repeated_phrases)
         timer.finish()
 
@@ -821,28 +843,60 @@ def run() -> int:
         else:
             print("PHRASE_NONE")
 
-        timer.start("transcribe_audio")
-        records, information, used_batch_size = transcribe_full_with_fallback(
-            model,
-            BatchedInferencePipeline,
-            audio,
-            batch_candidates,
-            hotwords,
+        timer.start("transcribe_full_audio")
+        records, information, used_batch_size = transcribe_batched_with_fallback(
+            model=model,
+            BatchedInferencePipeline=BatchedInferencePipeline,
+            audio=audio,
+            clips=clips,
+            batch_candidates=batch_candidates,
+            hotwords=hotwords,
         )
         timer.finish()
 
-        timer.start("repair_suspicious_segments")
-        records, repair_count = repair_suspicious_segments(
-            model,
-            audio,
-            records,
-            hotwords,
-            repeated_phrases,
+        timer.start("replace_opening_with_accurate_pass")
+        records = replace_window(
+            base=records,
+            replacement=opening_records,
+            start=0.0,
+            end=opening_end,
+        )
+        timer.finish()
+
+        timer.start("replace_closing_with_accurate_pass")
+        closing_start = max(opening_end, audio_seconds - CLOSING_REPAIR_SECONDS)
+        closing_records = transcribe_window(
+            model=model,
+            audio=audio,
+            start_seconds=closing_start,
+            end_seconds=audio_seconds,
+            hotwords=hotwords,
+            language=None,
+        )
+        records = replace_window(
+            base=records,
+            replacement=closing_records,
+            start=closing_start,
+            end=audio_seconds,
+        )
+        records = deduplicate_overlaps(records)
+        timer.finish()
+
+        timer.start("repair_probable_language_errors")
+        records, language_repairs = repair_probable_language_errors(
+            model=model,
+            audio=audio,
+            records=records,
+            repeated_phrases=repeated_phrases,
+            hotwords=hotwords,
         )
         timer.finish()
 
         timer.start("format_and_validate_transcript")
-        transcript, removed_hallucinations = format_transcript(records)
+        transcript, removed_hallucinations = format_transcript(
+            records=records,
+            repeated_phrases=repeated_phrases,
+        )
         decoder_loop = detect_decoder_loop(transcript)
         if decoder_loop is not None:
             raise TranscriptionError(
@@ -854,7 +908,7 @@ def run() -> int:
         write_text_atomically(output_file, transcript)
         timer.finish()
 
-        transcription_seconds = timer.step_seconds("transcribe_audio")
+        transcription_seconds = timer.step_seconds("transcribe_full_audio")
         realtime_factor = (
             transcription_seconds / audio_seconds if audio_seconds > 0 else 0.0
         )
@@ -862,15 +916,17 @@ def run() -> int:
         print("TRANSCRIPTION_RESULT=PASS")
         print(f"OUTPUT_FILE={output_file}")
         print(f"BATCH_SIZE_USED={used_batch_size}")
+        print(f"FULL_AUDIO_CLIP_COUNT={len(clips)}")
         print(f"SEGMENT_COUNT={len(records)}")
         print(f"AUDIO_SECONDS={audio_seconds:.3f}")
         print(f"REALTIME_FACTOR={realtime_factor:.4f}")
+
         print_quality_summary(
-            transcript,
-            audio_seconds,
-            repeated_phrases,
-            repair_count,
-            removed_hallucinations,
+            text=transcript,
+            audio_seconds=audio_seconds,
+            repeated_phrases=repeated_phrases,
+            removed_hallucinations=removed_hallucinations,
+            repaired_languages=language_repairs,
         )
 
         overall_result = "PASS"
