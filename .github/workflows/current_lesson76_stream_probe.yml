@@ -1,0 +1,53 @@
+name: Current Lesson 76 Stream Probe
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/current_lesson76_stream_probe.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    if: github.head_ref == 'analysis/20260802-lesson76-independent-audio'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Query current NHK series API and probe exact episode
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p probe
+          API='https://www.nhk.or.jp/radio-api/app/v1/web/ondemand/series?site_id=PMMJ59J6N2&corner_site_id=01'
+          curl -L --fail --silent --show-error "$API" -o probe/series.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path('probe/series.json').read_text(encoding='utf-8'))
+          episodes=data.get('episodes', [])
+          target=[e for e in episodes if str(e.get('id',''))=='4323812' or str(e.get('episode_id',''))=='4323812']
+          report={
+              'episode_count':len(episodes),
+              'episode_ids':[str(e.get('id') or e.get('episode_id') or '') for e in episodes],
+              'target_found':bool(target),
+              'target':target,
+          }
+          Path('probe/report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(report,ensure_ascii=False,indent=2))
+          if target:
+              url=str(target[0].get('stream_url',''))
+              Path('probe/current_stream_url.txt').write_text(url,encoding='utf-8')
+          PY
+          if [ -s probe/current_stream_url.txt ]; then
+            URL="$(cat probe/current_stream_url.txt)"
+            curl -L -sS -o /dev/null -w 'CURRENT_STREAM_HTTP=%{http_code}\n' "$URL" | tee probe/http_status.txt || true
+          else
+            echo 'CURRENT_STREAM_HTTP=NOT_AVAILABLE' | tee probe/http_status.txt
+          fi
+      - name: Upload probe
+        uses: actions/upload-artifact@v4
+        with:
+          name: current-lesson76-stream-probe
+          path: probe/
+          retention-days: 7
