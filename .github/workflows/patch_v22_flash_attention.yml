@@ -1,9 +1,6 @@
 name: Patch transcription v22 flash attention compatibility
 
 on:
-  push:
-    branches:
-      - deliverables/20260802-converged-transcription-v22
   pull_request:
     paths:
       - .github/workflows/patch_v22_flash_attention.yml
@@ -13,7 +10,7 @@ permissions:
 
 jobs:
   patch-v22:
-    if: github.event_name == 'push' || github.head_ref == 'deliverables/20260802-converged-transcription-v22'
+    if: github.head_ref == 'deliverables/20260802-converged-transcription-v22'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -91,5 +88,7 @@ jobs:
             echo 'No source changes required.'
           else
             git commit -m 'Fix v22 flash attention constructor compatibility'
+            git fetch origin deliverables/20260802-converged-transcription-v22
+            git rebase origin/deliverables/20260802-converged-transcription-v22
             git push origin HEAD:deliverables/20260802-converged-transcription-v22
           fi
