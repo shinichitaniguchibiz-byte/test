@@ -4,12 +4,16 @@ on:
   push:
     branches:
       - deliverables/20260802-converged-transcription-v22
+  pull_request:
+    paths:
+      - .github/workflows/patch_v22_flash_attention.yml
 
 permissions:
   contents: write
 
 jobs:
   patch-v22:
+    if: github.event_name == 'push' || github.head_ref == 'deliverables/20260802-converged-transcription-v22'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
