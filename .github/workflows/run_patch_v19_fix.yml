@@ -1,0 +1,74 @@
+name: Run Transaction 1 v19 Patch Fix
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/run_patch_v19_fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  run-patch-fix:
+    if: github.head_ref == 'deliverables/20260802-transaction1-transcription-v19'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Extract, normalize, and run v19 patch
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          workflow = Path('.github/workflows/patch_transcribe_v19.yml').read_text(encoding='utf-8')
+          start_marker = "          python - <<'PY'\n"
+          end_marker = "\n          PY\n      - name: Validate syntax and pure-function behavior"
+          start = workflow.index(start_marker) + len(start_marker)
+          end = workflow.index(end_marker, start)
+          patch = textwrap.dedent(workflow[start:end])
+          old = "source = source.replace(marker, insertion + marker, 1)"
+          new = "source = source.replace(marker, __import__('textwrap').dedent(insertion) + marker, 1)"
+          if old not in patch:
+              raise RuntimeError('patch insertion statement not found')
+          patch = patch.replace(old, new, 1)
+          Path('/tmp/patch_v19.py').write_text(patch + '\n', encoding='utf-8')
+          PY
+          python /tmp/patch_v19.py
+          python -m py_compile TRANSCRIBE_B.py
+      - name: Run pure-function checks
+        shell: bash
+        run: |
+          python - <<'PY'
+          import importlib.util
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location('transcribe_v19', Path('TRANSCRIBE_B.py'))
+          module = importlib.util.module_from_spec(spec)
+          assert spec.loader is not None
+          spec.loader.exec_module(module)
+          baseline = [module.SegmentRecord(0.0, 5.0, '日本語の説明です', -0.2, 1.0, 0.0, 'a')]
+          coverage = [module.SegmentRecord(1.0, 4.0, 'Suppose we asked Emily for advice.', -0.2, 1.0, 0.0, 'b')]
+          merged, additions, _ = module.merge_add_only_v19(baseline, coverage, stage='selftest')
+          assert len(merged) == 2 and additions
+          assert module.classify_language_v19(coverage[0].text) == 'en'
+          assert module.subtract_intervals_v19([(0.0, 10.0)], [(0.0, 4.0), (6.0, 10.0)]) == [(4.0, 6.0)]
+          assert '聞き取り不確実' in module.uncertain_marker_segments_v19([(4.0, 6.0)])[0].text
+          print('V19_PURE_FUNCTION_SELFTEST=PASS')
+          PY
+      - name: Commit v19 program
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add TRANSCRIBE_B.py
+          git commit -m "Implement Transaction 1 dual full-audio coverage transcription v19"
+          git push origin HEAD:${{ github.head_ref }}
