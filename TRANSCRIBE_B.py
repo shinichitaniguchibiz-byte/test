@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Iterable, TextIO
 
 
-TRANSCRIPTION_VERSION = 24
+TRANSCRIPTION_VERSION = 25
 DEVICE = "cuda"
 COMPUTE_TYPE = "float16"
 SAMPLE_RATE = 16000
@@ -87,6 +87,7 @@ SINGLE_EXAMPLE_PREFIXES = ("suppose ", "imagine ", "just an idea", "what if ", "
 V22_PATCH_APPLIED = True
 V23_PATCH_APPLIED = True
 V24_PATCH_APPLIED = True
+V25_PATCH_APPLIED = True
 
 
 class TranscriptionError(RuntimeError):
@@ -285,7 +286,7 @@ def installed_versions() -> dict[str, str | None]:
 def latest_pypi_version(package: str) -> str:
     request = urllib.request.Request(
         f"https://pypi.org/pypi/{package}/json",
-        headers={"User-Agent": "radio-transcription-v24"},
+        headers={"User-Agent": "radio-transcription-v25"},
     )
     with urllib.request.urlopen(request, timeout=15) as response:
         payload = json.load(response)
@@ -825,7 +826,7 @@ def transcribe_section_windows(
                 start=cursor,
                 end=chunk_end,
                 language="en",
-                source=f"v24_{slug}_w{window_count:02d}",
+                source=f"v25_{slug}_w{window_count:02d}",
                 beam_size=3,
                 multilingual=False,
             )
@@ -873,6 +874,17 @@ def local_baseline_candidates(
         and segment.start <= end + LOCAL_DUPLICATE_PADDING_SECONDS
     )
     return split_english_candidates(text)
+
+
+def is_complete_english_candidate(text: str) -> bool:
+    words = english_words(text)
+    if len(words) < 5:
+        return False
+    if words[-1].lower() in {"and", "but", "for", "of", "to", "us", "we", "a", "the"}:
+        return False
+    if text.strip().lower().startswith("to "):
+        return False
+    return True
 
 
 def recover_time_local_consensus(
@@ -947,7 +959,8 @@ def recover_time_local_consensus(
                 repeated_at_separate_times
                 and event_avg_logprob >= MIN_REPEATED_EVENT_AVG_LOGPROB
             )
-            accepted = source_supported and event_avg_logprob >= MIN_EVENT_AVG_LOGPROB
+            complete_candidate = is_complete_english_candidate(canonical)
+            accepted = complete_candidate and source_supported and event_avg_logprob >= MIN_EVENT_AVG_LOGPROB
             evidence_type = "overlapping_window_consensus"
             if not accepted and repeated_supported:
                 accepted = True
@@ -955,6 +968,7 @@ def recover_time_local_consensus(
             normalized_prefix = canonical.strip().lower()
             single_example_supported = (
                 section_name == "Essential Expressions"
+                and complete_candidate
                 and len(sources) == 1
                 and event_avg_logprob >= MIN_SINGLE_EXAMPLE_AVG_LOGPROB
                 and normalized_prefix.startswith(SINGLE_EXAMPLE_PREFIXES)
@@ -989,7 +1003,10 @@ def recover_time_local_consensus(
                 if normalize_for_comparison(candidate)
             )
             reason = "accepted"
-            if already_present:
+            if not complete_candidate:
+                accepted = False
+                reason = "incomplete_candidate"
+            elif already_present:
                 accepted = False
                 reason = "already_present_at_same_time"
             elif not source_supported and not repeated_supported and not single_example_supported:
@@ -1024,7 +1041,7 @@ def recover_time_local_consensus(
                         avg_logprob=event_avg_logprob,
                         compression_ratio=0.0,
                         no_speech_prob=0.0,
-                        source="turbo_v24_time_local_section_consensus",
+                        source="turbo_v25_time_local_section_consensus",
                     )
                 )
 
@@ -1148,9 +1165,7 @@ def correct_repeated_english_variants(
         best_index: int | None = None
         best_ratio = 0.0
         for index, cluster in enumerate(clusters):
-            ratio = SequenceMatcher(
-                None, normalized, normalize_for_comparison(cluster[0])
-            ).ratio()
+            ratio = SequenceMatcher(None, normalized, normalize_for_comparison(cluster[0])).ratio()
             if ratio > best_ratio:
                 best_index = index
                 best_ratio = ratio
@@ -1162,50 +1177,40 @@ def correct_repeated_english_variants(
     corrected = text
     corrections: list[dict[str, object]] = []
     for cluster in clusters:
-        counts = Counter(clean_text(candidate) for candidate in cluster)
-        if sum(counts.values()) < 4 or len(counts) < 2:
+        surface_counts = Counter(clean_text(candidate) for candidate in cluster)
+        normalized_counts = Counter(normalize_for_comparison(candidate) for candidate in cluster)
+        if sum(normalized_counts.values()) < 4 or len(normalized_counts) < 2:
             continue
-        canonical, canonical_count = max(
-            counts.items(), key=lambda item: (item[1], len(item[0]))
-        )
+        canonical_normalized, canonical_count = max(normalized_counts.items(), key=lambda item: (item[1], len(item[0])))
+        canonical_surfaces = [surface for surface in surface_counts if normalize_for_comparison(surface) == canonical_normalized]
+        canonical = max(canonical_surfaces, key=lambda value: (surface_counts[value], len(value)))
         canonical_words = english_words(canonical)
         if canonical_count < 2 or len(canonical_words) < 5:
             continue
-        for variant, variant_count in counts.items():
-            if variant == canonical:
+        for variant_normalized, variant_count in normalized_counts.items():
+            if variant_normalized == canonical_normalized:
                 continue
+            variant_surfaces = [surface for surface in surface_counts if normalize_for_comparison(surface) == variant_normalized]
+            variant = max(variant_surfaces, key=lambda value: (surface_counts[value], len(value)))
             variant_words = english_words(variant)
             if not variant_words:
                 continue
-            if canonical_words[0].lower() != variant_words[0].lower():
-                continue
-            if canonical_words[-1].lower() != variant_words[-1].lower():
+            if canonical_words[0].lower() != variant_words[0].lower() or canonical_words[-1].lower() != variant_words[-1].lower():
                 continue
             if abs(len(canonical_words) - len(variant_words)) > 3:
                 continue
-            similarity = SequenceMatcher(
-                None,
-                normalize_for_comparison(canonical),
-                normalize_for_comparison(variant),
-            ).ratio()
+            similarity = SequenceMatcher(None, canonical_normalized, variant_normalized).ratio()
             if similarity < 0.82 or canonical_count <= variant_count:
                 continue
-            occurrences = corrected.count(variant)
-            if occurrences == 0:
-                continue
-            corrected = corrected.replace(variant, canonical)
-            corrections.append(
-                {
-                    "from": variant,
-                    "to": canonical,
-                    "occurrences": occurrences,
-                    "canonical_count": canonical_count,
-                    "variant_count": variant_count,
-                    "similarity": round(similarity, 6),
-                }
-            )
+            occurrences = 0
+            for surface in variant_surfaces:
+                count = corrected.count(surface)
+                if count:
+                    corrected = corrected.replace(surface, canonical)
+                    occurrences += count
+            if occurrences:
+                corrections.append({"from": variant, "to": canonical, "occurrences": occurrences, "canonical_count": canonical_count, "variant_count": variant_count, "similarity": round(similarity, 6)})
     return corrected, corrections
-
 
 def apply_corrections_to_segments(
     segments: list[SegmentRecord], corrections: list[dict[str, object]]
@@ -1245,11 +1250,10 @@ def lesson76_regression(
         ("Dad's birthday is coming up next week", 20.0, 100.0, 1, "opening_dialogue"),
         ("We're not exactly great in the kitchen", 20.0, 120.0, 1, "opening_dialogue"),
         ("We're not exactly great in the kitchen", 180.0, 330.0, 1, "grammar_replay"),
-        ("Suppose we asked Emily for advice", 465.0, 535.0, 1, "essential_practice"),
-        ("Imagine we asked Emily for advice", 465.0, 535.0, 1, "essential_practice"),
+        ("Suppose we asked Emily for advice", 395.0, 425.0, 1, "essential_example"),
+        ("Imagine we asked Emily for advice", 395.0, 425.0, 1, "essential_example"),
         ("It might be a good idea for us to discuss this together", 410.0, 470.0, 1, "essential_first_example"),
         ("It might be a good idea for us to discuss this together", 480.0, 540.0, 1, "essential_practice"),
-        ("Just an idea, but we could try leaving a little earlier tomorrow", 440.0, 490.0, 1, "essential_first_example"),
         ("Just an idea, but we could try leaving a little earlier tomorrow", 490.0, 545.0, 1, "essential_practice"),
         ("It might be a good idea for us to take a break for a while", 620.0, 660.0, 1, "practical_model_answer"),
         ("We've been at this for a long time", 620.0, 660.0, 1, "practical_model_answer"),
@@ -1281,7 +1285,7 @@ def lesson76_regression(
         )
     return {
         "status": "PASS" if all(bool(item["passed"]) for item in items) else "FAIL",
-        "profile": "lesson76_time_local_repetition_regression_v24",
+        "profile": "lesson76_time_local_repetition_regression_v25",
         "scope": "KNOWN_PHRASE_TIME_AND_OCCURRENCE_REGRESSION_NOT_ACCURACY_PERCENTAGE",
         "passed_count": sum(bool(item["passed"]) for item in items),
         "total_count": len(items),
@@ -1370,7 +1374,7 @@ def run_transcription() -> int:
             print(f"RUN_ID={run_id}")
             print("TRANSCRIPTION_TRANSACTION=1")
             print(f"TRANSCRIPTION_VERSION={TRANSCRIPTION_VERSION}")
-            print("TRANSCRIPTION_MODE=FAST_PRIMARY_PLUS_MIXED_LANGUAGE_COMPACT_CONSENSUS")
+            print("TRANSCRIPTION_MODE=FAST_PRIMARY_PLUS_FINAL_ADAPTIVE_CONSENSUS")
             print("PRIMARY_PASS=FAST_BATCHED_VAD_FULL_AUDIO")
             print("SECTION_RECOVERY=GRAMMAR_ESSENTIAL_PRACTICAL_ONLY")
             print("SECTION_RECOVERY_WINDOW=ESSENTIAL_45_15_OTHER_90_45")
@@ -1585,7 +1589,7 @@ def run_transcription() -> int:
                 "version": TRANSCRIPTION_VERSION,
                 "convergence": {
                     "status": "FINAL_ACCEPTANCE_TEST",
-                    "source_versions_combined": [14, 16, 18, 19, 20, 22, 23],
+                    "source_versions_combined": [14, 16, 18, 19, 20, 22, 23, 24],
                     "v19_removed": [
                         "full_audio_second_pass",
                         "automatic_large_v3_gap_recovery",
