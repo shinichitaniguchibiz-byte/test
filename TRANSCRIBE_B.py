@@ -87,7 +87,6 @@ SINGLE_EXAMPLE_PREFIXES = ("suppose ", "imagine ", "just an idea", "what if ", "
 V22_PATCH_APPLIED = True
 V23_PATCH_APPLIED = True
 V24_PATCH_APPLIED = True
-V24_PATCH_APPLIED = True
 
 
 class TranscriptionError(RuntimeError):
