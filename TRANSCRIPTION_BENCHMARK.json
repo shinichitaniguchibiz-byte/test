@@ -1,0 +1,72 @@
+{
+  "input_basename": "b.m4a",
+  "purpose": "Lesson 76 Transaction 1 coverage regression benchmark. It verifies that known spoken phrases are present in their expected time regions. It is not a general-language accuracy score.",
+  "items": [
+    {
+      "phrase": "Dad's birthday is coming up next week.",
+      "start": 0.0,
+      "end": 210.0,
+      "min_count": 1
+    },
+    {
+      "phrase": "We're not exactly great in the kitchen.",
+      "start": 0.0,
+      "end": 330.0,
+      "min_count": 1
+    },
+    {
+      "phrase": "If it comes out burnt, you're explaining it.",
+      "start": 190.0,
+      "end": 330.0,
+      "min_count": 1
+    },
+    {
+      "phrase": "Suppose we asked Emily for advice.",
+      "start": 326.0,
+      "end": 500.0,
+      "min_count": 1
+    },
+    {
+      "phrase": "Imagine we asked Emily for advice.",
+      "start": 326.0,
+      "end": 510.0,
+      "min_count": 1
+    },
+    {
+      "phrase": "It might be a good idea for us to discuss this together.",
+      "start": 326.0,
+      "end": 540.0,
+      "min_count": 1
+    },
+    {
+      "phrase": "Just an idea, but we could try leaving a little earlier tomorrow.",
+      "start": 326.0,
+      "end": 540.0,
+      "min_count": 1
+    },
+    {
+      "phrase": "It might be a good idea for us to take a break for a while.",
+      "start": 540.0,
+      "end": 740.0,
+      "min_count": 1
+    },
+    {
+      "phrase": "We've been at this for a long time.",
+      "start": 540.0,
+      "end": 740.0,
+      "min_count": 1
+    },
+    {
+      "phrase": "We're all a bit tired.",
+      "start": 540.0,
+      "end": 740.0,
+      "min_count": 1
+    },
+    {
+      "phrase": "In today's practice, we'll focus on linking, as well as the weakened H sound in him.",
+      "start": 700.0,
+      "end": 840.0,
+      "min_count": 1
+    }
+  ]
+}
