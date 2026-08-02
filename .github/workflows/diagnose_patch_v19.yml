@@ -1,0 +1,38 @@
+name: Diagnose Transaction 1 v19 Patch
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/diagnose_patch_v19.yml
+
+jobs:
+  diagnose:
+    if: github.head_ref == 'deliverables/20260802-transaction1-transcription-v19'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Reproduce and print failing region
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          workflow = Path('.github/workflows/patch_transcribe_v19.yml').read_text(encoding='utf-8')
+          start_marker = "          python - <<'PY'\n"
+          end_marker = "\n          PY\n      - name: Validate syntax and pure-function behavior"
+          start = workflow.index(start_marker) + len(start_marker)
+          end = workflow.index(end_marker, start)
+          lines = workflow[start:end].splitlines()
+          patch = '\n'.join(line[10:] if line.startswith('          ') else line for line in lines)
+          old = "source = source.replace(marker, insertion + marker, 1)"
+          new = "source = source.replace(marker, __import__('textwrap').dedent(insertion) + marker, 1)"
+          patch = patch.replace(old, new, 1)
+          Path('/tmp/patch_v19.py').write_text(patch + '\n', encoding='utf-8')
+          PY
+          python /tmp/patch_v19.py
+          nl -ba TRANSCRIBE_B.py | sed -n '2870,2920p'
+          python -m py_compile TRANSCRIBE_B.py || true
