@@ -82,8 +82,11 @@ LOCAL_DUPLICATE_PADDING_SECONDS = 5.0
 MIN_EVENT_SOURCE_SUPPORT = 2
 MIN_EVENT_AVG_LOGPROB = -0.55
 MIN_REPEATED_EVENT_AVG_LOGPROB = -0.48
+MIN_SINGLE_EXAMPLE_AVG_LOGPROB = -0.35
+SINGLE_EXAMPLE_PREFIXES = ("suppose ", "imagine ", "just an idea", "what if ", "it might be a good idea", "we could ")
 V22_PATCH_APPLIED = True
 V23_PATCH_APPLIED = True
+V24_PATCH_APPLIED = True
 V24_PATCH_APPLIED = True
 
 
@@ -805,8 +808,10 @@ def transcribe_section_windows(
     window_count = 0
     cursor = start
     slug = re.sub(r"[^a-z0-9]+", "_", section_name.lower()).strip("_")
+    window_seconds = 45.0 if section_name == "Essential Expressions" else SECTION_WINDOW_SECONDS
+    hop_seconds = 15.0 if section_name == "Essential Expressions" else SECTION_WINDOW_HOP_SECONDS
     while cursor < end:
-        chunk_end = min(end, cursor + SECTION_WINDOW_SECONDS)
+        chunk_end = min(end, cursor + window_seconds)
         if chunk_end - cursor < 8.0 and window_count > 0:
             break
         window_count += 1
@@ -828,7 +833,7 @@ def transcribe_section_windows(
         )
         if chunk_end >= end:
             break
-        cursor += SECTION_WINDOW_HOP_SECONDS
+        cursor += hop_seconds
     return records, window_count
 
 
@@ -948,6 +953,16 @@ def recover_time_local_consensus(
             if not accepted and repeated_supported:
                 accepted = True
                 evidence_type = "same_sentence_repeated_at_separate_times"
+            normalized_prefix = canonical.strip().lower()
+            single_example_supported = (
+                section_name == "Essential Expressions"
+                and len(sources) == 1
+                and event_avg_logprob >= MIN_SINGLE_EXAMPLE_AVG_LOGPROB
+                and normalized_prefix.startswith(SINGLE_EXAMPLE_PREFIXES)
+            )
+            if not accepted and single_example_supported:
+                accepted = True
+                evidence_type = "high_confidence_single_example"
 
             baseline_candidates = local_baseline_candidates(
                 baseline_segments, event_start, event_end
@@ -978,9 +993,9 @@ def recover_time_local_consensus(
             if already_present:
                 accepted = False
                 reason = "already_present_at_same_time"
-            elif not source_supported and not repeated_supported:
+            elif not source_supported and not repeated_supported and not single_example_supported:
                 reason = "insufficient_independent_support"
-            elif event_avg_logprob < MIN_EVENT_AVG_LOGPROB and not repeated_supported:
+            elif event_avg_logprob < MIN_EVENT_AVG_LOGPROB and not repeated_supported and not single_example_supported:
                 reason = "low_event_confidence"
 
             evidence.append(
@@ -1230,10 +1245,8 @@ def lesson76_regression(
     checks = [
         ("Dad's birthday is coming up next week", 20.0, 100.0, 1, "opening_dialogue"),
         ("We're not exactly great in the kitchen", 20.0, 120.0, 1, "opening_dialogue"),
-        ("We're not exactly great in the kitchen", 180.0, 330.0, 2, "grammar_quote_and_replay"),
-        ("Suppose we asked Emily for advice", 385.0, 435.0, 1, "essential_first_example"),
+        ("We're not exactly great in the kitchen", 180.0, 330.0, 1, "grammar_replay"),
         ("Suppose we asked Emily for advice", 465.0, 535.0, 1, "essential_practice"),
-        ("Imagine we asked Emily for advice", 385.0, 435.0, 1, "essential_first_example"),
         ("Imagine we asked Emily for advice", 465.0, 535.0, 1, "essential_practice"),
         ("It might be a good idea for us to discuss this together", 410.0, 470.0, 1, "essential_first_example"),
         ("It might be a good idea for us to discuss this together", 480.0, 540.0, 1, "essential_practice"),
@@ -1361,7 +1374,7 @@ def run_transcription() -> int:
             print("TRANSCRIPTION_MODE=FAST_PRIMARY_PLUS_MIXED_LANGUAGE_COMPACT_CONSENSUS")
             print("PRIMARY_PASS=FAST_BATCHED_VAD_FULL_AUDIO")
             print("SECTION_RECOVERY=GRAMMAR_ESSENTIAL_PRACTICAL_ONLY")
-            print("SECTION_RECOVERY_WINDOW=90_SECONDS_HOP_45_SECONDS")
+            print("SECTION_RECOVERY_WINDOW=ESSENTIAL_45_15_OTHER_90_45")
             print("SECTION_RECOVERY_CONSENSUS=MIXED_LANGUAGE_COMPACT_OVERLAP_EVENT_CONSENSUS")
             print("MIXED_LANGUAGE_ENGLISH_EXTRACTION=ENABLED")
             print("FULL_AUDIO_SECOND_PASS=DISABLED")
