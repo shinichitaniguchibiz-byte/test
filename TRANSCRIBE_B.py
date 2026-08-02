@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Iterable, TextIO
 
 
-TRANSCRIPTION_VERSION = 21
+TRANSCRIPTION_VERSION = 22
 DEVICE = "cuda"
 COMPUTE_TYPE = "float16"
 SAMPLE_RATE = 16000
@@ -82,6 +82,7 @@ LOCAL_DUPLICATE_PADDING_SECONDS = 5.0
 MIN_EVENT_SOURCE_SUPPORT = 2
 MIN_EVENT_AVG_LOGPROB = -0.55
 MIN_REPEATED_EVENT_AVG_LOGPROB = -0.48
+V22_PATCH_APPLIED = True
 
 
 class TranscriptionError(RuntimeError):
@@ -434,7 +435,7 @@ def load_model(WhisperModel: object, model_directory: Path) -> object:
         device=DEVICE,
         compute_type=COMPUTE_TYPE,
         local_files_only=True,
-        use_flash_attention=False,
+        flash_attention=False,
     )
     print("FLASH_ATTENTION=False")
     print("MODEL_LOAD_COMPLETE")
