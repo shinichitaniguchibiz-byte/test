@@ -1,4 +1,5 @@
 name: Build converged transcription v24
+# trigger after pull request creation
 
 on:
   pull_request:
