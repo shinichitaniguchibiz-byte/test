@@ -1,3 +1,4 @@
+# v21 convergence validation
 name: Build converged transcription v21
 
 on:
@@ -455,11 +456,8 @@ jobs:
           assert "'version': 21" in source
 
           module = runpy.run_path('TRANSCRIBE_B.py', run_name='v21_validation')
-          SegmentRecord = module['SegmentRecord']
-          regression = module['regression_profile_v21']
-          result = regression(Path('not-b.m4a'), 10.0, [])
+          result = module['regression_profile_v21'](Path('not-b.m4a'), 10.0, [])
           assert result['status'] == 'NOT_APPLICABLE'
-
           language = module['language_label_v20']
           assert language('日本語') == 'ja'
           assert language('English sentence') == 'en'
