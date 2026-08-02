@@ -1,0 +1,148 @@
+name: Patch TRANSCRIBE_B v15
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/patch_transcribe_v15.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.head_ref == 'deliverables/20260801-balanced-transcription-v15'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply v15 convergence patch
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('TRANSCRIBE_B.py')
+          source = path.read_text(encoding='utf-8')
+          if 'V15_PATCH_APPLIED = True' in source:
+              raise SystemExit(0)
+
+          def replace_once(old: str, new: str) -> None:
+              global source
+              count = source.count(old)
+              if count != 1:
+                  raise RuntimeError(f'Expected one match, found {count}: {old[:100]!r}')
+              source = source.replace(old, new, 1)
+
+          replace_once(
+              'DEFAULT_MAX_REPAIR_WINDOWS = 1\nOPENING_AUDIT_PADDING_SECONDS = 2.5\nREPAIR_PADDING_SECONDS = 4.0\n',
+              'DEFAULT_MAX_REPAIR_WINDOWS = 1\nOPENING_AUDIT_PADDING_SECONDS = 2.5\nSECTION_AUDIT_PADDING_SECONDS = 2.0\nREPAIR_PADDING_SECONDS = 4.0\nV15_PATCH_APPLIED = True\n',
+          )
+
+          replace_once(
+              '@dataclass\nclass SuspicionEvent:',
+              '''@dataclass\nclass SectionAuditDecision:\n    accepted: bool\n    reason: str\n    section_name: str\n    core_start: float\n    core_end: float\n    baseline_text: str\n    audit_text: str\n    coverage_ratio: float\n    token_recall: float\n    baseline_score: float\n    audit_score: float\n    baseline_anchor_hits: int\n    audit_anchor_hits: int\n    baseline_section_hits: int\n    audit_section_hits: int\n    baseline_english_candidates: int\n    audit_english_candidates: int\n\n\n@dataclass\nclass SuspicionEvent:''',
+          )
+
+          replace_once(
+              '        representative = min(cluster, key=lambda value: len(value))\n        results.append((len(cluster), representative))\n',
+              '''        normalized_counts = Counter(\n            normalize_for_comparison(value) for value in cluster\n        )\n        representative_normalized = max(\n            normalized_counts,\n            key=lambda value: (normalized_counts[value], len(value)),\n        )\n        matching = [\n            value\n            for value in cluster\n            if normalize_for_comparison(value) == representative_normalized\n        ]\n        representative = max(matching, key=len)\n        results.append((len(cluster), representative))\n''',
+          )
+
+          marker = '''def anchor_exact_hits(text: str, anchors: Iterable[str]) -> int:\n'''
+          insertion = '''def correct_repeated_english_variants(\n    text: str,\n) -> tuple[str, list[dict[str, object]], int]:\n    candidates = split_english_candidates(text)\n    clusters: list[list[str]] = []\n    for candidate in candidates:\n        normalized = normalize_for_comparison(candidate)\n        best_index: int | None = None\n        best_ratio = 0.0\n        for index, cluster in enumerate(clusters):\n            ratio = SequenceMatcher(\n                None,\n                normalized,\n                normalize_for_comparison(cluster[0]),\n            ).ratio()\n            if ratio > best_ratio:\n                best_index = index\n                best_ratio = ratio\n        if best_index is not None and best_ratio >= 0.82:\n            clusters[best_index].append(candidate)\n        else:\n            clusters.append([candidate])\n\n    corrected = text\n    corrections: list[dict[str, object]] = []\n    unresolved = 0\n    for cluster in clusters:\n        exact_counts = Counter(clean_text(value) for value in cluster)\n        if sum(exact_counts.values()) < 4 or len(exact_counts) < 2:\n            continue\n        canonical, canonical_count = max(\n            exact_counts.items(),\n            key=lambda item: (item[1], len(item[0])),\n        )\n        canonical_words = english_words(canonical)\n        if canonical_count < 2 or len(canonical_words) < 5:\n            continue\n        cluster_changed = False\n        for variant, variant_count in exact_counts.items():\n            if variant == canonical:\n                continue\n            variant_words = english_words(variant)\n            if not variant_words:\n                continue\n            if canonical_words[0].lower() != variant_words[0].lower():\n                continue\n            if canonical_words[-1].lower() != variant_words[-1].lower():\n                continue\n            if abs(len(canonical_words) - len(variant_words)) > 3:\n                continue\n            canonical_normalized = normalize_for_comparison(canonical)\n            variant_normalized = normalize_for_comparison(variant)\n            if canonical_normalized in variant_normalized or variant_normalized in canonical_normalized:\n                continue\n            similarity = SequenceMatcher(\n                None,\n                canonical_normalized,\n                variant_normalized,\n            ).ratio()\n            if similarity < 0.82 or canonical_count <= variant_count:\n                continue\n            occurrences = corrected.count(variant)\n            if occurrences == 0:\n                continue\n            corrected = corrected.replace(variant, canonical)\n            corrections.append(\n                {\n                    'from': variant,\n                    'to': canonical,\n                    'occurrences': occurrences,\n                    'canonical_count': canonical_count,\n                    'variant_count': variant_count,\n                    'similarity': round(similarity, 6),\n                }\n            )\n            cluster_changed = True\n        if not cluster_changed:\n            unresolved += 1\n\n    return corrected, corrections, unresolved\n\n\ndef anchor_exact_hits(text: str, anchors: Iterable[str]) -> int:\n'''
+          replace_once(marker, insertion)
+
+          marker = '''def detect_strong_events(segments: list[SegmentRecord]) -> list[SuspicionEvent]:\n'''
+          insertion = '''def segments_between(\n    segments: Iterable[SegmentRecord],\n    start_time: float,\n    end_time: float,\n) -> list[SegmentRecord]:\n    return [\n        segment\n        for segment in segments\n        if start_time <= (segment.start + segment.end) / 2.0 <= end_time\n    ]\n\n\ndef find_section_interval(\n    segments: list[SegmentRecord],\n    start_section: str,\n    end_section: str,\n) -> tuple[float, float] | None:\n    start_time: float | None = None\n    for segment in sorted(segments, key=lambda item: (item.start, item.end)):\n        hits = strict_section_hits(segment.text)\n        if start_time is None and hits.get(start_section, False):\n            start_time = segment.start\n            continue\n        if start_time is not None and hits.get(end_section, False):\n            if segment.start > start_time:\n                return start_time, segment.start\n    return None\n\n\ndef decide_section_audit(\n    section_name: str,\n    baseline_segments: list[SegmentRecord],\n    audit_segments: list[SegmentRecord],\n    anchors: list[str],\n    core_start: float,\n    core_end: float,\n) -> SectionAuditDecision:\n    baseline_text = format_transcript(baseline_segments).strip()\n    audit_text = format_transcript(audit_segments).strip() if audit_segments else ''\n    coverage_ratio = len(audit_text) / max(len(baseline_text), 1)\n    recall = token_recall(baseline_text, audit_text)\n    baseline_score = quality_score(baseline_text, baseline_segments)\n    audit_score = quality_score(audit_text, audit_segments)\n    baseline_anchor_hits = anchor_exact_hits(baseline_text, anchors)\n    audit_anchor_hits = anchor_exact_hits(audit_text, anchors)\n    baseline_section_hits = sum(strict_section_hits(baseline_text).values())\n    audit_section_hits = sum(strict_section_hits(audit_text).values())\n    baseline_candidates = len(split_english_candidates(baseline_text))\n    audit_candidates = len(split_english_candidates(audit_text))\n\n    accepted = False\n    reason = 'baseline_retained'\n    if not audit_text:\n        reason = 'audit_empty'\n    elif '�' in audit_text or detect_decoder_loop(audit_text):\n        reason = 'audit_anomaly_rejected'\n    elif not 0.95 <= coverage_ratio <= 1.65:\n        reason = 'audit_coverage_guard_rejected'\n    elif recall < 0.72:\n        reason = 'audit_content_recall_rejected'\n    elif audit_anchor_hits < baseline_anchor_hits:\n        reason = 'audit_anchor_guard_rejected'\n    elif audit_section_hits < baseline_section_hits:\n        reason = 'audit_section_guard_rejected'\n    elif audit_candidates >= baseline_candidates + 2 and audit_score >= baseline_score - 0.10:\n        accepted = True\n        reason = 'section_examples_recovered'\n    elif coverage_ratio >= 1.06 and audit_score >= baseline_score - 0.05:\n        accepted = True\n        reason = 'section_coverage_improved'\n\n    return SectionAuditDecision(\n        accepted=accepted,\n        reason=reason,\n        section_name=section_name,\n        core_start=core_start,\n        core_end=core_end,\n        baseline_text=baseline_text,\n        audit_text=audit_text,\n        coverage_ratio=coverage_ratio,\n        token_recall=recall,\n        baseline_score=baseline_score,\n        audit_score=audit_score,\n        baseline_anchor_hits=baseline_anchor_hits,\n        audit_anchor_hits=audit_anchor_hits,\n        baseline_section_hits=baseline_section_hits,\n        audit_section_hits=audit_section_hits,\n        baseline_english_candidates=baseline_candidates,\n        audit_english_candidates=audit_candidates,\n    )\n\n\ndef apply_section_audit(\n    segments: list[SegmentRecord],\n    audit_segments: list[SegmentRecord],\n    core_start: float,\n    core_end: float,\n) -> list[SegmentRecord]:\n    retained = [\n        segment\n        for segment in segments\n        if not core_start <= (segment.start + segment.end) / 2.0 <= core_end\n    ]\n    return deduplicate_segments([*retained, *audit_segments])\n\n\ndef detect_strong_events(segments: list[SegmentRecord]) -> list[SuspicionEvent]:\n'''
+          replace_once(marker, insertion)
+
+          marker = '''def repair_decision_to_dict(decision: RepairDecision) -> dict[str, object]:\n'''
+          insertion = '''def section_decision_to_dict(\n    decision: SectionAuditDecision | None,\n) -> dict[str, object]:\n    if decision is None:\n        return {'status': 'NOT_RUN'}\n    return {\n        'status': 'RUN',\n        'accepted': decision.accepted,\n        'decision_reason': decision.reason,\n        'section_name': decision.section_name,\n        'core_start': round(decision.core_start, 3),\n        'core_end': round(decision.core_end, 3),\n        'coverage_ratio': round(decision.coverage_ratio, 6),\n        'token_recall': round(decision.token_recall, 6),\n        'baseline_score': round(decision.baseline_score, 6),\n        'audit_score': round(decision.audit_score, 6),\n        'baseline_anchor_hits': decision.baseline_anchor_hits,\n        'audit_anchor_hits': decision.audit_anchor_hits,\n        'baseline_section_hits': decision.baseline_section_hits,\n        'audit_section_hits': decision.audit_section_hits,\n        'baseline_english_candidates': decision.baseline_english_candidates,\n        'audit_english_candidates': decision.audit_english_candidates,\n        'baseline_text': decision.baseline_text,\n        'audit_text': decision.audit_text,\n    }\n\n\ndef repair_decision_to_dict(decision: RepairDecision) -> dict[str, object]:\n'''
+          replace_once(marker, insertion)
+
+          replace_once(
+              '    return "ACCEPT_FOR_AI_POST_CORRECTION"\n',
+              '    return "READY_FOR_AI_CORRECTION"\n',
+          )
+
+          replace_once(
+              '            print("TRANSCRIPTION_MODE=BATCHED_TURBO_GUARDED_OPENING_AUDIT")\n',
+              '            print("TRANSCRIPTION_MODE=BATCHED_TURBO_GUARDED_OPENING_AND_SECTION_AUDIT")\n',
+          )
+          replace_once(
+              '            print("OPENING_AUDIT_POLICY=NO_VAD_ADD_COVERAGE_ONLY_WITH_CONTENT_GUARDS")\n',
+              '            print("OPENING_AUDIT_POLICY=NO_VAD_ADD_COVERAGE_ONLY_WITH_CONTENT_GUARDS")\n            print("SECTION_AUDIT_POLICY=ESSENTIAL_EXPRESSIONS_NO_VAD_ONLY_WHEN_EXAMPLES_ARE_SPARSE")\n            print("REPEATED_ENGLISH_POLICY=WITHIN_RECORDING_MAJORITY_CONSENSUS_ONLY")\n',
+          )
+
+          old = '''            del primary_model\n            gc.collect()\n\n            timer.start("detect_strong_repair_windows")\n            post_opening_text = format_transcript(post_opening_segments)\n            strong_events = detect_strong_events(post_opening_segments)\n            repair_windows = build_repair_windows(\n                strong_events,\n                post_opening_segments,\n'''
+          new = '''            timer.start("essential_section_no_vad_audit")\n            section_decision: SectionAuditDecision | None = None\n            post_section_segments = list(post_opening_segments)\n            section_interval = find_section_interval(\n                post_opening_segments,\n                "Essential Expressions",\n                "Practical Usage",\n            )\n            if section_interval is not None:\n                section_start, section_end = section_interval\n                baseline_section_segments = segments_between(\n                    post_opening_segments,\n                    section_start,\n                    section_end,\n                )\n                baseline_section_text = (\n                    format_transcript(baseline_section_segments)\n                    if baseline_section_segments\n                    else ""\n                )\n                if len(split_english_candidates(baseline_section_text)) < 6:\n                    audit_start = max(0.0, section_start - SECTION_AUDIT_PADDING_SECONDS)\n                    audit_end = min(audio_seconds, section_end + SECTION_AUDIT_PADDING_SECONDS)\n                    section_audit_slice = transcribe_slice(\n                        primary_model,\n                        audio,\n                        start=audit_start,\n                        end=audit_end,\n                        language=requested_language,\n                        source="turbo_essential_no_vad",\n                        beam_size=5,\n                    )\n                    section_audit_segments = segments_between(\n                        section_audit_slice,\n                        section_start,\n                        section_end,\n                    )\n                    section_decision = decide_section_audit(\n                        "Essential Expressions",\n                        baseline_section_segments,\n                        section_audit_segments,\n                        anchors,\n                        section_start,\n                        section_end,\n                    )\n                    print(\n                        "SECTION_AUDIT_DECISION "\n                        f"ACCEPTED={'YES' if section_decision.accepted else 'NO'} "\n                        f"SECTION={section_decision.section_name} "\n                        f"CORE_START={section_decision.core_start:.3f} "\n                        f"CORE_END={section_decision.core_end:.3f} "\n                        f"COVERAGE_RATIO={section_decision.coverage_ratio:.3f} "\n                        f"TOKEN_RECALL={section_decision.token_recall:.3f} "\n                        f"BASELINE_EXAMPLES={section_decision.baseline_english_candidates} "\n                        f"AUDIT_EXAMPLES={section_decision.audit_english_candidates} "\n                        f"REASON={section_decision.reason}"\n                    )\n                    if section_decision.accepted:\n                        post_section_segments = apply_section_audit(\n                            post_opening_segments,\n                            section_audit_segments,\n                            section_start,\n                            section_end,\n                        )\n                else:\n                    print("SECTION_AUDIT_DECISION=SKIPPED_SUFFICIENT_ENGLISH_COVERAGE")\n            else:\n                print("SECTION_AUDIT_DECISION=NOT_APPLICABLE")\n            timer.finish()\n\n            del primary_model\n            gc.collect()\n\n            timer.start("detect_strong_repair_windows")\n            post_opening_text = format_transcript(post_section_segments)\n            strong_events = detect_strong_events(post_section_segments)\n            repair_windows = build_repair_windows(\n                strong_events,\n                post_section_segments,\n'''
+          replace_once(old, new)
+
+          replace_once(
+              '            final_segments = list(post_opening_segments)\n',
+              '            final_segments = list(post_section_segments)\n',
+          )
+
+          old = '''            final_segments = deduplicate_segments(final_segments)\n            final_text = format_transcript(final_segments)\n            final_indicators = transcript_indicators(\n                final_text,\n                final_segments,\n                anchors,\n            )\n'''
+          new = '''            final_segments = deduplicate_segments(final_segments)\n            final_text = format_transcript(final_segments)\n            final_text, consensus_corrections, unresolved_variant_clusters = (\n                correct_repeated_english_variants(final_text)\n            )\n            print(f"CONSENSUS_CORRECTIONS_APPLIED={len(consensus_corrections)}")\n            print(f"REPEATED_VARIANT_CLUSTERS_UNRESOLVED={unresolved_variant_clusters}")\n            final_indicators = transcript_indicators(\n                final_text,\n                final_segments,\n                anchors,\n            )\n'''
+          replace_once(old, new)
+
+          old = '''            effect = secondary_processing_effect(\n                opening_decision,\n                repair_decisions,\n                baseline_indicators,\n                final_indicators,\n            )\n'''
+          new = '''            effect = secondary_processing_effect(\n                opening_decision,\n                repair_decisions,\n                baseline_indicators,\n                final_indicators,\n            )\n            if consensus_corrections:\n                effect = "MEASURABLE_CONSENSUS_CORRECTION"\n            elif section_decision is not None and section_decision.accepted:\n                effect = "SECTION_COVERAGE_GAIN"\n            elif effect == "MEASURABLE_GAIN":\n                effect = "COVERAGE_CHANGE_NOT_ACCURACY_MEASUREMENT"\n'''
+          replace_once(old, new)
+
+          replace_once(
+              '                    "mode": "batched_turbo_guarded_opening_audit",\n',
+              '                    "mode": "batched_turbo_guarded_opening_and_section_audit",\n',
+          )
+
+          replace_once(
+              '                "opening_audit": opening_decision_to_dict(opening_decision),\n',
+              '                "opening_audit": opening_decision_to_dict(opening_decision),\n                "essential_section_audit": section_decision_to_dict(section_decision),\n                "repeated_english_consensus": {\n                    "correction_count": len(consensus_corrections),\n                    "corrections": consensus_corrections,\n                    "unresolved_variant_cluster_count": unresolved_variant_clusters,\n                    "source": "same_recording_repeated_occurrences_only",\n                },\n',
+          )
+
+          replace_once(
+              '                    "opening_audit_accepted": opening_accepted,\n',
+              '                    "opening_audit_accepted": opening_accepted,\n                    "essential_section_audit_accepted": bool(\n                        section_decision and section_decision.accepted\n                    ),\n                    "consensus_corrections_applied": len(consensus_corrections),\n',
+          )
+
+          replace_once(
+              '            opening_seconds = timer.seconds_for("opening_no_vad_audit")\n            repair_seconds = timer.seconds_for("selective_large_v3_repairs")\n',
+              '            opening_seconds = timer.seconds_for("opening_no_vad_audit")\n            section_seconds = timer.seconds_for("essential_section_no_vad_audit")\n            repair_seconds = timer.seconds_for("selective_large_v3_repairs")\n',
+          )
+
+          replace_once(
+              '                    "opening_audit_seconds": opening_seconds,\n                    "large_v3_repair_seconds": repair_seconds,\n                    "secondary_seconds": opening_seconds + repair_seconds,\n',
+              '                    "opening_audit_seconds": opening_seconds,\n                    "essential_section_audit_seconds": section_seconds,\n                    "large_v3_repair_seconds": repair_seconds,\n                    "secondary_seconds": opening_seconds + section_seconds + repair_seconds,\n',
+          )
+
+          replace_once(
+              '            print(f"OPENING_AUDIT_SECONDS={opening_seconds:.3f}")\n            print(f"LARGE_V3_REPAIR_SECONDS={repair_seconds:.3f}")\n            print(f"SECONDARY_SECONDS={opening_seconds + repair_seconds:.3f}")\n',
+              '            print(f"OPENING_AUDIT_SECONDS={opening_seconds:.3f}")\n            print(f"ESSENTIAL_SECTION_AUDIT_SECONDS={section_seconds:.3f}")\n            print(f"LARGE_V3_REPAIR_SECONDS={repair_seconds:.3f}")\n            print(\n                f"SECONDARY_SECONDS="\n                f"{opening_seconds + section_seconds + repair_seconds:.3f}"\n            )\n',
+          )
+
+          replace_once(
+              '            print(f"OPENING_AUDIT_ACCEPTED={\'YES\' if opening_accepted else \'NO\'}")\n',
+              '            print(f"OPENING_AUDIT_ACCEPTED={\'YES\' if opening_accepted else \'NO\'}")\n            print(\n                f"ESSENTIAL_SECTION_AUDIT_ACCEPTED="\n                f"{\'YES\' if section_decision and section_decision.accepted else \'NO\'}"\n            )\n',
+          )
+
+          path.write_text(source, encoding='utf-8')
+          PY
+      - name: Validate Python syntax
+        run: python -m py_compile TRANSCRIBE_B.py
+      - name: Commit patched program
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add TRANSCRIBE_B.py
+          git commit -m "Add selective section recovery and repeated-phrase consensus"
+          git push origin HEAD:${{ github.head_ref }}
