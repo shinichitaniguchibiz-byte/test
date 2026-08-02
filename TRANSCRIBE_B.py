@@ -5,7 +5,6 @@ import concurrent.futures
 import gc
 import importlib.metadata
 import json
-import logging
 import math
 import os
 import re
@@ -21,6 +20,7 @@ from pathlib import Path
 from typing import Iterable, TextIO
 
 
+TRANSCRIPTION_VERSION = 21
 DEVICE = "cuda"
 COMPUTE_TYPE = "float16"
 SAMPLE_RATE = 16000
@@ -28,32 +28,11 @@ DEFAULT_INPUT_FILE = "b.m4a"
 DEFAULT_OUTPUT_DIRECTORY = "stt_test"
 DEFAULT_BATCH_SIZE = 8
 DEFAULT_OPENING_AUDIT_SECONDS = 210.0
-DEFAULT_MAX_REPAIR_WINDOWS = 0
-OPENING_AUDIT_PADDING_SECONDS = 2.5
-SECTION_AUDIT_PADDING_SECONDS = 2.0
-SECTION_CHUNK_SECONDS = 20.0
-SECTION_CHUNK_OVERLAP_SECONDS = 10.0
-SECTION_EVENT_CLUSTER_SECONDS = 6.0
-SECTION_CROSS_WINDOW_MIN_SUPPORT = 2
-REPAIR_PADDING_SECONDS = 4.0
-V15_PATCH_APPLIED = True
-V16_PATCH_APPLIED = True
-V17_PATCH_APPLIED = True
-V18_PATCH_APPLIED = True
-V20_PATCH_APPLIED = True
 JST = timezone(timedelta(hours=9), name="JST")
-
-RUNTIME_PACKAGES = (
-    "faster-whisper",
-    "ctranslate2",
-    "huggingface-hub",
-)
 
 PRIMARY_MODEL_REPOSITORY = "mobiuslabsgmbh/faster-whisper-large-v3-turbo"
 PRIMARY_MODEL_DIRECTORY_NAME = "faster-whisper-large-v3-turbo"
-REPAIR_MODEL_REPOSITORY = "Systran/faster-whisper-large-v3"
-REPAIR_MODEL_DIRECTORY_NAME = "faster-whisper-large-v3"
-
+MODEL_REQUIRED_FILES = ("config.json", "model.bin", "tokenizer.json")
 MODEL_ALLOW_PATTERNS = (
     "config.json",
     "preprocessor_config.json",
@@ -62,26 +41,18 @@ MODEL_ALLOW_PATTERNS = (
     "vocabulary.json",
     "vocabulary.*",
 )
-
-MODEL_REQUIRED_FILES = (
-    "config.json",
-    "model.bin",
-    "tokenizer.json",
-)
+RUNTIME_PACKAGES = ("faster-whisper", "ctranslate2", "huggingface-hub")
 
 TRANSCRIPTION_GLOSSARY = (
     "Grammar and Vocabulary, Essential Expressions, Practical Usage, "
     "Pronunciation Polish, lesson, dialogue, key sentence, example, "
     "pronunciation, Suppose, Imagine, ask for advice, 仮定法, 目的格, 不定詞, "
-    "意味上の主語, 現在進行形, "
-    "説明型オーバーラッピング, come out, not exactly, what if, for us"
+    "意味上の主語, 現在進行形, 説明型オーバーラッピング, "
+    "come out, not exactly, what if, for us"
 )
 
 STRICT_SECTION_ALIASES: dict[str, tuple[str, ...]] = {
-    "Grammar and Vocabulary": (
-        "Grammar and Vocabulary",
-        "文法と語彙",
-    ),
+    "Grammar and Vocabulary": ("Grammar and Vocabulary", "文法と語彙"),
     "Essential Expressions": (
         "Essential Expressions",
         "エッセンシャル・エクスプレッションズ",
@@ -98,6 +69,19 @@ STRICT_SECTION_ALIASES: dict[str, tuple[str, ...]] = {
         "発音練習",
     ),
 }
+AUDITED_SECTIONS = (
+    "Grammar and Vocabulary",
+    "Essential Expressions",
+    "Practical Usage",
+)
+
+SECTION_WINDOW_SECONDS = 30.0
+SECTION_WINDOW_HOP_SECONDS = 10.0
+EVENT_CLUSTER_SECONDS = 7.0
+LOCAL_DUPLICATE_PADDING_SECONDS = 5.0
+MIN_EVENT_SOURCE_SUPPORT = 2
+MIN_EVENT_AVG_LOGPROB = -0.55
+MIN_REPEATED_EVENT_AVG_LOGPROB = -0.48
 
 
 class TranscriptionError(RuntimeError):
@@ -123,84 +107,6 @@ class SegmentRecord:
     source: str
 
 
-@dataclass
-class OpeningAuditDecision:
-    accepted: bool
-    reason: str
-    core_end: float
-    baseline_text: str
-    audit_text: str
-    coverage_ratio: float
-    token_recall: float
-    baseline_score: float
-    audit_score: float
-    baseline_anchor_hits: int
-    audit_anchor_hits: int
-    baseline_section_hits: int
-    audit_section_hits: int
-
-
-@dataclass
-class SectionAuditDecision:
-    accepted: bool
-    reason: str
-    section_name: str
-    core_start: float
-    core_end: float
-    baseline_text: str
-    audit_text: str
-    coverage_ratio: float
-    token_recall: float
-    baseline_score: float
-    audit_score: float
-    baseline_anchor_hits: int
-    audit_anchor_hits: int
-    baseline_section_hits: int
-    audit_section_hits: int
-    baseline_english_candidates: int
-    audit_english_candidates: int
-
-
-@dataclass
-class SuspicionEvent:
-    start: float
-    end: float
-    severity: float
-    reason: str
-    segment_indexes: tuple[int, ...]
-
-
-@dataclass
-class RepairWindow:
-    index: int
-    core_start: float
-    core_end: float
-    slice_start: float
-    slice_end: float
-    reasons: tuple[str, ...]
-    segment_indexes: tuple[int, ...]
-
-
-@dataclass
-class RepairDecision:
-    window_index: int
-    accepted: bool
-    reason: str
-    baseline_text: str
-    repair_text: str
-    coverage_ratio: float
-    token_recall: float
-    baseline_score: float
-    repair_score: float
-    baseline_suspicious_events: int
-    repair_suspicious_events: int
-    core_start: float
-    core_end: float
-    slice_start: float
-    slice_end: float
-    reasons: tuple[str, ...]
-
-
 class StepTimer:
     def __init__(self) -> None:
         self.started_at = time.perf_counter()
@@ -210,13 +116,13 @@ class StepTimer:
 
     def start(self, name: str) -> None:
         if self.current_name is not None:
-            self.finish("PASS")
+            self.finish()
         self.current_name = name
         self.current_started_at = time.perf_counter()
 
-    def finish(self, result: str = "PASS") -> None:
+    def finish(self, result: str = "PASS") -> float:
         if self.current_name is None or self.current_started_at is None:
-            return
+            return 0.0
         elapsed = time.perf_counter() - self.current_started_at
         self.steps.append(
             {
@@ -227,19 +133,21 @@ class StepTimer:
         )
         self.current_name = None
         self.current_started_at = None
+        return elapsed
 
     def fail_current(self) -> None:
         self.finish("FAILED")
 
+    def seconds_for(self, name: str) -> float:
+        return sum(
+            float(step["elapsed_seconds"])
+            for step in self.steps
+            if step["name"] == name
+        )
+
     @property
     def total_seconds(self) -> float:
         return time.perf_counter() - self.started_at
-
-    def seconds_for(self, name: str) -> float:
-        for step in self.steps:
-            if step["name"] == name:
-                return float(step["elapsed_seconds"])
-        return 0.0
 
     def print_summary(self, overall_result: str) -> None:
         if self.current_name is not None:
@@ -282,22 +190,22 @@ class TeeContext:
     def __init__(self, log_path: Path) -> None:
         self.log_path = log_path
         self.log_handle: TextIO | None = None
-        self.original_stdout: TextIO | None = None
-        self.original_stderr: TextIO | None = None
+        self.stdout: TextIO | None = None
+        self.stderr: TextIO | None = None
 
     def __enter__(self) -> None:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.log_handle = self.log_path.open("w", encoding="utf-8", newline="")
-        self.original_stdout = sys.stdout
-        self.original_stderr = sys.stderr
-        sys.stdout = TeeStream(self.original_stdout, self.log_handle)
-        sys.stderr = TeeStream(self.original_stderr, self.log_handle)
+        self.stdout = sys.stdout
+        self.stderr = sys.stderr
+        sys.stdout = TeeStream(self.stdout, self.log_handle)
+        sys.stderr = TeeStream(self.stderr, self.log_handle)
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
-        if self.original_stdout is not None:
-            sys.stdout = self.original_stdout
-        if self.original_stderr is not None:
-            sys.stderr = self.original_stderr
+        if self.stdout is not None:
+            sys.stdout = self.stdout
+        if self.stderr is not None:
+            sys.stderr = self.stderr
         if self.log_handle is not None:
             self.log_handle.flush()
             self.log_handle.close()
@@ -305,10 +213,7 @@ class TeeContext:
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Create a faithful full transcript using a fast batched Turbo pass, "
-            "one guarded opening audit, and rare large-v3 anomaly repair."
-        )
+        description="Create a faithful Japanese-English transcript locally."
     )
     parser.add_argument("--input", default=DEFAULT_INPUT_FILE)
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIRECTORY)
@@ -319,20 +224,13 @@ def parse_arguments() -> argparse.Namespace:
         type=float,
         default=DEFAULT_OPENING_AUDIT_SECONDS,
     )
-    parser.add_argument(
-        "--max-repair-windows",
-        type=int,
-        default=DEFAULT_MAX_REPAIR_WINDOWS,
-    )
     parser.add_argument("--reference", default="")
     return parser.parse_args()
 
 
-def resolve_path(script_directory: Path, value: str) -> Path:
+def resolve_path(base: Path, value: str) -> Path:
     path = Path(value).expanduser()
-    if path.is_absolute():
-        return path.resolve()
-    return (script_directory / path).resolve()
+    return path.resolve() if path.is_absolute() else (base / path).resolve()
 
 
 def make_output_paths(output_directory: Path, run_id: str) -> OutputPaths:
@@ -346,57 +244,30 @@ def make_output_paths(output_directory: Path, run_id: str) -> OutputPaths:
 
 
 def ensure_stt_virtual_environment(script_directory: Path) -> None:
-    expected_python = script_directory / ".venv-stt" / "Scripts" / "python.exe"
-    current_python = Path(sys.executable).resolve()
-    if not expected_python.is_file():
-        raise FileNotFoundError(
-            f"The transcription virtual environment was not found: {expected_python}"
-        )
-    if current_python == expected_python.resolve():
+    expected = script_directory / ".venv-stt" / "Scripts" / "python.exe"
+    current = Path(sys.executable).resolve()
+    if not expected.is_file():
+        raise FileNotFoundError(f"STT virtual environment not found: {expected}")
+    if current == expected.resolve():
         return
-
     run_id = os.environ.get("TRANSCRIBE_RUN_ID") or datetime.now(JST).strftime(
         "%Y%m%d_%H%M%S"
     )
-    child_environment = dict(os.environ)
-    child_environment["TRANSCRIBE_RUN_ID"] = run_id
-    child_environment["TRANSCRIBE_BOOTSTRAP_FROM"] = str(current_python)
-    child_environment["TRANSCRIBE_BOOTSTRAP_TO"] = str(expected_python)
-
+    environment = dict(os.environ)
+    environment["TRANSCRIBE_RUN_ID"] = run_id
     print("PYTHON_ENVIRONMENT_SWITCH")
-    print(f"FROM={current_python}")
-    print(f"TO={expected_python}")
+    print(f"FROM={current}")
+    print(f"TO={expected}")
     completed = subprocess.run(
-        [str(expected_python), str(Path(__file__).resolve()), *sys.argv[1:]],
+        [str(expected), str(Path(__file__).resolve()), *sys.argv[1:]],
         cwd=str(script_directory),
-        env=child_environment,
+        env=environment,
         check=False,
     )
     raise SystemExit(completed.returncode)
 
 
-def run_command(
-    command: list[str],
-    *,
-    cwd: Path,
-    timeout_seconds: int,
-) -> subprocess.CompletedProcess[str]:
-    try:
-        return subprocess.run(
-            command,
-            cwd=str(cwd),
-            check=False,
-            text=True,
-            capture_output=True,
-            timeout=timeout_seconds,
-        )
-    except subprocess.TimeoutExpired as exception:
-        raise TranscriptionError(
-            f"Command timed out after {timeout_seconds} seconds: {' '.join(command)}"
-        ) from exception
-
-
-def installed_package_versions() -> dict[str, str | None]:
+def installed_versions() -> dict[str, str | None]:
     versions: dict[str, str | None] = {}
     for package in RUNTIME_PACKAGES:
         try:
@@ -406,24 +277,16 @@ def installed_package_versions() -> dict[str, str | None]:
     return versions
 
 
-def fetch_latest_pypi_version(package: str) -> str:
+def latest_pypi_version(package: str) -> str:
     request = urllib.request.Request(
         f"https://pypi.org/pypi/{package}/json",
-        headers={"User-Agent": "radio-transcription-version-check/1.0"},
+        headers={"User-Agent": "radio-transcription-v21"},
     )
-    try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            payload = json.load(response)
-    except Exception as exception:
-        raise TranscriptionError(
-            f"The latest software version could not be checked for {package}. "
-            f"{type(exception).__name__}: {exception}"
-        ) from exception
+    with urllib.request.urlopen(request, timeout=15) as response:
+        payload = json.load(response)
     version = str(payload.get("info", {}).get("version", "")).strip()
     if not version:
-        raise TranscriptionError(
-            f"PyPI returned no current version for {package}."
-        )
+        raise TranscriptionError(f"PyPI returned no version for {package}")
     return version
 
 
@@ -432,49 +295,32 @@ def version_is_newer(latest: str, installed: str | None) -> bool:
         from packaging.version import Version
     except ImportError:
         from pip._vendor.packaging.version import Version
-    if installed is None:
-        return True
-    return Version(latest) > Version(installed)
+    return installed is None or Version(latest) > Version(installed)
 
 
-def check_and_update_runtime_packages(script_directory: Path) -> dict[str, object]:
-    print("SOFTWARE_VERSION_CHECK_START")
-    print("SOFTWARE_CHECK_METHOD=PYPI_JSON_THEN_PIP_ONLY_IF_UPDATE_REQUIRED")
-    before = installed_package_versions()
-    print(
-        "SOFTWARE_VERSIONS_BEFORE="
-        + json.dumps(before, ensure_ascii=False, sort_keys=True)
-    )
-
+def check_and_update_software(script_directory: Path) -> dict[str, object]:
+    before = installed_versions()
     latest: dict[str, str] = {}
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=len(RUNTIME_PACKAGES)
-    ) as executor:
+    errors: dict[str, str] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         futures = {
-            executor.submit(fetch_latest_pypi_version, package): package
+            executor.submit(latest_pypi_version, package): package
             for package in RUNTIME_PACKAGES
         }
         for future in concurrent.futures.as_completed(futures):
             package = futures[future]
-            latest[package] = future.result()
+            try:
+                latest[package] = future.result()
+            except Exception as exception:
+                errors[package] = f"{type(exception).__name__}: {exception}"
 
-    latest = {package: latest[package] for package in RUNTIME_PACKAGES}
     outdated = [
         package
-        for package in RUNTIME_PACKAGES
-        if version_is_newer(latest[package], before.get(package))
+        for package, latest_version in latest.items()
+        if version_is_newer(latest_version, before.get(package))
     ]
-    print(
-        "SOFTWARE_LATEST_VERSIONS="
-        + json.dumps(latest, ensure_ascii=False, sort_keys=True)
-    )
-    print(
-        "SOFTWARE_UPDATE_REQUIRED="
-        + (",".join(outdated) if outdated else "NONE")
-    )
-
     if outdated:
-        completed = run_command(
+        completed = subprocess.run(
             [
                 sys.executable,
                 "-m",
@@ -484,292 +330,169 @@ def check_and_update_runtime_packages(script_directory: Path) -> dict[str, objec
                 "--upgrade-strategy",
                 "only-if-needed",
                 "--disable-pip-version-check",
-                "--timeout",
-                "30",
                 *outdated,
             ],
-            cwd=script_directory,
-            timeout_seconds=900,
+            cwd=str(script_directory),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=900,
         )
         if completed.returncode != 0:
             details = completed.stderr.strip() or completed.stdout.strip()
-            raise TranscriptionError(
-                "Newer transcription software was found but could not be installed. "
-                + details
-            )
+            raise TranscriptionError(f"Software update failed: {details}")
 
-    after = installed_package_versions()
-    changed = {
-        package: {"before": before.get(package), "after": after.get(package)}
-        for package in RUNTIME_PACKAGES
-        if before.get(package) != after.get(package)
-    }
-    print(
-        "SOFTWARE_VERSIONS_AFTER="
-        + json.dumps(after, ensure_ascii=False, sort_keys=True)
-    )
-    print(
-        "SOFTWARE_UPDATED="
-        + (
-            json.dumps(changed, ensure_ascii=False, sort_keys=True)
-            if changed
-            else "NONE"
-        )
-    )
+    after = installed_versions()
     print("SOFTWARE_VERSION_CHECK_RESULT=PASS")
+    print("SOFTWARE_VERSIONS=" + json.dumps(after, ensure_ascii=False, sort_keys=True))
+    print("SOFTWARE_UPDATED=" + (",".join(outdated) if outdated else "NONE"))
+    if errors:
+        print("SOFTWARE_VERSION_CHECK_WARNINGS=" + json.dumps(errors, ensure_ascii=False))
     return {
-        "check_method": "pypi_json_then_pip_only_if_update_required",
         "before": before,
         "latest": latest,
-        "update_required": outdated,
         "after": after,
-        "updated": changed,
+        "updated": outdated,
+        "warnings": errors,
     }
 
 
-def model_files_are_complete(model_directory: Path) -> bool:
-    return all((model_directory / name).is_file() for name in MODEL_REQUIRED_FILES)
-
-
-def get_model_revision(repository: str) -> str:
-    from huggingface_hub import HfApi
-
-    try:
-        information = HfApi().model_info(
-            repo_id=repository,
-            revision="main",
-            timeout=30,
-        )
-    except Exception as exception:
-        raise TranscriptionError(
-            f"The latest model revision could not be checked: {repository}. "
-            f"{type(exception).__name__}: {exception}"
-        ) from exception
-    revision = str(information.sha or "").strip()
-    if not revision:
-        raise TranscriptionError(
-            f"The model service returned no revision for {repository}."
-        )
-    return revision
-
-
-def check_model(
-    script_directory: Path,
-    *,
-    repository: str,
-    directory_name: str,
-    label: str,
-    download_now: bool,
-) -> dict[str, object]:
-    from huggingface_hub import snapshot_download
-    from huggingface_hub.utils import disable_progress_bars
-
-    disable_progress_bars()
-    logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
-    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-
-    model_directory = script_directory / "models" / directory_name
-    revision_file = model_directory / ".model_revision.txt"
+def check_model(script_directory: Path, snapshot_download: object, HfApi: object) -> dict[str, object]:
+    model_directory = script_directory / "models" / PRIMARY_MODEL_DIRECTORY_NAME
+    revision_file = model_directory / ".revision.txt"
+    required_present = all((model_directory / name).is_file() for name in MODEL_REQUIRED_FILES)
     installed_revision = (
         revision_file.read_text(encoding="utf-8").strip()
         if revision_file.is_file()
         else ""
     )
-    latest_revision = get_model_revision(repository)
-    download_required = (
-        installed_revision != latest_revision
-        or not model_files_are_complete(model_directory)
-    )
+    latest_revision = ""
+    warning = ""
+    try:
+        latest_revision = str(HfApi().model_info(PRIMARY_MODEL_REPOSITORY).sha or "")
+    except Exception as exception:
+        warning = f"{type(exception).__name__}: {exception}"
 
-    print(f"{label}_MODEL_CHECK")
-    print(f"MODEL_REPOSITORY={repository}")
-    print(f"MODEL_DIRECTORY={model_directory}")
-    print(f"MODEL_INSTALLED_REVISION={installed_revision or 'NONE'}")
-    print(f"MODEL_LATEST_REVISION={latest_revision}")
-    print(f"MODEL_DOWNLOAD_REQUIRED={'YES' if download_required else 'NO'}")
+    download_required = not required_present
+    if required_present and latest_revision and installed_revision:
+        download_required = latest_revision != installed_revision
 
-    updated = False
-    if download_required and download_now:
+    if download_required:
         model_directory.mkdir(parents=True, exist_ok=True)
-        try:
-            snapshot_download(
-                repo_id=repository,
-                revision=latest_revision,
-                local_dir=str(model_directory),
-                allow_patterns=list(MODEL_ALLOW_PATTERNS),
-            )
-        except Exception as exception:
-            raise TranscriptionError(
-                f"The latest model files could not be downloaded: {repository}. "
-                f"{type(exception).__name__}: {exception}"
-            ) from exception
-        if not model_files_are_complete(model_directory):
-            missing = [
-                name
-                for name in MODEL_REQUIRED_FILES
-                if not (model_directory / name).is_file()
-            ]
-            raise TranscriptionError(
-                f"The downloaded model is incomplete: {repository}. Missing: "
-                + ", ".join(missing)
-            )
-        revision_file.write_text(latest_revision + "\n", encoding="utf-8")
-        updated = True
+        snapshot_download(
+            repo_id=PRIMARY_MODEL_REPOSITORY,
+            revision=latest_revision or None,
+            local_dir=str(model_directory),
+            allow_patterns=list(MODEL_ALLOW_PATTERNS),
+        )
+        required_present = all(
+            (model_directory / name).is_file() for name in MODEL_REQUIRED_FILES
+        )
+        if not required_present:
+            raise TranscriptionError("Primary model download is incomplete")
 
+    if latest_revision and required_present:
+        revision_file.write_text(latest_revision + "\n", encoding="utf-8")
+        installed_revision = latest_revision
+
+    if not required_present:
+        raise FileNotFoundError(f"Primary model not found: {model_directory}")
+
+    print("PRIMARY_MODEL_CHECK=PASS")
+    print(f"MODEL_DIRECTORY={model_directory}")
+    print(f"MODEL_DOWNLOAD_REQUIRED={'YES' if download_required else 'NO'}")
+    if warning:
+        print(f"MODEL_VERSION_CHECK_WARNING={warning}")
     return {
-        "repository": repository,
+        "repository": PRIMARY_MODEL_REPOSITORY,
         "directory": str(model_directory),
-        "revision": latest_revision,
         "installed_revision": installed_revision or None,
-        "download_required": download_required,
-        "updated": updated,
+        "latest_revision": latest_revision or None,
+        "downloaded": download_required,
+        "warning": warning or None,
     }
 
 
-def ensure_repair_model(
-    script_directory: Path,
-    model_information: dict[str, object],
-) -> dict[str, object]:
-    if not bool(model_information["download_required"]):
-        return model_information
-    return check_model(
-        script_directory,
-        repository=REPAIR_MODEL_REPOSITORY,
-        directory_name=REPAIR_MODEL_DIRECTORY_NAME,
-        label="REPAIR",
-        download_now=True,
-    )
-
-
-def validate_environment(
-    input_file: Path,
-    batch_size: int,
-    opening_audit_seconds: float,
-    max_repair_windows: int,
-    ctranslate2: object,
-) -> None:
+def validate_environment(input_file: Path, batch_size: int, ctranslate2: object) -> None:
     if not input_file.is_file():
-        raise FileNotFoundError(f"Input file was not found: {input_file}")
-    if batch_size < 1 or batch_size > 32:
-        raise ValueError("--batch-size must be between 1 and 32.")
-    if opening_audit_seconds < 0 or opening_audit_seconds > 600:
-        raise ValueError("--opening-audit-seconds must be between 0 and 600.")
-    if max_repair_windows < 0 or max_repair_windows > 4:
-        raise ValueError("--max-repair-windows must be between 0 and 4.")
-    if ctranslate2.get_cuda_device_count() < 1:
-        raise TranscriptionError("CTranslate2 cannot detect a CUDA GPU.")
-    supported = ctranslate2.get_supported_compute_types("cuda")
+        raise FileNotFoundError(f"Input audio not found: {input_file}")
+    if not 1 <= batch_size <= 32:
+        raise ValueError("batch-size must be between 1 and 32")
+    if int(ctranslate2.get_cuda_device_count()) < 1:
+        raise TranscriptionError("CUDA device was not detected")
+    supported = set(ctranslate2.get_supported_compute_types(DEVICE))
     if COMPUTE_TYPE not in supported:
         raise TranscriptionError(
-            f"{COMPUTE_TYPE} is not supported. Supported types: {sorted(supported)}"
+            f"{COMPUTE_TYPE} is unsupported. Supported: {sorted(supported)}"
         )
 
 
-def load_model(WhisperModel: object, model_path: Path, source: str) -> object:
+def load_model(WhisperModel: object, model_directory: Path) -> object:
     print("MODEL_LOAD_START")
-    print(f"MODEL_SOURCE={source}")
-    print(f"MODEL_PATH={model_path}")
-    print(f"COMPUTE_TYPE={COMPUTE_TYPE}")
     model = WhisperModel(
-        str(model_path),
+        str(model_directory),
         device=DEVICE,
-        device_index=0,
         compute_type=COMPUTE_TYPE,
-        flash_attention=False,
         local_files_only=True,
+        use_flash_attention=False,
     )
     print("FLASH_ATTENTION=False")
     print("MODEL_LOAD_COMPLETE")
     return model
 
 
-def clean_text(text: str) -> str:
-    return re.sub(r"[ \t]+", " ", text).strip()
-
-
-def segment_from_object(
-    segment: object,
-    *,
-    source: str,
-    offset: float = 0.0,
-) -> SegmentRecord | None:
-    text = clean_text(str(getattr(segment, "text", "")))
-    if not text:
-        return None
-    start = max(0.0, float(getattr(segment, "start", 0.0)) + offset)
-    end = max(start, float(getattr(segment, "end", start)) + offset)
-    return SegmentRecord(
-        start=start,
-        end=end,
-        text=text,
-        avg_logprob=float(getattr(segment, "avg_logprob", -1.0)),
-        compression_ratio=float(getattr(segment, "compression_ratio", 0.0)),
-        no_speech_prob=float(getattr(segment, "no_speech_prob", 0.0)),
-        source=source,
-    )
-
-
 def analyze_audio_signal(audio: object) -> dict[str, object]:
     import numpy as np
 
-    samples = np.asarray(audio, dtype=np.float32).reshape(-1)
-    if samples.size == 0:
-        raise TranscriptionError("The decoded audio contains no samples.")
-
-    absolute = np.abs(samples)
-    peak = float(np.max(absolute))
-    rms = float(np.sqrt(np.mean(samples * samples)))
-    clipped_ratio = float(np.mean(absolute >= 0.999))
-
-    frame_size = max(1, int(SAMPLE_RATE * 0.03))
-    frame_count = samples.size // frame_size
-    if frame_count > 0:
-        frames = samples[: frame_count * frame_size].reshape(frame_count, frame_size)
-        frame_rms = np.sqrt(np.mean(frames * frames, axis=1) + 1e-12)
-        frame_dbfs = 20.0 * np.log10(np.maximum(frame_rms, 1e-12))
-        low_level_frame_ratio = float(np.mean(frame_dbfs < -50.0))
-        p10_dbfs = float(np.percentile(frame_dbfs, 10))
-        p50_dbfs = float(np.percentile(frame_dbfs, 50))
-        p95_dbfs = float(np.percentile(frame_dbfs, 95))
-    else:
-        low_level_frame_ratio = 0.0
-        p10_dbfs = p50_dbfs = p95_dbfs = -120.0
-
-    peak_dbfs = 20.0 * math.log10(max(peak, 1e-12))
-    rms_dbfs = 20.0 * math.log10(max(rms, 1e-12))
+    values = np.asarray(audio, dtype=np.float32)
+    if values.size == 0:
+        raise TranscriptionError("Decoded audio is empty")
+    rms = float(np.sqrt(np.mean(values * values) + 1e-12))
+    peak = float(np.max(np.abs(values)))
+    frame_size = SAMPLE_RATE
+    frame_levels: list[float] = []
+    for start in range(0, len(values), frame_size):
+        frame = values[start : start + frame_size]
+        if frame.size == 0:
+            continue
+        frame_rms = float(np.sqrt(np.mean(frame * frame) + 1e-12))
+        frame_levels.append(20.0 * math.log10(max(frame_rms, 1e-12)))
+    levels = np.asarray(frame_levels, dtype=np.float32)
+    clipped_ratio = float(np.mean(np.abs(values) >= 0.999))
+    low_level_ratio = float(np.mean(levels < -50.0)) if levels.size else 0.0
     flags: list[str] = []
     if clipped_ratio > 0.001:
-        flags.append("clipping_detected")
-    if rms_dbfs < -35.0:
-        flags.append("low_recording_level")
-    if low_level_frame_ratio > 0.70:
-        flags.append("high_low_level_frame_ratio")
-    if p95_dbfs - p10_dbfs < 8.0:
-        flags.append("low_dynamic_range")
-
+        flags.append("CLIPPING")
+    if low_level_ratio > 0.55:
+        flags.append("MANY_LOW_LEVEL_FRAMES")
     return {
+        "scope": "SIGNAL_LEVEL_DIAGNOSTIC_NOT_TRANSCRIPTION_ACCURACY",
         "sample_rate": SAMPLE_RATE,
-        "sample_count": int(samples.size),
-        "peak_dbfs": round(peak_dbfs, 3),
-        "rms_dbfs": round(rms_dbfs, 3),
+        "sample_count": int(values.size),
+        "rms_dbfs": round(20.0 * math.log10(max(rms, 1e-12)), 3),
+        "peak_dbfs": round(20.0 * math.log10(max(peak, 1e-12)), 3),
         "clipped_sample_ratio": clipped_ratio,
-        "low_level_frame_ratio": low_level_frame_ratio,
-        "frame_dbfs_p10": round(p10_dbfs, 3),
-        "frame_dbfs_p50": round(p50_dbfs, 3),
-        "frame_dbfs_p95": round(p95_dbfs, 3),
-        "dynamic_range_p95_minus_p10_db": round(p95_dbfs - p10_dbfs, 3),
+        "low_level_frame_ratio": low_level_ratio,
+        "frame_dbfs_p10": round(float(np.percentile(levels, 10)), 3),
+        "frame_dbfs_p50": round(float(np.percentile(levels, 50)), 3),
+        "frame_dbfs_p95": round(float(np.percentile(levels, 95)), 3),
+        "dynamic_range_p95_minus_p10_db": round(
+            float(np.percentile(levels, 95) - np.percentile(levels, 10)), 3
+        ),
         "quality_flags": flags,
         "quality_status": "PASS" if not flags else "REVIEW",
-        "scope": "SIGNAL_LEVEL_DIAGNOSTIC_NOT_TRANSCRIPTION_ACCURACY",
     }
 
 
+def clean_text(text: str) -> str:
+    text = text.replace("\u3000", " ").replace("�", "")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\s+([,.!?;:])", r"\1", text)
+    return text.strip()
+
+
 def normalize_for_comparison(text: str) -> str:
-    return re.sub(r"[^0-9A-Za-zぁ-んァ-ヶ一-龯々]+", "", text.lower())
-
-
-def english_words(text: str) -> list[str]:
-    return re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", text)
+    return re.sub(r"[^a-z0-9ぁ-んァ-ヶ一-龯々]+", "", text.lower())
 
 
 def japanese_character_count(text: str) -> int:
@@ -780,510 +503,79 @@ def latin_character_count(text: str) -> int:
     return len(re.findall(r"[A-Za-z]", text))
 
 
-def detect_decoder_loop(text: str) -> bool:
-    compact = re.sub(r"\s+", "", text)
-    for unit_length in range(2, 17):
-        if re.search(rf"(.{{{unit_length}}})\1{{8,}}", compact):
-            return True
-    return False
+def english_words(text: str) -> list[str]:
+    return re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", text)
 
 
-def strict_section_hits(text: str) -> dict[str, bool]:
-    lower_text = text.lower()
-    return {
-        canonical: any(alias.lower() in lower_text for alias in aliases)
-        for canonical, aliases in STRICT_SECTION_ALIASES.items()
-    }
+def language_label(text: str) -> str:
+    japanese = japanese_character_count(text)
+    latin = latin_character_count(text)
+    if japanese and latin:
+        return "mixed"
+    if japanese:
+        return "ja"
+    if latin:
+        return "en"
+    return "unknown"
 
 
 def split_english_candidates(text: str) -> list[str]:
     candidates: list[str] = []
     for piece in re.split(r"(?<=[.!?])\s+|[\r\n]+", text):
         piece = clean_text(piece)
-        if 5 <= len(english_words(piece)) <= 30 and latin_character_count(piece) >= 18:
-            candidates.append(piece)
+        words = english_words(piece)
+        compact = re.sub(r"\s+", "", piece)
+        if not compact or not 4 <= len(words) <= 40:
+            continue
+        if latin_character_count(piece) / len(compact) < 0.82:
+            continue
+        if len({word.lower() for word in words}) / len(words) < 0.42:
+            continue
+        candidates.append(piece)
     return candidates
 
 
-def discover_repeated_anchors(segments: Iterable[SegmentRecord]) -> list[str]:
-    candidates: list[str] = []
-    for segment in segments:
-        candidates.extend(split_english_candidates(segment.text))
-
-    clusters: list[list[str]] = []
-    for candidate in candidates:
-        normalized = normalize_for_comparison(candidate)
-        best_index: int | None = None
-        best_ratio = 0.0
-        for index, cluster in enumerate(clusters):
-            ratio = SequenceMatcher(
-                None,
-                normalized,
-                normalize_for_comparison(cluster[0]),
-            ).ratio()
-            if ratio > best_ratio:
-                best_index = index
-                best_ratio = ratio
-        if best_index is not None and best_ratio >= 0.82:
-            clusters[best_index].append(candidate)
-        else:
-            clusters.append([candidate])
-
-    results: list[tuple[int, str]] = []
-    for cluster in clusters:
-        if len(cluster) < 2:
-            continue
-        normalized_counts = Counter(
-            normalize_for_comparison(value) for value in cluster
-        )
-        representative_normalized = max(
-            normalized_counts,
-            key=lambda value: (normalized_counts[value], len(value)),
-        )
-        matching = [
-            value
-            for value in cluster
-            if normalize_for_comparison(value) == representative_normalized
-        ]
-        representative = max(matching, key=len)
-        results.append((len(cluster), representative))
-    results.sort(key=lambda item: (-item[0], -len(item[1])))
-    return [text for _count, text in results[:10]]
+def detect_decoder_loop(text: str) -> bool:
+    words = re.findall(r"[A-Za-zぁ-んァ-ヶ一-龯々]+", text.lower())
+    if len(words) < 18:
+        return False
+    for size in (2, 3, 4, 5):
+        chunks = [tuple(words[index : index + size]) for index in range(len(words) - size + 1)]
+        if chunks and Counter(chunks).most_common(1)[0][1] >= 6:
+            return True
+    return False
 
 
-def correct_repeated_english_variants(
-    text: str,
-) -> tuple[str, list[dict[str, object]], int]:
-    candidates = split_english_candidates(text)
-    clusters: list[list[str]] = []
-    for candidate in candidates:
-        normalized = normalize_for_comparison(candidate)
-        best_index: int | None = None
-        best_ratio = 0.0
-        for index, cluster in enumerate(clusters):
-            ratio = SequenceMatcher(
-                None,
-                normalized,
-                normalize_for_comparison(cluster[0]),
-            ).ratio()
-            if ratio > best_ratio:
-                best_index = index
-                best_ratio = ratio
-        if best_index is not None and best_ratio >= 0.82:
-            clusters[best_index].append(candidate)
-        else:
-            clusters.append([candidate])
-
-    corrected = text
-    corrections: list[dict[str, object]] = []
-    unresolved = 0
-    for cluster in clusters:
-        exact_counts = Counter(clean_text(value) for value in cluster)
-        if sum(exact_counts.values()) < 4 or len(exact_counts) < 2:
-            continue
-        canonical, canonical_count = max(
-            exact_counts.items(),
-            key=lambda item: (item[1], len(item[0])),
-        )
-        canonical_words = english_words(canonical)
-        if canonical_count < 2 or len(canonical_words) < 5:
-            continue
-        cluster_changed = False
-        for variant, variant_count in exact_counts.items():
-            if variant == canonical:
-                continue
-            variant_words = english_words(variant)
-            if not variant_words:
-                continue
-            if canonical_words[0].lower() != variant_words[0].lower():
-                continue
-            if canonical_words[-1].lower() != variant_words[-1].lower():
-                continue
-            if abs(len(canonical_words) - len(variant_words)) > 3:
-                continue
-            canonical_normalized = normalize_for_comparison(canonical)
-            variant_normalized = normalize_for_comparison(variant)
-            if canonical_normalized in variant_normalized or variant_normalized in canonical_normalized:
-                continue
-            similarity = SequenceMatcher(
-                None,
-                canonical_normalized,
-                variant_normalized,
-            ).ratio()
-            if similarity < 0.82 or canonical_count <= variant_count:
-                continue
-            occurrences = corrected.count(variant)
-            if occurrences == 0:
-                continue
-            corrected = corrected.replace(variant, canonical)
-            corrections.append(
-                {
-                    'from': variant,
-                    'to': canonical,
-                    'occurrences': occurrences,
-                    'canonical_count': canonical_count,
-                    'variant_count': variant_count,
-                    'similarity': round(similarity, 6),
-                }
-            )
-            cluster_changed = True
-        if not cluster_changed:
-            unresolved += 1
-
-    return corrected, corrections, unresolved
+def strict_section_hits(text: str) -> dict[str, bool]:
+    lower = text.lower()
+    return {
+        section: any(alias.lower() in lower for alias in aliases)
+        for section, aliases in STRICT_SECTION_ALIASES.items()
+    }
 
 
-def recover_repeated_section_examples(
-    baseline_text: str,
-    audit_text: str,
-) -> list[dict[str, object]]:
-    baseline_candidates = split_english_candidates(baseline_text)
-    audit_candidates = split_english_candidates(audit_text)
-    clusters: list[list[tuple[int, str]]] = []
-
-    for position, candidate in enumerate(audit_candidates):
-        normalized = normalize_for_comparison(candidate)
-        best_index: int | None = None
-        best_ratio = 0.0
-        for index, cluster in enumerate(clusters):
-            ratio = SequenceMatcher(
-                None,
-                normalized,
-                normalize_for_comparison(cluster[0][1]),
-            ).ratio()
-            if ratio > best_ratio:
-                best_index = index
-                best_ratio = ratio
-        if best_index is not None and best_ratio >= 0.90:
-            clusters[best_index].append((position, candidate))
-        else:
-            clusters.append([(position, candidate)])
-
-    recovered: list[dict[str, object]] = []
-    for cluster in clusters:
-        if len(cluster) < 2:
-            continue
-        normalized_counts = Counter(
-            normalize_for_comparison(candidate)
-            for _position, candidate in cluster
-        )
-        canonical_normalized, occurrence_count = max(
-            normalized_counts.items(),
-            key=lambda item: (item[1], len(item[0])),
-        )
-        if occurrence_count < 2:
-            continue
-        matching = [
-            (position, candidate)
-            for position, candidate in cluster
-            if normalize_for_comparison(candidate) == canonical_normalized
-        ]
-        first_position = min(position for position, _candidate in matching)
-        canonical = max((candidate for _position, candidate in matching), key=len)
-        words = english_words(canonical)
-        compact = re.sub(r"\s+", "", canonical)
-        if not 5 <= len(words) <= 28 or not compact:
-            continue
-        if latin_character_count(canonical) / len(compact) < 0.82:
-            continue
-        if any(section.lower() in canonical.lower() for section in STRICT_SECTION_ALIASES):
-            continue
-        if any(
-            SequenceMatcher(
-                None,
-                canonical_normalized,
-                normalize_for_comparison(existing),
-            ).ratio()
-            >= 0.84
-            for existing in baseline_candidates
-        ):
-            continue
-        recovered.append(
-            {
-                "text": canonical,
-                "occurrences": occurrence_count,
-                "first_position": first_position,
-                "evidence": "repeated_in_forced_english_section_audit",
-            }
-        )
-
-    recovered.sort(key=lambda item: int(item["first_position"]))
-    return recovered
-
-
-def recover_cross_window_section_examples(
-    baseline_text: str,
-    audit_segments: list[SegmentRecord],
-) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    baseline_candidates = split_english_candidates(baseline_text)
-    observations: list[dict[str, object]] = []
-    for segment in audit_segments:
-        for candidate in split_english_candidates(segment.text):
-            words = english_words(candidate)
-            compact = re.sub(r"\s+", "", candidate)
-            if not 5 <= len(words) <= 24 or not compact:
-                continue
-            if latin_character_count(candidate) / len(compact) < 0.88:
-                continue
-            unique_ratio = len({word.lower() for word in words}) / len(words)
-            if unique_ratio < 0.45:
-                continue
-            observations.append(
-                {
-                    "text": candidate,
-                    "normalized": normalize_for_comparison(candidate),
-                    "start": segment.start,
-                    "end": segment.end,
-                    "midpoint": (segment.start + segment.end) / 2.0,
-                    "source": segment.source,
-                    "avg_logprob": segment.avg_logprob,
-                }
-            )
-
-    clusters: list[list[dict[str, object]]] = []
-    for observation in observations:
-        best_index: int | None = None
-        best_ratio = 0.0
-        for index, cluster in enumerate(clusters):
-            ratio = SequenceMatcher(
-                None,
-                str(observation["normalized"]),
-                str(cluster[0]["normalized"]),
-            ).ratio()
-            if ratio > best_ratio:
-                best_index = index
-                best_ratio = ratio
-        if best_index is not None and best_ratio >= 0.88:
-            clusters[best_index].append(observation)
-        else:
-            clusters.append([observation])
-
-    recovered: list[dict[str, object]] = []
-    evidence_log: list[dict[str, object]] = []
-    for cluster_index, cluster in enumerate(clusters):
-        variant_counts = Counter(clean_text(str(item["text"])) for item in cluster)
-        canonical = max(
-            variant_counts,
-            key=lambda value: (variant_counts[value], len(value)),
-        )
-        canonical_normalized = normalize_for_comparison(canonical)
-        matching = [
-            item
-            for item in cluster
-            if SequenceMatcher(
-                None,
-                canonical_normalized,
-                str(item["normalized"]),
-            ).ratio()
-            >= 0.90
-        ]
-        matching.sort(key=lambda item: float(item["midpoint"]))
-
-        temporal_events: list[list[dict[str, object]]] = []
-        for item in matching:
-            midpoint = float(item["midpoint"])
-            if (
-                not temporal_events
-                or midpoint
-                - sum(float(value["midpoint"]) for value in temporal_events[-1])
-                / len(temporal_events[-1])
-                > SECTION_EVENT_CLUSTER_SECONDS
-            ):
-                temporal_events.append([item])
-            else:
-                temporal_events[-1].append(item)
-
-        distinct_sources = {str(item["source"]) for item in matching}
-        supported_events = [
-            event
-            for event in temporal_events
-            if len({str(item["source"]) for item in event})
-            >= SECTION_CROSS_WINDOW_MIN_SUPPORT
-        ]
-        evidence_type = "cross_window_same_utterance"
-        if not supported_events and len(temporal_events) >= 2 and len(distinct_sources) >= 2:
-            supported_events = temporal_events
-            evidence_type = "same_sentence_repeated_at_separate_times"
-
-        average_probability = (
-            sum(float(item["avg_logprob"]) for item in matching) / len(matching)
-            if matching
-            else -10.0
-        )
-        existing_similarity = max(
-            (
-                SequenceMatcher(
-                    None,
-                    canonical_normalized,
-                    normalize_for_comparison(existing),
-                ).ratio()
-                for existing in baseline_candidates
-            ),
-            default=0.0,
-        )
-        accepted = bool(supported_events)
-        reason = "accepted"
-        if existing_similarity >= 0.84:
-            accepted = False
-            reason = "already_present_or_close_variant"
-        elif average_probability < -0.65:
-            accepted = False
-            reason = "low_cross_window_confidence"
-        elif not supported_events:
-            reason = "insufficient_independent_support"
-
-        event_records = []
-        for event in supported_events:
-            event_records.append(
-                {
-                    "start": min(float(item["start"]) for item in event),
-                    "end": max(float(item["end"]) for item in event),
-                    "window_support": len(
-                        {str(item["source"]) for item in event}
-                    ),
-                    "sources": sorted(
-                        {str(item["source"]) for item in event}
-                    ),
-                    "avg_logprob": (
-                        sum(float(item["avg_logprob"]) for item in event)
-                        / len(event)
-                    ),
-                }
-            )
-
-        evidence = {
-            "cluster_index": cluster_index,
-            "text": canonical,
-            "observation_count": len(matching),
-            "distinct_window_count": len(distinct_sources),
-            "temporal_event_count": len(temporal_events),
-            "supported_event_count": len(supported_events),
-            "average_logprob": round(average_probability, 6),
-            "existing_similarity": round(existing_similarity, 6),
-            "accepted": accepted,
-            "decision_reason": reason,
-            "evidence_type": evidence_type,
-            "events": event_records,
-        }
-        evidence_log.append(evidence)
-        if not accepted:
-            continue
-        recovered.append(
-            {
-                "text": canonical,
-                "occurrences": len(event_records),
-                "first_position": int(min(event["start"] for event in event_records) * 1000),
-                "evidence": evidence_type,
-                "average_logprob": average_probability,
-                "events": event_records,
-            }
-        )
-
-    recovered.sort(key=lambda item: int(item["first_position"]))
-    return recovered, evidence_log
-
-
-def recovered_examples_to_segments(
-    recovered_examples: list[dict[str, object]],
-) -> list[SegmentRecord]:
-    segments: list[SegmentRecord] = []
-    for example_index, item in enumerate(recovered_examples):
-        text = str(item["text"]).strip()
-        for event_index, event in enumerate(item.get("events", [])):
-            event_data = dict(event)
-            segments.append(
-                SegmentRecord(
-                    start=float(event_data["start"]),
-                    end=float(event_data["end"]),
-                    text=text,
-                    avg_logprob=float(event_data["avg_logprob"]),
-                    compression_ratio=0.0,
-                    no_speech_prob=0.0,
-                    source=(
-                        f"turbo_essential_dense_consensus_"
-                        f"{example_index:02d}_{event_index:02d}"
-                    ),
-                )
-            )
-    return segments
-
-
-def merge_recovered_examples(
-    *groups: list[dict[str, object]],
-) -> list[dict[str, object]]:
-    merged: dict[str, dict[str, object]] = {}
-    for group in groups:
-        for item in group:
-            text = str(item.get("text", "")).strip()
-            normalized = normalize_for_comparison(text)
-            if not normalized:
-                continue
-            current = merged.get(normalized)
-            if current is None:
-                merged[normalized] = dict(item)
-                continue
-            current["occurrences"] = max(
-                int(current.get("occurrences", 1)),
-                int(item.get("occurrences", 1)),
-            )
-            current["first_position"] = min(
-                int(current.get("first_position", 0)),
-                int(item.get("first_position", 0)),
-            )
-            evidence = {
-                str(current.get("evidence", "")),
-                str(item.get("evidence", "")),
-            }
-            current["evidence"] = "+".join(sorted(value for value in evidence if value))
-    results = list(merged.values())
-    results.sort(
-        key=lambda item: (
-            int(item.get("first_position", 0)),
-            str(item.get("text", "")),
-        )
-    )
-    return results
-
-
-def insert_recovered_examples(
-    text: str,
-    recovered_examples: list[dict[str, object]],
-) -> str:
-    if not recovered_examples:
-        return text
-    recovered_lines: list[str] = []
-    for item in recovered_examples:
-        sentence = str(item["text"]).strip()
-        occurrences = max(1, int(item["occurrences"]))
-        recovered_lines.extend(sentence for _index in range(occurrences))
-    insertion = "\n".join(recovered_lines).strip()
-    if not insertion:
-        return text
-
-    match = re.search(r"(?mi)^Practical Usage\s*$", text)
-    if match is None:
-        return text.rstrip() + "\n\n" + insertion + "\n"
-    before = text[:match.start()].rstrip()
-    after = text[match.start():].lstrip()
-    return before + "\n\n" + insertion + "\n\n" + after
-
-
-def anchor_exact_hits(text: str, anchors: Iterable[str]) -> int:
-    normalized_text = normalize_for_comparison(text)
-    return sum(
-        normalized_text.count(normalize_for_comparison(anchor))
-        for anchor in anchors
-        if normalize_for_comparison(anchor)
+def segment_from_object(segment: object, source: str, offset: float = 0.0) -> SegmentRecord | None:
+    text = clean_text(str(getattr(segment, "text", "")))
+    if not text:
+        return None
+    return SegmentRecord(
+        start=offset + float(getattr(segment, "start", 0.0)),
+        end=offset + float(getattr(segment, "end", 0.0)),
+        text=text,
+        avg_logprob=float(getattr(segment, "avg_logprob", -10.0)),
+        compression_ratio=float(getattr(segment, "compression_ratio", 0.0)),
+        no_speech_prob=float(getattr(segment, "no_speech_prob", 0.0)),
+        source=source,
     )
 
 
 def deduplicate_segments(segments: Iterable[SegmentRecord]) -> list[SegmentRecord]:
     result: list[SegmentRecord] = []
     for candidate in sorted(segments, key=lambda item: (item.start, item.end)):
-        duplicate_index: int | None = None
-        for index in range(len(result) - 1, max(-1, len(result) - 5), -1):
+        duplicate: int | None = None
+        for index in range(len(result) - 1, max(-1, len(result) - 8), -1):
             previous = result[index]
-            if candidate.start - previous.end > 1.0:
+            if candidate.start - previous.end > 2.0:
                 break
             overlap = min(previous.end, candidate.end) - max(previous.start, candidate.start)
             if overlap <= 0.05:
@@ -1294,16 +586,16 @@ def deduplicate_segments(segments: Iterable[SegmentRecord]) -> list[SegmentRecor
                 continue
             similarity = SequenceMatcher(None, left, right).ratio()
             if similarity >= 0.90 or left in right or right in left:
-                duplicate_index = index
+                duplicate = index
                 break
-        if duplicate_index is None:
+        if duplicate is None:
             result.append(candidate)
             continue
-        previous = result[duplicate_index]
-        previous_quality = previous.avg_logprob + min(len(previous.text), 180) / 1000.0
-        candidate_quality = candidate.avg_logprob + min(len(candidate.text), 180) / 1000.0
-        if candidate_quality > previous_quality:
-            result[duplicate_index] = candidate
+        previous = result[duplicate]
+        previous_score = previous.avg_logprob + min(len(previous.text), 180) / 1000.0
+        candidate_score = candidate.avg_logprob + min(len(candidate.text), 180) / 1000.0
+        if candidate_score > previous_score:
+            result[duplicate] = candidate
     return sorted(result, key=lambda item: (item.start, item.end))
 
 
@@ -1319,7 +611,6 @@ def format_transcript(segments: Iterable[SegmentRecord]) -> str:
                 lines.append("")
         lines.append(text)
         previous_end = segment.end
-
     compact: list[str] = []
     for line in lines:
         if line == "" and compact and compact[-1] == "":
@@ -1327,33 +618,32 @@ def format_transcript(segments: Iterable[SegmentRecord]) -> str:
         compact.append(line)
     transcript = "\n".join(compact).strip()
     if not transcript:
-        raise TranscriptionError("The final transcript is empty.")
+        raise TranscriptionError("Final transcript is empty")
     return transcript + "\n"
+
+
+def batch_sizes(initial: int) -> list[int]:
+    values: list[int] = []
+    current = initial
+    while True:
+        if current not in values:
+            values.append(current)
+        if current == 1:
+            return values
+        current = max(1, current // 2)
 
 
 def is_cuda_memory_error(exception: BaseException) -> bool:
     message = str(exception).lower()
     return any(
-        term in message
-        for term in (
+        token in message
+        for token in (
             "out of memory",
             "cuda_error_out_of_memory",
             "failed to allocate",
             "memory allocation",
         )
     )
-
-
-def batch_candidates(initial: int) -> list[int]:
-    values: list[int] = []
-    current = initial
-    while current >= 1:
-        if current not in values:
-            values.append(current)
-        if current == 1:
-            break
-        current = max(1, current // 2)
-    return values
 
 
 def transcribe_batched_baseline(
@@ -1365,10 +655,8 @@ def transcribe_batched_baseline(
 ) -> tuple[list[SegmentRecord], int, str]:
     pipeline = BatchedInferencePipeline(model=model)
     last_exception: BaseException | None = None
-
-    for batch_size in batch_candidates(requested_batch_size):
-        print("PRIMARY_TRANSCRIPTION_ATTEMPT")
-        print(f"BATCH_SIZE={batch_size}")
+    for batch_size in batch_sizes(requested_batch_size):
+        print(f"PRIMARY_TRANSCRIPTION_ATTEMPT BATCH_SIZE={batch_size}")
         try:
             iterator, information = pipeline.transcribe(
                 audio,
@@ -1395,23 +683,20 @@ def transcribe_batched_baseline(
             records = [
                 record
                 for segment in iterator
-                if (record := segment_from_object(segment, source="turbo_batched"))
+                if (record := segment_from_object(segment, "turbo_batched"))
                 is not None
             ]
             if not records:
-                raise TranscriptionError("The primary model returned no transcript segments.")
-            detected_language = str(getattr(information, "language", language or "unknown"))
-            return deduplicate_segments(records), batch_size, detected_language
+                raise TranscriptionError("Primary model returned no segments")
+            detected = str(getattr(information, "language", language or "unknown"))
+            return deduplicate_segments(records), batch_size, detected
         except Exception as exception:
             last_exception = exception
             if not is_cuda_memory_error(exception):
                 raise
-            print(f"GPU_MEMORY_RETRY=BATCH_SIZE_{batch_size}")
+            print(f"GPU_MEMORY_RETRY_AFTER_BATCH_SIZE={batch_size}")
             gc.collect()
-
-    raise TranscriptionError(
-        "The primary transcription failed at every batch size."
-    ) from last_exception
+    raise TranscriptionError("Primary transcription failed at every batch size") from last_exception
 
 
 def transcribe_slice(
@@ -1423,20 +708,21 @@ def transcribe_slice(
     language: str | None,
     source: str,
     beam_size: int,
-    multilingual: bool = True,
+    multilingual: bool,
 ) -> list[SegmentRecord]:
-    start_sample = int(max(0.0, start) * SAMPLE_RATE)
-    end_sample = int(max(start, end) * SAMPLE_RATE)
-    audio_slice = audio[start_sample:end_sample]
+    start_sample = max(0, int(start * SAMPLE_RATE))
+    end_sample = min(len(audio), int(end * SAMPLE_RATE))
+    if end_sample <= start_sample:
+        return []
     iterator, _information = model.transcribe(
-        audio_slice,
+        audio[start_sample:end_sample],
         task="transcribe",
         language=language,
         multilingual=multilingual,
         beam_size=beam_size,
         best_of=beam_size,
         patience=1.0,
-        temperature=(0.0, 0.2, 0.4),
+        temperature=0.0,
         vad_filter=False,
         condition_on_previous_text=False,
         without_timestamps=False,
@@ -1447,39 +733,57 @@ def transcribe_slice(
         no_speech_threshold=0.6,
         log_progress=False,
     )
-    records = [
+    return deduplicate_segments(
         record
         for segment in iterator
-        if (
-            record := segment_from_object(
-                segment,
-                source=source,
-                offset=start,
-            )
-        )
-        is not None
+        if (record := segment_from_object(segment, source, start)) is not None
+    )
+
+
+def section_intervals(
+    segments: list[SegmentRecord], audio_seconds: float
+) -> dict[str, tuple[float, float]]:
+    first_hits: dict[str, float] = {}
+    for segment in sorted(segments, key=lambda item: (item.start, item.end)):
+        for section, hit in strict_section_hits(segment.text).items():
+            if hit and section not in first_hits:
+                first_hits[section] = segment.start
+    order = [
+        "Grammar and Vocabulary",
+        "Essential Expressions",
+        "Practical Usage",
+        "Pronunciation Polish",
     ]
-    return deduplicate_segments(records)
+    intervals: dict[str, tuple[float, float]] = {}
+    for index, section in enumerate(order[:-1]):
+        start = first_hits.get(section)
+        end = first_hits.get(order[index + 1])
+        if start is None or end is None or end - start < 8.0:
+            continue
+        intervals[section] = (max(0.0, start), min(audio_seconds, end))
+    return intervals
 
 
-def transcribe_chunked_english_section(
+def transcribe_section_windows(
     model: object,
     audio: object,
     *,
+    section_name: str,
     start: float,
     end: float,
 ) -> tuple[list[SegmentRecord], int]:
-    if end <= start:
-        return [], 0
     records: list[SegmentRecord] = []
     window_count = 0
     cursor = start
+    slug = re.sub(r"[^a-z0-9]+", "_", section_name.lower()).strip("_")
     while cursor < end:
-        chunk_end = min(end, cursor + SECTION_CHUNK_SECONDS)
+        chunk_end = min(end, cursor + SECTION_WINDOW_SECONDS)
+        if chunk_end - cursor < 8.0 and window_count > 0:
+            break
         window_count += 1
         print(
-            f"SECTION_DENSE_AUDIT_WINDOW={window_count:02d} "
-            f"START={cursor:.3f} END={chunk_end:.3f}"
+            f"SECTION_COVERAGE_WINDOW SECTION={section_name} "
+            f"INDEX={window_count:02d} START={cursor:.3f} END={chunk_end:.3f}"
         )
         records.extend(
             transcribe_slice(
@@ -1488,46 +792,230 @@ def transcribe_chunked_english_section(
                 start=cursor,
                 end=chunk_end,
                 language="en",
-                source=f"turbo_essential_dense_en_w{window_count:02d}",
+                source=f"v21_{slug}_w{window_count:02d}",
                 beam_size=3,
                 multilingual=False,
             )
         )
         if chunk_end >= end:
             break
-        next_cursor = chunk_end - SECTION_CHUNK_OVERLAP_SECONDS
-        if next_cursor <= cursor:
-            next_cursor = cursor + 1.0
-        cursor = next_cursor
+        cursor += SECTION_WINDOW_HOP_SECONDS
     return records, window_count
 
 
-def average_logprob(segments: Iterable[SegmentRecord]) -> float:
-    values = [segment.avg_logprob for segment in segments]
-    return sum(values) / len(values) if values else -10.0
+def candidate_observations(segments: list[SegmentRecord]) -> list[dict[str, object]]:
+    observations: list[dict[str, object]] = []
+    for segment in segments:
+        for candidate in split_english_candidates(segment.text):
+            if segment.avg_logprob < -0.72 or detect_decoder_loop(candidate):
+                continue
+            observations.append(
+                {
+                    "text": candidate,
+                    "normalized": normalize_for_comparison(candidate),
+                    "start": segment.start,
+                    "end": segment.end,
+                    "midpoint": (segment.start + segment.end) / 2.0,
+                    "avg_logprob": segment.avg_logprob,
+                    "source": segment.source,
+                }
+            )
+    return observations
 
 
-def quality_score(text: str, segments: list[SegmentRecord]) -> float:
-    confidence = max(0.0, min(1.0, (average_logprob(segments) + 1.2) / 1.2))
-    length_score = min(len(text) / 240.0, 1.0)
-    penalty = 0.0
-    if "�" in text:
-        penalty += 0.5
-    if detect_decoder_loop(text):
-        penalty += 0.8
-    return max(0.0, confidence * 0.78 + length_score * 0.22 - penalty)
+def local_baseline_candidates(
+    baseline_segments: list[SegmentRecord], start: float, end: float
+) -> list[str]:
+    text = " ".join(
+        segment.text
+        for segment in baseline_segments
+        if segment.end >= start - LOCAL_DUPLICATE_PADDING_SECONDS
+        and segment.start <= end + LOCAL_DUPLICATE_PADDING_SECONDS
+    )
+    return split_english_candidates(text)
 
 
-def comparison_tokens(text: str) -> list[str]:
-    return [
-        token.lower()
-        for token in re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?|[ぁ-んァ-ヶ一-龯々]", text)
+def recover_time_local_consensus(
+    baseline_segments: list[SegmentRecord],
+    audit_segments: list[SegmentRecord],
+    section_name: str,
+) -> tuple[list[SegmentRecord], list[dict[str, object]]]:
+    observations = candidate_observations(audit_segments)
+    clusters: list[list[dict[str, object]]] = []
+    for observation in observations:
+        best_index: int | None = None
+        best_ratio = 0.0
+        for index, cluster in enumerate(clusters):
+            ratio = SequenceMatcher(
+                None,
+                str(observation["normalized"]),
+                str(cluster[0]["normalized"]),
+            ).ratio()
+            if ratio > best_ratio:
+                best_index = index
+                best_ratio = ratio
+        if best_index is not None and best_ratio >= 0.88:
+            clusters[best_index].append(observation)
+        else:
+            clusters.append([observation])
+
+    recovered: list[SegmentRecord] = []
+    evidence: list[dict[str, object]] = []
+    for cluster_index, cluster in enumerate(clusters):
+        variants = Counter(clean_text(str(item["text"])) for item in cluster)
+        canonical = max(variants, key=lambda value: (variants[value], len(value)))
+        canonical_normalized = normalize_for_comparison(canonical)
+        if any(
+            alias.lower() in canonical.lower()
+            for aliases in STRICT_SECTION_ALIASES.values()
+            for alias in aliases
+        ):
+            continue
+        matching = [
+            item
+            for item in cluster
+            if SequenceMatcher(
+                None, canonical_normalized, str(item["normalized"])
+            ).ratio()
+            >= 0.90
+        ]
+        matching.sort(key=lambda item: float(item["midpoint"]))
+        if not matching:
+            continue
+
+        events: list[list[dict[str, object]]] = []
+        for observation in matching:
+            midpoint = float(observation["midpoint"])
+            if not events:
+                events.append([observation])
+                continue
+            previous_midpoint = sum(float(item["midpoint"]) for item in events[-1]) / len(
+                events[-1]
+            )
+            if midpoint - previous_midpoint > EVENT_CLUSTER_SECONDS:
+                events.append([observation])
+            else:
+                events[-1].append(observation)
+
+        repeated_at_separate_times = len(events) >= 2
+        for event_index, event in enumerate(events):
+            sources = sorted({str(item["source"]) for item in event})
+            event_start = min(float(item["start"]) for item in event)
+            event_end = max(float(item["end"]) for item in event)
+            event_avg_logprob = sum(float(item["avg_logprob"]) for item in event) / len(
+                event
+            )
+            source_supported = len(sources) >= MIN_EVENT_SOURCE_SUPPORT
+            repeated_supported = (
+                repeated_at_separate_times
+                and event_avg_logprob >= MIN_REPEATED_EVENT_AVG_LOGPROB
+            )
+            accepted = source_supported and event_avg_logprob >= MIN_EVENT_AVG_LOGPROB
+            evidence_type = "overlapping_window_consensus"
+            if not accepted and repeated_supported:
+                accepted = True
+                evidence_type = "same_sentence_repeated_at_separate_times"
+
+            baseline_candidates = local_baseline_candidates(
+                baseline_segments, event_start, event_end
+            )
+            similarities = [
+                SequenceMatcher(
+                    None,
+                    canonical_normalized,
+                    normalize_for_comparison(candidate),
+                ).ratio()
+                for candidate in baseline_candidates
+                if normalize_for_comparison(candidate)
+            ]
+            local_similarity = max(similarities, default=0.0)
+            already_present = any(
+                canonical_normalized in normalize_for_comparison(candidate)
+                or normalize_for_comparison(candidate) in canonical_normalized
+                or SequenceMatcher(
+                    None,
+                    canonical_normalized,
+                    normalize_for_comparison(candidate),
+                ).ratio()
+                >= 0.86
+                for candidate in baseline_candidates
+                if normalize_for_comparison(candidate)
+            )
+            reason = "accepted"
+            if already_present:
+                accepted = False
+                reason = "already_present_at_same_time"
+            elif not source_supported and not repeated_supported:
+                reason = "insufficient_independent_support"
+            elif event_avg_logprob < MIN_EVENT_AVG_LOGPROB and not repeated_supported:
+                reason = "low_event_confidence"
+
+            evidence.append(
+                {
+                    "cluster_index": cluster_index,
+                    "event_index": event_index,
+                    "section": section_name,
+                    "text": canonical,
+                    "start": event_start,
+                    "end": event_end,
+                    "source_count": len(sources),
+                    "sources": sources,
+                    "avg_logprob": event_avg_logprob,
+                    "temporal_event_count": len(events),
+                    "evidence_type": evidence_type,
+                    "local_similarity": local_similarity,
+                    "accepted": accepted,
+                    "decision_reason": reason,
+                }
+            )
+            if accepted:
+                recovered.append(
+                    SegmentRecord(
+                        start=event_start,
+                        end=event_end,
+                        text=canonical,
+                        avg_logprob=event_avg_logprob,
+                        compression_ratio=0.0,
+                        no_speech_prob=0.0,
+                        source="turbo_v21_time_local_section_consensus",
+                    )
+                )
+
+    return deduplicate_segments(recovered), evidence
+
+
+def opening_is_sparse(segments: list[SegmentRecord], core_end: float) -> tuple[bool, dict[str, object]]:
+    opening = [
+        segment
+        for segment in segments
+        if (segment.start + segment.end) / 2.0 <= core_end
     ]
+    text = format_transcript(opening) if opening else ""
+    diagnostics = {
+        "segment_count": len(opening),
+        "text_characters": len(text),
+        "japanese_characters": japanese_character_count(text),
+        "latin_characters": latin_character_count(text),
+        "english_candidate_count": len(split_english_candidates(text)),
+        "decoder_loop": detect_decoder_loop(text),
+    }
+    sufficient = (
+        len(opening) >= 8
+        and len(text) >= 500
+        and int(diagnostics["japanese_characters"]) >= 120
+        and int(diagnostics["latin_characters"]) >= 250
+        and int(diagnostics["english_candidate_count"]) >= 5
+        and not bool(diagnostics["decoder_loop"])
+    )
+    diagnostics["decision"] = "SKIP_SUFFICIENT_BASELINE" if sufficient else "RUN_AUDIT"
+    return not sufficient, diagnostics
 
 
-def token_recall(baseline_text: str, candidate_text: str) -> float:
-    baseline_tokens = comparison_tokens(baseline_text)
-    available = Counter(comparison_tokens(candidate_text))
+def token_recall(baseline: str, candidate: str) -> float:
+    baseline_tokens = re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?|[ぁ-んァ-ヶ一-龯々]", baseline.lower())
+    available = Counter(
+        re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?|[ぁ-んァ-ヶ一-龯々]", candidate.lower())
+    )
     if not baseline_tokens:
         return 1.0
     matched = 0
@@ -1538,401 +1026,152 @@ def token_recall(baseline_text: str, candidate_text: str) -> float:
     return matched / len(baseline_tokens)
 
 
-def opening_core_end(
-    segments: list[SegmentRecord],
+def run_conditional_opening_audit(
+    model: object,
+    audio: object,
+    baseline_segments: list[SegmentRecord],
+    audio_seconds: float,
     requested_seconds: float,
-    audio_seconds: float,
-) -> float:
+    language: str | None,
+) -> tuple[list[SegmentRecord], dict[str, object]]:
     if requested_seconds <= 0:
-        return 0.0
-    limit = min(requested_seconds, audio_seconds)
-    candidates = [segment.end for segment in segments if segment.end <= limit]
-    if not candidates:
-        return limit
-    return max(candidates)
+        return baseline_segments, {"status": "DISABLED"}
+    core_end = min(requested_seconds, audio_seconds)
+    run_audit, diagnostics = opening_is_sparse(baseline_segments, core_end)
+    if not run_audit:
+        return baseline_segments, {"status": "SKIPPED", "diagnostics": diagnostics}
 
-
-def segments_before(
-    segments: Iterable[SegmentRecord],
-    end_time: float,
-) -> list[SegmentRecord]:
-    return [
-        segment
-        for segment in segments
-        if (segment.start + segment.end) / 2.0 <= end_time
-    ]
-
-
-def decide_opening_audit(
-    baseline_segments: list[SegmentRecord],
-    audit_segments: list[SegmentRecord],
-    anchors: list[str],
-    core_end: float,
-) -> OpeningAuditDecision:
-    baseline_text = format_transcript(baseline_segments).strip()
-    audit_text = format_transcript(audit_segments).strip() if audit_segments else ""
-    coverage_ratio = len(audit_text) / max(len(baseline_text), 1)
-    recall = token_recall(baseline_text, audit_text)
-    baseline_score = quality_score(baseline_text, baseline_segments)
-    audit_score = quality_score(audit_text, audit_segments)
-    baseline_anchor_hits = anchor_exact_hits(baseline_text, anchors)
-    audit_anchor_hits = anchor_exact_hits(audit_text, anchors)
-    baseline_section_hits = sum(strict_section_hits(baseline_text).values())
-    audit_section_hits = sum(strict_section_hits(audit_text).values())
-
-    accepted = False
-    reason = "baseline_retained"
-    if not audit_text:
-        reason = "audit_empty"
-    elif "�" in audit_text or detect_decoder_loop(audit_text):
-        reason = "audit_anomaly_rejected"
-    elif not 0.98 <= coverage_ratio <= 1.50:
-        reason = "audit_coverage_guard_rejected"
-    elif recall < 0.80:
-        reason = "audit_content_recall_rejected"
-    elif audit_anchor_hits < baseline_anchor_hits:
-        reason = "audit_anchor_guard_rejected"
-    elif audit_section_hits < baseline_section_hits:
-        reason = "audit_section_guard_rejected"
-    elif coverage_ratio >= 1.03 and audit_score >= baseline_score - 0.08:
-        accepted = True
-        reason = "opening_coverage_improved"
-    elif audit_score >= baseline_score + 0.12 and coverage_ratio >= 0.99:
-        accepted = True
-        reason = "opening_confidence_improved"
-
-    return OpeningAuditDecision(
-        accepted=accepted,
-        reason=reason,
-        core_end=core_end,
-        baseline_text=baseline_text,
-        audit_text=audit_text,
-        coverage_ratio=coverage_ratio,
-        token_recall=recall,
-        baseline_score=baseline_score,
-        audit_score=audit_score,
-        baseline_anchor_hits=baseline_anchor_hits,
-        audit_anchor_hits=audit_anchor_hits,
-        baseline_section_hits=baseline_section_hits,
-        audit_section_hits=audit_section_hits,
+    candidate = transcribe_slice(
+        model,
+        audio,
+        start=0.0,
+        end=min(audio_seconds, core_end + 2.5),
+        language=language,
+        source="turbo_opening_no_vad",
+        beam_size=5,
+        multilingual=True,
     )
-
-
-def apply_opening_audit(
-    segments: list[SegmentRecord],
-    audit_segments: list[SegmentRecord],
-    core_end: float,
-) -> list[SegmentRecord]:
-    retained = [
+    candidate = [
         segment
-        for segment in segments
-        if (segment.start + segment.end) / 2.0 > core_end
+        for segment in candidate
+        if (segment.start + segment.end) / 2.0 <= core_end
     ]
-    return deduplicate_segments([*audit_segments, *retained])
-
-
-def segments_between(
-    segments: Iterable[SegmentRecord],
-    start_time: float,
-    end_time: float,
-) -> list[SegmentRecord]:
-    return [
+    baseline_opening = [
         segment
-        for segment in segments
-        if start_time <= (segment.start + segment.end) / 2.0 <= end_time
+        for segment in baseline_segments
+        if (segment.start + segment.end) / 2.0 <= core_end
     ]
-
-
-def find_section_interval(
-    segments: list[SegmentRecord],
-    start_section: str,
-    end_section: str,
-) -> tuple[float, float] | None:
-    start_time: float | None = None
-    for segment in sorted(segments, key=lambda item: (item.start, item.end)):
-        hits = strict_section_hits(segment.text)
-        if start_time is None and hits.get(start_section, False):
-            start_time = segment.start
-            continue
-        if start_time is not None and hits.get(end_section, False):
-            if segment.start > start_time:
-                return start_time, segment.start
-    return None
-
-
-def decide_section_audit(
-    section_name: str,
-    baseline_segments: list[SegmentRecord],
-    audit_segments: list[SegmentRecord],
-    anchors: list[str],
-    core_start: float,
-    core_end: float,
-) -> SectionAuditDecision:
-    baseline_text = format_transcript(baseline_segments).strip()
-    audit_text = format_transcript(audit_segments).strip() if audit_segments else ''
-    coverage_ratio = len(audit_text) / max(len(baseline_text), 1)
-    recall = token_recall(baseline_text, audit_text)
-    baseline_score = quality_score(baseline_text, baseline_segments)
-    audit_score = quality_score(audit_text, audit_segments)
-    baseline_anchor_hits = anchor_exact_hits(baseline_text, anchors)
-    audit_anchor_hits = anchor_exact_hits(audit_text, anchors)
-    baseline_section_hits = sum(strict_section_hits(baseline_text).values())
-    audit_section_hits = sum(strict_section_hits(audit_text).values())
-    baseline_candidates = len(split_english_candidates(baseline_text))
-    audit_candidates = len(split_english_candidates(audit_text))
-
-    accepted = False
-    reason = 'baseline_retained'
-    if not audit_text:
-        reason = 'audit_empty'
-    elif '�' in audit_text or detect_decoder_loop(audit_text):
-        reason = 'audit_anomaly_rejected'
-    elif not 0.95 <= coverage_ratio <= 1.65:
-        reason = 'audit_coverage_guard_rejected'
-    elif recall < 0.72:
-        reason = 'audit_content_recall_rejected'
-    elif audit_anchor_hits < baseline_anchor_hits:
-        reason = 'audit_anchor_guard_rejected'
-    elif audit_section_hits < baseline_section_hits:
-        reason = 'audit_section_guard_rejected'
-    elif audit_candidates >= baseline_candidates + 2 and audit_score >= baseline_score - 0.10:
-        accepted = True
-        reason = 'section_examples_recovered'
-    elif coverage_ratio >= 1.06 and audit_score >= baseline_score - 0.05:
-        accepted = True
-        reason = 'section_coverage_improved'
-
-    return SectionAuditDecision(
-        accepted=accepted,
-        reason=reason,
-        section_name=section_name,
-        core_start=core_start,
-        core_end=core_end,
-        baseline_text=baseline_text,
-        audit_text=audit_text,
-        coverage_ratio=coverage_ratio,
-        token_recall=recall,
-        baseline_score=baseline_score,
-        audit_score=audit_score,
-        baseline_anchor_hits=baseline_anchor_hits,
-        audit_anchor_hits=audit_anchor_hits,
-        baseline_section_hits=baseline_section_hits,
-        audit_section_hits=audit_section_hits,
-        baseline_english_candidates=baseline_candidates,
-        audit_english_candidates=audit_candidates,
+    baseline_text = format_transcript(baseline_opening)
+    candidate_text = format_transcript(candidate) if candidate else ""
+    coverage_ratio = len(candidate_text) / max(len(baseline_text), 1)
+    recall = token_recall(baseline_text, candidate_text)
+    accepted = (
+        bool(candidate_text)
+        and 1.03 <= coverage_ratio <= 1.50
+        and recall >= 0.80
+        and not detect_decoder_loop(candidate_text)
     )
+    if accepted:
+        retained = [
+            segment
+            for segment in baseline_segments
+            if (segment.start + segment.end) / 2.0 > core_end
+        ]
+        merged = deduplicate_segments([*candidate, *retained])
+    else:
+        merged = baseline_segments
+    return merged, {
+        "status": "RUN",
+        "diagnostics": diagnostics,
+        "accepted": accepted,
+        "coverage_ratio": coverage_ratio,
+        "token_recall": recall,
+        "baseline_text": baseline_text,
+        "candidate_text": candidate_text,
+    }
 
 
-def apply_section_audit(
-    segments: list[SegmentRecord],
-    audit_segments: list[SegmentRecord],
-    core_start: float,
-    core_end: float,
-) -> list[SegmentRecord]:
-    retained = [
-        segment
-        for segment in segments
-        if not core_start <= (segment.start + segment.end) / 2.0 <= core_end
-    ]
-    return deduplicate_segments([*retained, *audit_segments])
-
-
-def detect_strong_events(segments: list[SegmentRecord]) -> list[SuspicionEvent]:
-    events: list[SuspicionEvent] = []
-    for index, segment in enumerate(segments):
-        duration = max(segment.end - segment.start, 0.1)
-        if segment.avg_logprob < -0.90:
-            events.append(
-                SuspicionEvent(
-                    segment.start,
-                    segment.end,
-                    2.5,
-                    "low_logprob",
-                    (index,),
-                )
-            )
-        if segment.compression_ratio > 2.50:
-            events.append(
-                SuspicionEvent(
-                    segment.start,
-                    segment.end,
-                    2.8,
-                    "high_compression",
-                    (index,),
-                )
-            )
-        if "�" in segment.text:
-            events.append(
-                SuspicionEvent(
-                    segment.start,
-                    segment.end,
-                    4.0,
-                    "replacement_character",
-                    (index,),
-                )
-            )
-        if detect_decoder_loop(segment.text):
-            events.append(
-                SuspicionEvent(
-                    segment.start,
-                    segment.end,
-                    5.0,
-                    "decoder_loop",
-                    (index,),
-                )
-            )
-        if duration >= 5.0 and len(segment.text) / duration < 0.9:
-            events.append(
-                SuspicionEvent(
-                    segment.start,
-                    segment.end,
-                    2.0,
-                    "very_low_text_rate",
-                    (index,),
-                )
-            )
-    return events
-
-
-def build_repair_windows(
-    events: list[SuspicionEvent],
-    segments: list[SegmentRecord],
-    audio_seconds: float,
-    max_windows: int,
-) -> list[RepairWindow]:
-    if max_windows == 0 or not events:
-        return []
-    grouped: list[list[SuspicionEvent]] = []
-    for event in sorted(events, key=lambda item: (item.start, item.end)):
-        if not grouped or event.start > max(item.end for item in grouped[-1]) + 1.0:
-            grouped.append([event])
-        else:
-            grouped[-1].append(event)
-
-    candidates: list[tuple[float, RepairWindow]] = []
-    for group in grouped:
-        indexes = sorted(
-            {index for event in group for index in event.segment_indexes}
-        )
-        core_start = min(segments[index].start for index in indexes)
-        core_end = max(segments[index].end for index in indexes)
-        reasons = tuple(sorted({event.reason for event in group}))
-        severity = sum(event.severity for event in group)
-        candidates.append(
-            (
-                severity,
-                RepairWindow(
-                    index=0,
-                    core_start=core_start,
-                    core_end=core_end,
-                    slice_start=max(0.0, core_start - REPAIR_PADDING_SECONDS),
-                    slice_end=min(audio_seconds, core_end + REPAIR_PADDING_SECONDS),
-                    reasons=reasons,
-                    segment_indexes=tuple(indexes),
-                ),
-            )
-        )
-
-    candidates.sort(key=lambda item: (-item[0], item[1].core_start))
-    selected = [item[1] for item in candidates[:max_windows]]
-    selected.sort(key=lambda item: item.core_start)
-    return [
-        RepairWindow(
-            index=index,
-            core_start=window.core_start,
-            core_end=window.core_end,
-            slice_start=window.slice_start,
-            slice_end=window.slice_end,
-            reasons=window.reasons,
-            segment_indexes=window.segment_indexes,
-        )
-        for index, window in enumerate(selected)
-    ]
-
-
-def segments_in_core(
-    segments: Iterable[SegmentRecord],
-    core_start: float,
-    core_end: float,
-) -> list[SegmentRecord]:
-    return [
-        segment
-        for segment in segments
-        if core_start <= (segment.start + segment.end) / 2.0 <= core_end
-    ]
-
-
-def decide_repair(
-    window: RepairWindow,
-    baseline_segments: list[SegmentRecord],
-    repair_segments: list[SegmentRecord],
-) -> RepairDecision:
-    baseline_text = format_transcript(baseline_segments).strip()
-    repair_text = format_transcript(repair_segments).strip() if repair_segments else ""
-    coverage_ratio = len(repair_text) / max(len(baseline_text), 1)
-    recall = token_recall(baseline_text, repair_text)
-    baseline_score = quality_score(baseline_text, baseline_segments)
-    repair_score = quality_score(repair_text, repair_segments)
-    baseline_suspicious = len(detect_strong_events(baseline_segments))
-    repair_suspicious = len(detect_strong_events(repair_segments))
-
-    accepted = False
-    reason = "baseline_retained"
-    if not repair_text:
-        reason = "repair_empty"
-    elif not 0.92 <= coverage_ratio <= 1.50:
-        reason = "repair_coverage_guard_rejected"
-    elif recall < 0.75:
-        reason = "repair_content_recall_rejected"
-    elif repair_suspicious < baseline_suspicious and repair_score >= baseline_score - 0.05:
-        accepted = True
-        reason = "strong_anomaly_reduced"
-    elif repair_score >= baseline_score + 0.15 and repair_suspicious <= baseline_suspicious:
-        accepted = True
-        reason = "repair_quality_improved"
-
-    return RepairDecision(
-        window_index=window.index,
-        accepted=accepted,
-        reason=reason,
-        baseline_text=baseline_text,
-        repair_text=repair_text,
-        coverage_ratio=coverage_ratio,
-        token_recall=recall,
-        baseline_score=baseline_score,
-        repair_score=repair_score,
-        baseline_suspicious_events=baseline_suspicious,
-        repair_suspicious_events=repair_suspicious,
-        core_start=window.core_start,
-        core_end=window.core_end,
-        slice_start=window.slice_start,
-        slice_end=window.slice_end,
-        reasons=window.reasons,
-    )
-
-
-def apply_repair(
-    segments: list[SegmentRecord],
-    replacement: list[SegmentRecord],
-    window: RepairWindow,
-) -> list[SegmentRecord]:
-    retained = [
-        segment
-        for segment in segments
-        if not window.core_start
-        <= (segment.start + segment.end) / 2.0
-        <= window.core_end
-    ]
-    return deduplicate_segments([*retained, *replacement])
-
-
-def transcript_indicators(
+def correct_repeated_english_variants(
     text: str,
-    segments: list[SegmentRecord],
-    anchors: list[str],
-) -> dict[str, object]:
+) -> tuple[str, list[dict[str, object]]]:
+    candidates = split_english_candidates(text)
+    clusters: list[list[str]] = []
+    for candidate in candidates:
+        normalized = normalize_for_comparison(candidate)
+        best_index: int | None = None
+        best_ratio = 0.0
+        for index, cluster in enumerate(clusters):
+            ratio = SequenceMatcher(
+                None, normalized, normalize_for_comparison(cluster[0])
+            ).ratio()
+            if ratio > best_ratio:
+                best_index = index
+                best_ratio = ratio
+        if best_index is not None and best_ratio >= 0.82:
+            clusters[best_index].append(candidate)
+        else:
+            clusters.append([candidate])
+
+    corrected = text
+    corrections: list[dict[str, object]] = []
+    for cluster in clusters:
+        counts = Counter(clean_text(candidate) for candidate in cluster)
+        if sum(counts.values()) < 4 or len(counts) < 2:
+            continue
+        canonical, canonical_count = max(
+            counts.items(), key=lambda item: (item[1], len(item[0]))
+        )
+        canonical_words = english_words(canonical)
+        if canonical_count < 2 or len(canonical_words) < 5:
+            continue
+        for variant, variant_count in counts.items():
+            if variant == canonical:
+                continue
+            variant_words = english_words(variant)
+            if not variant_words:
+                continue
+            if canonical_words[0].lower() != variant_words[0].lower():
+                continue
+            if canonical_words[-1].lower() != variant_words[-1].lower():
+                continue
+            if abs(len(canonical_words) - len(variant_words)) > 3:
+                continue
+            similarity = SequenceMatcher(
+                None,
+                normalize_for_comparison(canonical),
+                normalize_for_comparison(variant),
+            ).ratio()
+            if similarity < 0.82 or canonical_count <= variant_count:
+                continue
+            occurrences = corrected.count(variant)
+            if occurrences == 0:
+                continue
+            corrected = corrected.replace(variant, canonical)
+            corrections.append(
+                {
+                    "from": variant,
+                    "to": canonical,
+                    "occurrences": occurrences,
+                    "canonical_count": canonical_count,
+                    "variant_count": variant_count,
+                    "similarity": round(similarity, 6),
+                }
+            )
+    return corrected, corrections
+
+
+def apply_corrections_to_segments(
+    segments: list[SegmentRecord], corrections: list[dict[str, object]]
+) -> None:
+    for segment in segments:
+        for correction in corrections:
+            segment.text = segment.text.replace(
+                str(correction["from"]), str(correction["to"])
+            )
+
+
+def transcript_indicators(text: str, segments: list[SegmentRecord]) -> dict[str, object]:
     sections = strict_section_hits(text)
-    events = detect_strong_events(segments)
     return {
         "text_characters": len(text),
         "segment_count": len(segments),
@@ -1942,54 +1181,67 @@ def transcript_indicators(
         "decoder_loop": detect_decoder_loop(text),
         "strict_section_hits": sections,
         "strict_section_count": sum(sections.values()),
-        "anchor_exact_hits": anchor_exact_hits(text, anchors),
-        "strong_suspicious_event_count": len(events),
-        "strong_suspicious_reason_counts": dict(
-            Counter(event.reason for event in events)
+        "language_segment_counts": dict(
+            Counter(language_label(segment.text) for segment in segments)
         ),
     }
 
 
-def automatic_review_status(
-    indicators: dict[str, object],
+def lesson76_regression(
+    input_file: Path,
     audio_seconds: float,
-) -> str:
-    if bool(indicators["decoder_loop"]):
-        return "RERUN_RECOMMENDED"
-    if int(indicators["replacement_characters"]) > 0:
-        return "RERUN_RECOMMENDED"
-    if int(indicators["strong_suspicious_event_count"]) > 1:
-        return "REVIEW_REQUIRED"
-    if int(indicators["text_characters"]) < int(audio_seconds * 4.2):
-        return "REVIEW_REQUIRED"
-    return "READY_FOR_AI_CORRECTION"
-
-
-def secondary_processing_effect(
-    opening_decision: OpeningAuditDecision | None,
-    repair_decisions: list[RepairDecision],
-    baseline_indicators: dict[str, object],
-    final_indicators: dict[str, object],
-) -> str:
-    opening_accepted = bool(opening_decision and opening_decision.accepted)
-    repair_accepted = any(item.accepted for item in repair_decisions)
-    if not opening_accepted and not repair_accepted:
-        return "NO_MEASURABLE_GAIN"
-    anomaly_change = (
-        int(final_indicators["strong_suspicious_event_count"])
-        - int(baseline_indicators["strong_suspicious_event_count"])
-    )
-    character_change = (
-        int(final_indicators["text_characters"])
-        - int(baseline_indicators["text_characters"])
-    )
-    anchor_change = (
-        int(final_indicators["anchor_exact_hits"])
-        - int(baseline_indicators["anchor_exact_hits"])
-    )
-    if anomaly_change < 0 or character_change >= 40 or anchor_change > 0:
-        return "MEASURABLE_GAIN"
-    return "CHANGE_ACCEPTED_WITHOUT_MEASURABLE_GLOBAL_GAIN"
+    segments: list[SegmentRecord],
+) -> dict[str, object]:
+    if input_file.name.lower() != "b.m4a" or not 850.0 <= audio_seconds <= 870.0:
+        return {"status": "NOT_APPLICABLE", "profile": None, "items": []}
+    checks = [
+        ("Dad's birthday is coming up next week", 20.0, 100.0, 1, "opening_dialogue"),
+        ("We're not exactly great in the kitchen", 20.0, 120.0, 1, "opening_dialogue"),
+        ("We're not exactly great in the kitchen", 180.0, 330.0, 2, "grammar_quote_and_replay"),
+        ("Suppose we asked Emily for advice", 385.0, 435.0, 1, "essential_first_example"),
+        ("Suppose we asked Emily for advice", 465.0, 535.0, 1, "essential_practice"),
+        ("Imagine we asked Emily for advice", 385.0, 435.0, 1, "essential_first_example"),
+        ("Imagine we asked Emily for advice", 465.0, 535.0, 1, "essential_practice"),
+        ("It might be a good idea for us to discuss this together", 410.0, 470.0, 1, "essential_first_example"),
+        ("It might be a good idea for us to discuss this together", 480.0, 540.0, 1, "essential_practice"),
+        ("Just an idea, but we could try leaving a little earlier tomorrow", 440.0, 490.0, 1, "essential_first_example"),
+        ("Just an idea, but we could try leaving a little earlier tomorrow", 490.0, 545.0, 1, "essential_practice"),
+        ("It might be a good idea for us to take a break for a while", 620.0, 660.0, 1, "practical_model_answer"),
+        ("We've been at this for a long time", 620.0, 660.0, 1, "practical_model_answer"),
+        ("We're all a bit tired", 620.0, 660.0, 1, "practical_model_answer"),
+        ("It might be a good idea for us to take a break for a while", 680.0, 735.0, 1, "practical_practice"),
+        ("We've been at this for a long time", 680.0, 735.0, 1, "practical_practice"),
+        ("We're all a bit tired", 680.0, 735.0, 1, "practical_practice"),
+        ("What if we baked him a cake ourselves", 735.0, 830.0, 4, "pronunciation_repetition"),
+    ]
+    items: list[dict[str, object]] = []
+    for phrase, start, end, minimum, role in checks:
+        expected = normalize_for_comparison(phrase)
+        region_text = " ".join(
+            segment.text
+            for segment in segments
+            if segment.end >= start and segment.start <= end
+        )
+        occurrences = normalize_for_comparison(region_text).count(expected)
+        items.append(
+            {
+                "phrase": phrase,
+                "start": start,
+                "end": end,
+                "role": role,
+                "minimum_occurrences": minimum,
+                "observed_occurrences": occurrences,
+                "passed": occurrences >= minimum,
+            }
+        )
+    return {
+        "status": "PASS" if all(bool(item["passed"]) for item in items) else "FAIL",
+        "profile": "lesson76_time_local_repetition_regression_v21",
+        "scope": "KNOWN_PHRASE_TIME_AND_OCCURRENCE_REGRESSION_NOT_ACCURACY_PERCENTAGE",
+        "passed_count": sum(bool(item["passed"]) for item in items),
+        "total_count": len(items),
+        "items": items,
+    }
 
 
 def levenshtein_distance(left: list[str], right: list[str]) -> int:
@@ -2010,51 +1262,35 @@ def levenshtein_distance(left: list[str], right: list[str]) -> int:
     return previous[-1]
 
 
-def calculate_reference_metrics(
-    reference_text: str,
-    baseline_text: str,
-    final_text: str,
-) -> dict[str, object]:
-    def character_error_rate(hypothesis: str) -> float:
-        reference_units = list(re.sub(r"\s+", "", reference_text))
-        hypothesis_units = list(re.sub(r"\s+", "", hypothesis))
-        return levenshtein_distance(reference_units, hypothesis_units) / max(
-            len(reference_units), 1
+def reference_metrics(reference: str, baseline: str, final: str) -> dict[str, object]:
+    reference_characters = list(re.sub(r"\s+", "", reference))
+    reference_english = [word.lower() for word in english_words(reference)]
+
+    def cer(text: str) -> float:
+        units = list(re.sub(r"\s+", "", text))
+        return levenshtein_distance(reference_characters, units) / max(
+            len(reference_characters), 1
         )
 
-    reference_english = [word.lower() for word in english_words(reference_text)]
-
-    def english_word_error_rate(hypothesis: str) -> float | None:
+    def wer(text: str) -> float | None:
         if not reference_english:
             return None
-        hypothesis_english = [word.lower() for word in english_words(hypothesis)]
-        return levenshtein_distance(reference_english, hypothesis_english) / len(
-            reference_english
-        )
+        units = [word.lower() for word in english_words(text)]
+        return levenshtein_distance(reference_english, units) / len(reference_english)
 
-    baseline_cer = character_error_rate(baseline_text)
-    final_cer = character_error_rate(final_text)
-    baseline_wer = english_word_error_rate(baseline_text)
-    final_wer = english_word_error_rate(final_text)
+    baseline_wer = wer(baseline)
+    final_wer = wer(final)
     return {
         "status": "MEASURED",
-        "baseline_cer": baseline_cer,
-        "final_cer": final_cer,
-        "cer_change": final_cer - baseline_cer,
+        "baseline_cer": cer(baseline),
+        "final_cer": cer(final),
         "baseline_english_wer": baseline_wer,
         "final_english_wer": final_wer,
-        "english_wer_change": (
-            None
-            if baseline_wer is None or final_wer is None
-            else final_wer - baseline_wer
-        ),
     }
 
 
 def write_text_atomically(path: Path, text: str) -> None:
     temporary = path.with_name(path.name + ".part")
-    if temporary.exists():
-        temporary.unlink()
     temporary.write_text(text, encoding="utf-8")
     temporary.replace(path)
 
@@ -2066,81 +1302,9 @@ def write_json_atomically(path: Path, data: dict[str, object]) -> None:
     )
 
 
-def opening_decision_to_dict(
-    decision: OpeningAuditDecision | None,
-) -> dict[str, object]:
-    if decision is None:
-        return {"status": "NOT_RUN"}
-    return {
-        "status": "RUN",
-        "accepted": decision.accepted,
-        "decision_reason": decision.reason,
-        "core_end": round(decision.core_end, 3),
-        "coverage_ratio": round(decision.coverage_ratio, 6),
-        "token_recall": round(decision.token_recall, 6),
-        "baseline_score": round(decision.baseline_score, 6),
-        "audit_score": round(decision.audit_score, 6),
-        "baseline_anchor_hits": decision.baseline_anchor_hits,
-        "audit_anchor_hits": decision.audit_anchor_hits,
-        "baseline_section_hits": decision.baseline_section_hits,
-        "audit_section_hits": decision.audit_section_hits,
-        "baseline_text": decision.baseline_text,
-        "audit_text": decision.audit_text,
-    }
-
-
-def section_decision_to_dict(
-    decision: SectionAuditDecision | None,
-) -> dict[str, object]:
-    if decision is None:
-        return {'status': 'NOT_RUN'}
-    return {
-        'status': 'RUN',
-        'accepted': decision.accepted,
-        'decision_reason': decision.reason,
-        'section_name': decision.section_name,
-        'core_start': round(decision.core_start, 3),
-        'core_end': round(decision.core_end, 3),
-        'coverage_ratio': round(decision.coverage_ratio, 6),
-        'token_recall': round(decision.token_recall, 6),
-        'baseline_score': round(decision.baseline_score, 6),
-        'audit_score': round(decision.audit_score, 6),
-        'baseline_anchor_hits': decision.baseline_anchor_hits,
-        'audit_anchor_hits': decision.audit_anchor_hits,
-        'baseline_section_hits': decision.baseline_section_hits,
-        'audit_section_hits': decision.audit_section_hits,
-        'baseline_english_candidates': decision.baseline_english_candidates,
-        'audit_english_candidates': decision.audit_english_candidates,
-        'baseline_text': decision.baseline_text,
-        'audit_text': decision.audit_text,
-    }
-
-
-def repair_decision_to_dict(decision: RepairDecision) -> dict[str, object]:
-    return {
-        "window_index": decision.window_index,
-        "accepted": decision.accepted,
-        "decision_reason": decision.reason,
-        "coverage_ratio": round(decision.coverage_ratio, 6),
-        "token_recall": round(decision.token_recall, 6),
-        "baseline_score": round(decision.baseline_score, 6),
-        "repair_score": round(decision.repair_score, 6),
-        "baseline_suspicious_events": decision.baseline_suspicious_events,
-        "repair_suspicious_events": decision.repair_suspicious_events,
-        "core_start": round(decision.core_start, 3),
-        "core_end": round(decision.core_end, 3),
-        "slice_start": round(decision.slice_start, 3),
-        "slice_end": round(decision.slice_end, 3),
-        "reasons": list(decision.reasons),
-        "baseline_text": decision.baseline_text,
-        "repair_text": decision.repair_text,
-    }
-
-
-def run_child() -> int:
+def run_transcription() -> int:
     timer = StepTimer()
     overall_result = "FAILED"
-
     arguments = parse_arguments()
     script_directory = Path(__file__).resolve().parent
     run_id = os.environ.get("TRANSCRIBE_RUN_ID") or datetime.now(JST).strftime(
@@ -2148,32 +1312,36 @@ def run_child() -> int:
     )
     input_file = resolve_path(script_directory, arguments.input)
     output_directory = resolve_path(script_directory, arguments.output_dir)
-    output_paths = make_output_paths(output_directory, run_id)
+    outputs = make_output_paths(output_directory, run_id)
     reference_file = (
         resolve_path(script_directory, arguments.reference)
         if arguments.reference
         else None
     )
 
-    with TeeContext(output_paths.log):
+    with TeeContext(outputs.log):
         try:
             print("RUN_START")
             print(f"RUN_ID={run_id}")
-            print(
-                "BOOTSTRAP_PYTHON_FROM="
-                + os.environ.get("TRANSCRIBE_BOOTSTRAP_FROM", str(sys.executable))
-            )
-            print(
-                "BOOTSTRAP_PYTHON_TO="
-                + os.environ.get("TRANSCRIBE_BOOTSTRAP_TO", str(sys.executable))
-            )
-            print("OUTPUT_DIRECTORY_POLICY=TRANSCRIPT_LOG_METRICS_SAME_DIRECTORY")
-            print(f"TRANSCRIPT_FILE={output_paths.transcript}")
-            print(f"LOG_FILE={output_paths.log}")
-            print(f"METRICS_FILE={output_paths.metrics}")
+            print("TRANSCRIPTION_TRANSACTION=1")
+            print(f"TRANSCRIPTION_VERSION={TRANSCRIPTION_VERSION}")
+            print("TRANSCRIPTION_MODE=FAST_PRIMARY_PLUS_TIME_LOCAL_SECTION_CONSENSUS")
+            print("PRIMARY_PASS=FAST_BATCHED_VAD_FULL_AUDIO")
+            print("SECTION_RECOVERY=GRAMMAR_ESSENTIAL_PRACTICAL_ONLY")
+            print("SECTION_RECOVERY_WINDOW=30_SECONDS_HOP_10_SECONDS")
+            print("SECTION_RECOVERY_CONSENSUS=TIME_LOCAL_OVERLAPPING_WINDOWS")
+            print("FULL_AUDIO_SECOND_PASS=DISABLED")
+            print("LARGE_V3_AUTOMATIC_PASS=DISABLED")
+            print("CANDIDATES_IN_TRANSCRIPT=NO")
+            print("CANDIDATES_IN_METRICS=YES")
+            print("CONTENT_REMOVAL_APPLIED=NO")
+            print("EDUCATIONAL_FORMATTING_APPLIED=NO")
+            print(f"TRANSCRIPT_FILE={outputs.transcript}")
+            print(f"LOG_FILE={outputs.log}")
+            print(f"METRICS_FILE={outputs.metrics}")
 
             timer.start("check_and_update_software")
-            software_metrics = check_and_update_runtime_packages(script_directory)
+            software = check_and_update_software(script_directory)
             timer.finish()
 
             timer.start("import_transcription_libraries")
@@ -2181,67 +1349,23 @@ def run_child() -> int:
             import faster_whisper
             from faster_whisper import BatchedInferencePipeline, WhisperModel
             from faster_whisper.audio import decode_audio
+            from huggingface_hub import HfApi, snapshot_download
+
+            print(f"FASTER_WHISPER={faster_whisper.__version__}")
+            print(f"CTRANSLATE2={ctranslate2.__version__}")
             timer.finish()
 
-            timer.start("check_model_revisions")
-            print("MODEL_VERSION_CHECK_START")
-            primary_model_information = check_model(
-                script_directory,
-                repository=PRIMARY_MODEL_REPOSITORY,
-                directory_name=PRIMARY_MODEL_DIRECTORY_NAME,
-                label="PRIMARY",
-                download_now=True,
+            timer.start("check_primary_model_revision")
+            model_information = check_model(
+                script_directory, snapshot_download, HfApi
             )
-            repair_model_information = check_model(
-                script_directory,
-                repository=REPAIR_MODEL_REPOSITORY,
-                directory_name=REPAIR_MODEL_DIRECTORY_NAME,
-                label="REPAIR",
-                download_now=False,
-            )
-            print("REPAIR_MODEL_DOWNLOAD_POLICY=DOWNLOAD_ONLY_IF_STRONG_ANOMALY_EXISTS")
-            print("MODEL_VERSION_CHECK_RESULT=PASS")
             timer.finish()
 
             timer.start("validate_environment")
-            validate_environment(
-                input_file,
-                arguments.batch_size,
-                arguments.opening_audit_seconds,
-                arguments.max_repair_windows,
-                ctranslate2,
-            )
+            validate_environment(input_file, arguments.batch_size, ctranslate2)
             if reference_file is not None and not reference_file.is_file():
-                raise FileNotFoundError(f"Reference file was not found: {reference_file}")
+                raise FileNotFoundError(f"Reference file not found: {reference_file}")
             timer.finish()
-
-            print("TRANSCRIPTION_CONFIGURATION")
-            print("TRANSCRIPTION_MODE=BATCHED_TURBO_GUARDED_OPENING_AND_SECTION_AUDIT")
-            print("PRIMARY_POLICY=FAST_BATCHED_VAD_FULL_PROGRAM_PASS")
-            print("OPENING_AUDIT_POLICY=NO_VAD_ADD_COVERAGE_ONLY_WITH_CONTENT_GUARDS")
-            print("SECTION_AUDIT_POLICY=DENSE_OVERLAPPED_FORCED_ENGLISH_CROSS_WINDOW_CONSENSUS")
-            print("SECTION_MERGE_POLICY=TIMESTAMPED_ADD_ONLY_NEVER_REPLACE_BASELINE")
-            print("REPEATED_ENGLISH_POLICY=WITHIN_RECORDING_MAJORITY_CONSENSUS_ONLY")
-            print("COMPLEMENTARY_LANGUAGE_RECOVERY=DISABLED_NO_MEASURABLE_GAIN")
-            print("LARGE_V3_POLICY=RARE_STRONG_ANOMALIES_ONLY")
-            print("EDUCATIONAL_FORMATTING_APPLIED=NO")
-            print("CONTENT_REMOVAL_APPLIED=NO")
-            print("PARAPHRASING_APPLIED=NO")
-            print("TRANSLATION_APPLIED=NO")
-            print(f"PYTHON={sys.executable}")
-            print(f"FASTER_WHISPER={faster_whisper.__version__}")
-            print(f"CTRANSLATE2={ctranslate2.__version__}")
-            print(f"CUDA_DEVICES={ctranslate2.get_cuda_device_count()}")
-            print(f"COMPUTE_TYPE={COMPUTE_TYPE}")
-            print(f"LANGUAGE={arguments.language}")
-            print(f"BATCH_SIZE_REQUESTED={arguments.batch_size}")
-            print(f"OPENING_AUDIT_SECONDS={arguments.opening_audit_seconds:.1f}")
-            print(f"MAX_REPAIR_WINDOWS={arguments.max_repair_windows}")
-            print("PRIMARY_MODEL=large-v3-turbo")
-            print("OPENING_AUDIT_MODEL=large-v3-turbo")
-            print("REPAIR_MODEL=large-v3")
-            print(f"INPUT={input_file}")
-            print(f"REFERENCE={reference_file or 'NONE'}")
 
             timer.start("decode_audio")
             audio = decode_audio(str(input_file), sampling_rate=SAMPLE_RATE)
@@ -2250,1018 +1374,18 @@ def run_child() -> int:
             timer.finish()
             print(f"AUDIO_SECONDS={audio_seconds:.3f}")
             print(f"AUDIO_SIGNAL_QUALITY={audio_signal['quality_status']}")
-            print(f"AUDIO_SIGNAL_RMS_DBFS={audio_signal['rms_dbfs']}")
-            print(f"AUDIO_SIGNAL_PEAK_DBFS={audio_signal['peak_dbfs']}")
-            print(
-                "AUDIO_SIGNAL_FLAGS="
-                + json.dumps(audio_signal["quality_flags"], ensure_ascii=False)
-            )
 
             timer.start("load_primary_model")
-            primary_model = load_model(
-                WhisperModel,
-                Path(str(primary_model_information["directory"])),
-                "turbo",
+            model = load_model(
+                WhisperModel, Path(str(model_information["directory"]))
             )
             timer.finish()
 
             requested_language = None if arguments.language == "auto" else arguments.language
 
             timer.start("primary_batched_transcription")
-            baseline_segments, batch_size_used, detected_language = (
-                transcribe_batched_baseline(
-                    primary_model,
-                    BatchedInferencePipeline,
-                    audio,
-                    requested_language,
-                    arguments.batch_size,
-                )
-            )
-            baseline_text = format_transcript(baseline_segments)
-            timer.finish()
-
-            timer.start("discover_repeated_content")
-            anchors = discover_repeated_anchors(baseline_segments)
-            baseline_indicators = transcript_indicators(
-                baseline_text,
-                baseline_segments,
-                anchors,
-            )
-            timer.finish()
-
-            print(f"PRIMARY_BATCH_SIZE_USED={batch_size_used}")
-            print(f"DETECTED_LANGUAGE={detected_language}")
-            print(f"BASELINE_SEGMENT_COUNT={len(baseline_segments)}")
-            print(f"BASELINE_TEXT_CHARACTERS={len(baseline_text)}")
-            print(f"REPEATED_PHRASE_ANCHORS={json.dumps(anchors, ensure_ascii=False)}")
-
-            timer.start("opening_no_vad_audit")
-            opening_decision: OpeningAuditDecision | None = None
-            post_opening_segments = list(baseline_segments)
-            core_end = opening_core_end(
-                baseline_segments,
-                arguments.opening_audit_seconds,
-                audio_seconds,
-            )
-            if core_end > 0:
-                audit_slice_end = min(
-                    audio_seconds,
-                    core_end + OPENING_AUDIT_PADDING_SECONDS,
-                )
-                opening_audit_segments = transcribe_slice(
-                    primary_model,
-                    audio,
-                    start=0.0,
-                    end=audit_slice_end,
-                    language=requested_language,
-                    source="turbo_opening_no_vad",
-                    beam_size=5,
-                )
-                opening_audit_segments = segments_before(
-                    opening_audit_segments,
-                    core_end,
-                )
-                baseline_opening_segments = segments_before(
-                    baseline_segments,
-                    core_end,
-                )
-                opening_decision = decide_opening_audit(
-                    baseline_opening_segments,
-                    opening_audit_segments,
-                    anchors,
-                    core_end,
-                )
-                print(
-                    "OPENING_AUDIT_DECISION "
-                    f"ACCEPTED={'YES' if opening_decision.accepted else 'NO'} "
-                    f"CORE_END={opening_decision.core_end:.3f} "
-                    f"COVERAGE_RATIO={opening_decision.coverage_ratio:.3f} "
-                    f"TOKEN_RECALL={opening_decision.token_recall:.3f} "
-                    f"BASELINE_SCORE={opening_decision.baseline_score:.3f} "
-                    f"AUDIT_SCORE={opening_decision.audit_score:.3f} "
-                    f"REASON={opening_decision.reason}"
-                )
-                if opening_decision.accepted:
-                    post_opening_segments = apply_opening_audit(
-                        baseline_segments,
-                        opening_audit_segments,
-                        core_end,
-                    )
-            else:
-                print("OPENING_AUDIT_DECISION=NOT_RUN")
-            timer.finish()
-
-            timer.start("essential_section_dense_english_audit")
-            section_decision: SectionAuditDecision | None = None
-            section_recovered_examples: list[dict[str, object]] = []
-            section_recovery_evidence: list[dict[str, object]] = []
-            section_dense_seconds = 0.0
-            section_dense_windows = 0
-            post_section_segments = list(post_opening_segments)
-            section_interval = find_section_interval(
-                post_opening_segments,
-                "Essential Expressions",
-                "Practical Usage",
-            )
-            if section_interval is not None:
-                section_start, section_end = section_interval
-                baseline_section_segments = segments_between(
-                    post_opening_segments,
-                    section_start,
-                    section_end,
-                )
-                baseline_section_text = (
-                    format_transcript(baseline_section_segments)
-                    if baseline_section_segments
-                    else ""
-                )
-                if len(split_english_candidates(baseline_section_text)) < 8:
-                    dense_started = time.perf_counter()
-                    dense_segments, section_dense_windows = (
-                        transcribe_chunked_english_section(
-                            primary_model,
-                            audio,
-                            start=max(0.0, section_start - SECTION_AUDIT_PADDING_SECONDS),
-                            end=min(audio_seconds, section_end + SECTION_AUDIT_PADDING_SECONDS),
-                        )
-                    )
-                    section_dense_seconds = time.perf_counter() - dense_started
-                    dense_deduplicated = deduplicate_segments(dense_segments)
-                    section_decision = decide_section_audit(
-                        "Essential Expressions",
-                        baseline_section_segments,
-                        dense_deduplicated,
-                        anchors,
-                        section_start,
-                        section_end,
-                    )
-                    (
-                        section_recovered_examples,
-                        section_recovery_evidence,
-                    ) = recover_cross_window_section_examples(
-                        baseline_section_text,
-                        dense_segments,
-                    )
-                    section_decision.accepted = bool(section_recovered_examples)
-                    section_decision.reason = (
-                        "timestamped_cross_window_examples_recovered"
-                        if section_recovered_examples
-                        else "no_safe_cross_window_examples"
-                    )
-                    recovered_segments = recovered_examples_to_segments(
-                        section_recovered_examples
-                    )
-                    if recovered_segments:
-                        post_section_segments = deduplicate_segments(
-                            [*post_opening_segments, *recovered_segments]
-                        )
-                    print(
-                        "SECTION_AUDIT_DECISION "
-                        f"ACCEPTED={'YES' if section_decision.accepted else 'NO'} "
-                        f"SECTION={section_decision.section_name} "
-                        f"CORE_START={section_decision.core_start:.3f} "
-                        f"CORE_END={section_decision.core_end:.3f} "
-                        f"BASELINE_EXAMPLES={section_decision.baseline_english_candidates} "
-                        f"RECOVERED_EXAMPLES={len(section_recovered_examples)} "
-                        f"DENSE_WINDOWS={section_dense_windows} "
-                        f"DENSE_SECONDS={section_dense_seconds:.3f} "
-                        f"REASON={section_decision.reason}"
-                    )
-                    for example_index, item in enumerate(
-                        section_recovered_examples,
-                        start=1,
-                    ):
-                        event_starts = [
-                            round(float(event["start"]), 3)
-                            for event in item.get("events", [])
-                        ]
-                        print(
-                            f"SECTION_RECOVERED_EXAMPLE_{example_index:02d}="
-                            f"{item['text']} | OCCURRENCES={item['occurrences']} "
-                            f"| STARTS={event_starts} | EVIDENCE={item['evidence']}"
-                        )
-                else:
-                    print("SECTION_AUDIT_DECISION=SKIPPED_SUFFICIENT_ENGLISH_COVERAGE")
-            else:
-                print("SECTION_AUDIT_DECISION=NOT_APPLICABLE")
-            timer.finish()
-
-            del primary_model
-            gc.collect()
-
-            timer.start("detect_strong_repair_windows")
-            strong_events = detect_strong_events(post_section_segments)
-            repair_windows = build_repair_windows(
-                strong_events,
-                post_section_segments,
-                audio_seconds,
-                arguments.max_repair_windows,
-            )
-            timer.finish()
-
-            print(f"STRONG_SUSPICIOUS_EVENT_COUNT={len(strong_events)}")
-            print(
-                "STRONG_SUSPICIOUS_EVENT_REASONS="
-                + json.dumps(
-                    Counter(event.reason for event in strong_events),
-                    ensure_ascii=False,
-                    sort_keys=True,
-                )
-            )
-            print(f"STRONG_REPAIR_WINDOW_COUNT={len(repair_windows)}")
-
-            timer.start("selective_large_v3_repairs")
-            final_segments = list(post_section_segments)
-            repair_decisions: list[RepairDecision] = []
-            repair_model_updated = False
-            if repair_windows:
-                repair_model_information = ensure_repair_model(
-                    script_directory,
-                    repair_model_information,
-                )
-                repair_model_updated = bool(repair_model_information["updated"])
-                repair_model = load_model(
-                    WhisperModel,
-                    Path(str(repair_model_information["directory"])),
-                    "large_v3",
-                )
-                for window in repair_windows:
-                    print(
-                        f"SELECTIVE_REPAIR_START INDEX={window.index:02d} "
-                        f"SLICE_START={window.slice_start:.3f} "
-                        f"SLICE_END={window.slice_end:.3f}"
-                    )
-                    baseline_core = segments_in_core(
-                        final_segments,
-                        window.core_start,
-                        window.core_end,
-                    )
-                    repair_slice = transcribe_slice(
-                        repair_model,
-                        audio,
-                        start=window.slice_start,
-                        end=window.slice_end,
-                        language=requested_language,
-                        source="large_v3",
-                        beam_size=5,
-                    )
-                    repair_core = segments_in_core(
-                        repair_slice,
-                        window.core_start,
-                        window.core_end,
-                    )
-                    decision = decide_repair(
-                        window,
-                        baseline_core,
-                        repair_core,
-                    )
-                    repair_decisions.append(decision)
-                    print(
-                        f"SELECTIVE_REPAIR_DECISION INDEX={window.index:02d} "
-                        f"ACCEPTED={'YES' if decision.accepted else 'NO'} "
-                        f"COVERAGE_RATIO={decision.coverage_ratio:.3f} "
-                        f"TOKEN_RECALL={decision.token_recall:.3f} "
-                        f"BASELINE_SCORE={decision.baseline_score:.3f} "
-                        f"REPAIR_SCORE={decision.repair_score:.3f} "
-                        f"REASON={decision.reason}"
-                    )
-                    if decision.accepted:
-                        final_segments = apply_repair(
-                            final_segments,
-                            repair_core,
-                            window,
-                        )
-                del repair_model
-                gc.collect()
-            timer.finish()
-
-            timer.start("assemble_final_transcript")
-            final_segments = deduplicate_segments(final_segments)
-            final_text = format_transcript(final_segments)
-            final_text, consensus_corrections, unresolved_variant_clusters = (
-                correct_repeated_english_variants(final_text)
-            )
-            print(f"CONSENSUS_CORRECTIONS_APPLIED={len(consensus_corrections)}")
-            print(
-                f"SECTION_RECOVERED_EXAMPLES_INSERTED="
-                f"{len(section_recovered_examples)}"
-            )
-            print(f"REPEATED_VARIANT_CLUSTERS_UNRESOLVED={unresolved_variant_clusters}")
-            final_indicators = transcript_indicators(
-                final_text,
-                final_segments,
-                anchors,
-            )
-            review_status = automatic_review_status(
-                final_indicators,
-                audio_seconds,
-            )
-            effect = secondary_processing_effect(
-                opening_decision,
-                repair_decisions,
-                baseline_indicators,
-                final_indicators,
-            )
-            if consensus_corrections and section_recovered_examples:
-                effect = "MEASURABLE_TIMESTAMPED_EXAMPLE_RECOVERY_AND_CONSENSUS_CORRECTION"
-            elif consensus_corrections:
-                effect = "MEASURABLE_CONSENSUS_CORRECTION"
-            elif section_recovered_examples:
-                effect = "MEASURABLE_TIMESTAMPED_EXAMPLE_RECOVERY"
-            elif effect == "MEASURABLE_GAIN":
-                effect = "COVERAGE_CHANGE_NOT_ACCURACY_MEASUREMENT"
-            timer.finish()
-
-            timer.start("calculate_reference_metrics")
-            if reference_file is None:
-                reference_metrics: dict[str, object] = {"status": "NOT_MEASURED"}
-            else:
-                reference_text = reference_file.read_text(encoding="utf-8")
-                reference_metrics = calculate_reference_metrics(
-                    reference_text,
-                    baseline_text,
-                    final_text,
-                )
-            timer.finish()
-
-            timer.start("write_transcript")
-            write_text_atomically(output_paths.transcript, final_text)
-            timer.finish()
-
-            primary_seconds = timer.seconds_for("primary_batched_transcription")
-            opening_seconds = timer.seconds_for("opening_no_vad_audit")
-            section_seconds = timer.seconds_for("essential_section_dense_english_audit")
-            repair_seconds = timer.seconds_for("selective_large_v3_repairs")
-            accepted_repairs = sum(item.accepted for item in repair_decisions)
-            opening_accepted = bool(opening_decision and opening_decision.accepted)
-
-            metrics = {
-                "run_id": run_id,
-                "created_at": datetime.now(JST).isoformat(),
-                "input": str(input_file),
-                "output_files": {
-                    "transcript": str(output_paths.transcript),
-                    "log": str(output_paths.log),
-                    "metrics": str(output_paths.metrics),
-                },
-                "configuration": {
-                    "mode": "batched_turbo_opening_audit_dense_cross_window_example_recovery",
-                    "language": arguments.language,
-                    "batch_size_requested": arguments.batch_size,
-                    "batch_size_used": batch_size_used,
-                    "opening_audit_seconds": arguments.opening_audit_seconds,
-                    "max_repair_windows": arguments.max_repair_windows,
-                    "complementary_language_recovery": "disabled_no_measurable_gain",
-                },
-                "software": software_metrics,
-                "models": {
-                    "primary": primary_model_information,
-                    "repair": repair_model_information,
-                    "repair_model_updated_during_run": repair_model_updated,
-                },
-                "audio_seconds": audio_seconds,
-                "audio_signal": audio_signal,
-                "detected_language": detected_language,
-                "repeated_phrase_anchors": anchors,
-                "baseline": baseline_indicators,
-                "opening_audit": opening_decision_to_dict(opening_decision),
-                "essential_section_audit": section_decision_to_dict(section_decision),
-                "essential_section_recovery": {
-                    "forced_language": "en",
-                    "recovered_example_count": len(section_recovered_examples),
-                    "recovered_examples": section_recovered_examples,
-                    "candidate_evidence": section_recovery_evidence,
-                    "dense_window_count": section_dense_windows,
-                    "dense_seconds": section_dense_seconds,
-                    "window_seconds": SECTION_CHUNK_SECONDS,
-                    "window_overlap_seconds": SECTION_CHUNK_OVERLAP_SECONDS,
-                    "event_cluster_seconds": SECTION_EVENT_CLUSTER_SECONDS,
-                    "minimum_cross_window_support": SECTION_CROSS_WINDOW_MIN_SUPPORT,
-                    "merge_policy": "timestamped_add_only_cross_window_consensus_never_replace_baseline",
-                },
-                "repeated_english_consensus": {
-                    "correction_count": len(consensus_corrections),
-                    "corrections": consensus_corrections,
-                    "unresolved_variant_cluster_count": unresolved_variant_clusters,
-                    "source": "same_recording_repeated_occurrences_only",
-                },
-                "strong_repair_detection": {
-                    "event_count": len(strong_events),
-                    "reason_counts": dict(
-                        Counter(event.reason for event in strong_events)
-                    ),
-                    "window_count": len(repair_windows),
-                    "windows": [
-                        {
-                            "index": window.index,
-                            "core_start": round(window.core_start, 3),
-                            "core_end": round(window.core_end, 3),
-                            "slice_start": round(window.slice_start, 3),
-                            "slice_end": round(window.slice_end, 3),
-                            "reasons": list(window.reasons),
-                        }
-                        for window in repair_windows
-                    ],
-                },
-                "large_v3_repair_decisions": [
-                    repair_decision_to_dict(item)
-                    for item in repair_decisions
-                ],
-                "final": final_indicators,
-                "reference_accuracy": reference_metrics,
-                "automatic_review": {
-                    "status": review_status,
-                    "scope": "STRUCTURAL_COVERAGE_AND_STRONG_ANOMALIES_ONLY",
-                    "is_accuracy_measurement": False,
-                },
-                "secondary_processing": {
-                    "effect": effect,
-                    "opening_audit_accepted": opening_accepted,
-                    "essential_section_audit_accepted": bool(
-                        section_recovered_examples
-                    ),
-                    "essential_section_recovered_examples": len(
-                        section_recovered_examples
-                    ),
-                    "consensus_corrections_applied": len(consensus_corrections),
-                    "large_v3_repairs_accepted": accepted_repairs,
-                    "text_character_change": (
-                        int(final_indicators["text_characters"])
-                        - int(baseline_indicators["text_characters"])
-                    ),
-                    "anchor_exact_hit_change": (
-                        int(final_indicators["anchor_exact_hits"])
-                        - int(baseline_indicators["anchor_exact_hits"])
-                    ),
-                    "strong_suspicious_event_change": (
-                        int(final_indicators["strong_suspicious_event_count"])
-                        - int(baseline_indicators["strong_suspicious_event_count"])
-                    ),
-                },
-                "performance": {
-                    "primary_seconds": primary_seconds,
-                    "opening_audit_seconds": opening_seconds,
-                    "essential_section_audit_seconds": section_seconds,
-                    "essential_section_dense_asr_seconds": section_dense_seconds,
-                    "essential_section_dense_windows": section_dense_windows,
-                    "large_v3_repair_seconds": repair_seconds,
-                    "secondary_seconds": opening_seconds + section_seconds + repair_seconds,
-                    "total_seconds": timer.total_seconds,
-                    "primary_realtime_factor": primary_seconds / audio_seconds,
-                    "total_realtime_factor": timer.total_seconds / audio_seconds,
-                    "audio_minutes_per_processing_minute": (
-                        audio_seconds / max(timer.total_seconds, 0.001)
-                    ),
-                },
-                "timings": timer.steps,
-            }
-            total_seconds = timer.total_seconds
-            startup_seconds = sum(
-                timer.seconds_for(name)
-                for name in (
-                    "check_and_update_software",
-                    "import_transcription_libraries",
-                    "check_model_revisions",
-                    "validate_environment",
-                    "decode_audio",
-                    "load_primary_model",
-                )
-            )
-            core_processing_seconds = (
-                primary_seconds + opening_seconds + section_seconds + repair_seconds
-            )
-            performance_class = (
-                "FAST"
-                if total_seconds / audio_seconds <= 0.10
-                else "MODERATE"
-                if total_seconds / audio_seconds <= 0.20
-                else "SLOW"
-            )
-            metrics["performance"]["startup_seconds"] = startup_seconds
-            metrics["performance"]["core_processing_seconds"] = core_processing_seconds
-            metrics["performance"]["performance_class"] = performance_class
-            write_json_atomically(output_paths.metrics, metrics)
-
-            print("TRANSCRIPTION_RESULT=PASS")
-            print(f"OUTPUT_FILE={output_paths.transcript}")
-            print(f"LOG_FILE={output_paths.log}")
-            print(f"METRICS_FILE={output_paths.metrics}")
-            print(f"PRIMARY_SECONDS={primary_seconds:.3f}")
-            print(f"OPENING_AUDIT_SECONDS={opening_seconds:.3f}")
-            print(f"ESSENTIAL_SECTION_AUDIT_SECONDS={section_seconds:.3f}")
-            print(
-                f"ESSENTIAL_SECTION_DENSE_ASR_SECONDS="
-                f"{section_dense_seconds:.3f}"
-            )
-            print(f"ESSENTIAL_SECTION_DENSE_WINDOWS={section_dense_windows}")
-            print(f"LARGE_V3_REPAIR_SECONDS={repair_seconds:.3f}")
-            print(
-                f"SECONDARY_SECONDS="
-                f"{opening_seconds + section_seconds + repair_seconds:.3f}"
-            )
-            print(f"STARTUP_SECONDS={startup_seconds:.3f}")
-            print(f"CORE_PROCESSING_SECONDS={core_processing_seconds:.3f}")
-            print(f"TOTAL_SECONDS={total_seconds:.3f}")
-            print(f"PERFORMANCE_CLASS={performance_class}")
-            print(f"TOTAL_PROCESS_REALTIME_FACTOR={total_seconds / audio_seconds:.4f}")
-            print(f"OPENING_AUDIT_ACCEPTED={'YES' if opening_accepted else 'NO'}")
-            print(
-                f"ESSENTIAL_SECTION_AUDIT_ACCEPTED="
-                f"{'YES' if section_recovered_examples else 'NO'}"
-            )
-            print(f"LARGE_V3_WINDOWS_PROCESSED={len(repair_windows)}")
-            print(f"LARGE_V3_REPAIRS_ACCEPTED={accepted_repairs}")
-            print(f"BASELINE_TEXT_CHARACTERS={len(baseline_text)}")
-            print(f"FINAL_TEXT_CHARACTERS={len(final_text)}")
-            print(
-                f"BASELINE_STRICT_SECTION_COUNT="
-                f"{baseline_indicators['strict_section_count']}/4"
-            )
-            print(
-                f"FINAL_STRICT_SECTION_COUNT="
-                f"{final_indicators['strict_section_count']}/4"
-            )
-            print(
-                f"BASELINE_ANCHOR_EXACT_HITS="
-                f"{baseline_indicators['anchor_exact_hits']}"
-            )
-            print(
-                f"FINAL_ANCHOR_EXACT_HITS="
-                f"{final_indicators['anchor_exact_hits']}"
-            )
-            print(
-                f"FINAL_STRONG_SUSPICIOUS_EVENTS="
-                f"{final_indicators['strong_suspicious_event_count']}"
-            )
-            print(f"SECONDARY_PROCESSING_EFFECT={effect}")
-            print(f"REFERENCE_ACCURACY={reference_metrics['status']}")
-            print(f"AUTOMATIC_REVIEW_STATUS={review_status}")
-            print("AUTOMATIC_REVIEW_STATUS_IS_ACCURACY_MEASUREMENT=NO")
-            print("EDUCATIONAL_FORMATTING_APPLIED=NO")
-
-            overall_result = "PASS"
-            return 0
-
-        except KeyboardInterrupt:
-            timer.fail_current()
-            print("TRANSCRIPTION_RESULT=CANCELLED", file=sys.stderr)
-            overall_result = "CANCELLED"
-            return 130
-        except Exception as exception:
-            timer.fail_current()
-            print("TRANSCRIPTION_RESULT=FAILED", file=sys.stderr)
-            print(f"ERROR={type(exception).__name__}: {exception}", file=sys.stderr)
-            print(f"OUTPUT_FILE_NOT_CREATED={output_paths.transcript}", file=sys.stderr)
-            overall_result = "FAILED"
-            return 1
-        finally:
-            timer.print_summary(overall_result)
-
-
-
-V20_MIN_GAP_SECONDS = 1.0
-V20_MAX_GAP_SECONDS = 22.0
-V20_GAP_PADDING_A = 1.0
-V20_GAP_PADDING_B = 2.0
-V20_MIN_ENGLISH_WORDS = 4
-V20_MAX_ENGLISH_WORDS = 36
-V20_MIN_LATIN_RATIO = 0.82
-V20_MIN_CONSENSUS_SIMILARITY = 0.82
-V20_MIN_AVG_LOGPROB = -0.72
-V20_SECTION_GAP_LIMITS = {
-    'Grammar and Vocabulary': 1,
-    'Essential Expressions': 4,
-    'Practical Usage': 2,
-}
-V20_PREVIOUS_RUNS = {
-    'v14_total_seconds': 52.528,
-    'v16_total_seconds': 108.805,
-    'v18_total_seconds': 105.937,
-    'v19_total_seconds': 491.729,
-    'v19_pass_a_seconds': 57.119,
-    'v19_full_coverage_seconds': 85.193,
-    'v19_turbo_gap_seconds': 73.077,
-    'v19_large_v3_gap_seconds': 227.397,
-}
-
-
-def language_label_v20(text: str) -> str:
-    japanese = japanese_character_count(text)
-    latin = latin_character_count(text)
-    if japanese and latin:
-        return 'mixed'
-    if japanese:
-        return 'ja'
-    if latin:
-        return 'en'
-    return 'unknown'
-
-
-def opening_audit_needed_v20(segments: list[SegmentRecord], core_end: float) -> tuple[bool, dict[str, object]]:
-    opening = segments_before(segments, core_end)
-    text = format_transcript(opening) if opening else ''
-    english_candidates = split_english_candidates(text)
-    diagnostics = {
-        'segment_count': len(opening),
-        'text_characters': len(text),
-        'japanese_characters': japanese_character_count(text),
-        'latin_characters': latin_character_count(text),
-        'english_candidate_count': len(english_candidates),
-        'strong_event_count': len(detect_strong_events(opening)),
-    }
-    sufficient = (
-        len(opening) >= 8
-        and len(text) >= 500
-        and diagnostics['japanese_characters'] >= 120
-        and diagnostics['latin_characters'] >= 250
-        and len(english_candidates) >= 5
-        and diagnostics['strong_event_count'] == 0
-    )
-    diagnostics['decision'] = 'SKIP_SUFFICIENT_BASELINE' if sufficient else 'RUN_AUDIT'
-    return (not sufficient), diagnostics
-
-
-def section_intervals_v20(
-    segments: list[SegmentRecord],
-    audio_seconds: float,
-) -> dict[str, tuple[float, float]]:
-    first_hits: dict[str, float] = {}
-    for segment in sorted(segments, key=lambda item: (item.start, item.end)):
-        hits = strict_section_hits(segment.text)
-        for name, hit in hits.items():
-            if hit and name not in first_hits:
-                first_hits[name] = segment.start
-    order = [
-        'Grammar and Vocabulary',
-        'Essential Expressions',
-        'Practical Usage',
-        'Pronunciation Polish',
-    ]
-    intervals: dict[str, tuple[float, float]] = {}
-    for index, name in enumerate(order[:-1]):
-        start = first_hits.get(name)
-        end = first_hits.get(order[index + 1])
-        if start is None or end is None or end <= start:
-            continue
-        intervals[name] = (max(0.0, start), min(audio_seconds, end))
-    return intervals
-
-
-def gap_energy_dbfs_v20(audio: object, start: float, end: float) -> float:
-    import numpy as np
-    start_sample = max(0, int(start * SAMPLE_RATE))
-    end_sample = min(len(audio), int(end * SAMPLE_RATE))
-    if end_sample <= start_sample:
-        return -120.0
-    values = np.asarray(audio[start_sample:end_sample], dtype=np.float32)
-    if values.size == 0:
-        return -120.0
-    rms = float(np.sqrt(np.mean(values * values) + 1e-12))
-    return 20.0 * math.log10(max(rms, 1e-12))
-
-
-def targeted_gap_plan_v20(
-    segments: list[SegmentRecord],
-    audio: object,
-    audio_seconds: float,
-) -> list[dict[str, object]]:
-    intervals = section_intervals_v20(segments, audio_seconds)
-    plan: list[dict[str, object]] = []
-    ordered_segments = sorted(segments, key=lambda item: (item.start, item.end))
-    for section_name, limit in V20_SECTION_GAP_LIMITS.items():
-        interval = intervals.get(section_name)
-        if interval is None:
-            continue
-        section_start, section_end = interval
-        section_segments = [
-            item for item in ordered_segments
-            if item.end >= section_start and item.start <= section_end
-        ]
-        candidates: list[dict[str, object]] = []
-        for left, right in zip(section_segments, section_segments[1:]):
-            gap_start = max(section_start, left.end)
-            gap_end = min(section_end, right.start)
-            gap_seconds = gap_end - gap_start
-            if not V20_MIN_GAP_SECONDS <= gap_seconds <= V20_MAX_GAP_SECONDS:
-                continue
-            energy = gap_energy_dbfs_v20(audio, gap_start, gap_end)
-            if energy < -46.0:
-                continue
-            candidates.append({
-                'section': section_name,
-                'start': gap_start,
-                'end': gap_end,
-                'seconds': gap_seconds,
-                'energy_dbfs': energy,
-                'left_text': left.text,
-                'right_text': right.text,
-            })
-        candidates.sort(
-            key=lambda item: (
-                -float(item['seconds']),
-                -float(item['energy_dbfs']),
-                float(item['start']),
-            )
-        )
-        selected = sorted(candidates[:limit], key=lambda item: float(item['start']))
-        plan.extend(selected)
-    return plan
-
-
-def candidate_sentences_v20(segments: list[SegmentRecord]) -> list[dict[str, object]]:
-    results: list[dict[str, object]] = []
-    for segment in segments:
-        pieces = split_english_candidates(segment.text)
-        if not pieces:
-            pieces = [clean_text(segment.text)]
-        for piece in pieces:
-            words = english_words(piece)
-            compact = re.sub(r'\s+', '', piece)
-            if not V20_MIN_ENGLISH_WORDS <= len(words) <= V20_MAX_ENGLISH_WORDS:
-                continue
-            if not compact:
-                continue
-            if latin_character_count(piece) / len(compact) < V20_MIN_LATIN_RATIO:
-                continue
-            if segment.avg_logprob < V20_MIN_AVG_LOGPROB:
-                continue
-            if detect_decoder_loop(piece):
-                continue
-            results.append({
-                'text': clean_text(piece),
-                'normalized': normalize_for_comparison(piece),
-                'start': segment.start,
-                'end': segment.end,
-                'avg_logprob': segment.avg_logprob,
-                'source': segment.source,
-            })
-    return results
-
-
-def nearby_text_v20(
-    segments: list[SegmentRecord],
-    start: float,
-    end: float,
-    padding: float = 2.5,
-) -> str:
-    return ' '.join(
-        item.text for item in segments
-        if item.end >= start - padding and item.start <= end + padding
-    )
-
-
-def recover_targeted_gap_v20(
-    model: object,
-    audio: object,
-    gap: dict[str, object],
-    baseline_segments: list[SegmentRecord],
-    audio_seconds: float,
-    index: int,
-) -> tuple[SegmentRecord | None, dict[str, object]]:
-    gap_start = float(gap['start'])
-    gap_end = float(gap['end'])
-    pass_a = transcribe_slice(
-        model,
-        audio,
-        start=max(0.0, gap_start - V20_GAP_PADDING_A),
-        end=min(audio_seconds, gap_end + V20_GAP_PADDING_A),
-        language='en',
-        source=f'v20_gap_{index:02d}_a',
-        beam_size=3,
-        multilingual=False,
-    )
-    pass_b = transcribe_slice(
-        model,
-        audio,
-        start=max(0.0, gap_start - V20_GAP_PADDING_B),
-        end=min(audio_seconds, gap_end + V20_GAP_PADDING_B),
-        language='en',
-        source=f'v20_gap_{index:02d}_b',
-        beam_size=3,
-        multilingual=False,
-    )
-    candidates_a = candidate_sentences_v20(pass_a)
-    candidates_b = candidate_sentences_v20(pass_b)
-    best: tuple[float, dict[str, object], dict[str, object]] | None = None
-    for left in candidates_a:
-        for right in candidates_b:
-            similarity = SequenceMatcher(
-                None,
-                str(left['normalized']),
-                str(right['normalized']),
-            ).ratio()
-            if similarity < V20_MIN_CONSENSUS_SIMILARITY:
-                continue
-            score = (
-                similarity
-                + max(-1.0, float(left['avg_logprob'])) * 0.08
-                + max(-1.0, float(right['avg_logprob'])) * 0.08
-                + min(len(str(left['text'])), len(str(right['text']))) / 1000.0
-            )
-            if best is None or score > best[0]:
-                best = (score, left, right)
-
-    evidence: dict[str, object] = {
-        **gap,
-        'index': index,
-        'pass_a_candidates': candidates_a,
-        'pass_b_candidates': candidates_b,
-        'accepted': False,
-        'decision_reason': 'no_cross_boundary_consensus',
-    }
-    if best is None:
-        return None, evidence
-    _score, left, right = best
-    similarity = SequenceMatcher(
-        None,
-        str(left['normalized']),
-        str(right['normalized']),
-    ).ratio()
-    chosen = left if (
-        float(left['avg_logprob']), len(str(left['text']))
-    ) >= (
-        float(right['avg_logprob']), len(str(right['text']))
-    ) else right
-    nearby = nearby_text_v20(
-        baseline_segments,
-        gap_start,
-        gap_end,
-    )
-    nearby_similarity = SequenceMatcher(
-        None,
-        str(chosen['normalized']),
-        normalize_for_comparison(nearby),
-    ).ratio()
-    normalized_nearby = normalize_for_comparison(nearby)
-    if str(chosen['normalized']) in normalized_nearby:
-        evidence['decision_reason'] = 'already_present_nearby'
-        evidence['consensus_similarity'] = similarity
-        return None, evidence
-    if nearby_similarity >= 0.86:
-        evidence['decision_reason'] = 'close_variant_already_present_nearby'
-        evidence['consensus_similarity'] = similarity
-        evidence['nearby_similarity'] = nearby_similarity
-        return None, evidence
-    accepted = SegmentRecord(
-        start=max(gap_start, min(float(left['start']), float(right['start']))),
-        end=min(gap_end, max(float(left['end']), float(right['end']))),
-        text=str(chosen['text']),
-        avg_logprob=max(float(left['avg_logprob']), float(right['avg_logprob'])),
-        compression_ratio=0.0,
-        no_speech_prob=0.0,
-        source='turbo_targeted_gap_consensus',
-    )
-    if accepted.end <= accepted.start:
-        accepted.start = gap_start
-        accepted.end = gap_end
-    evidence.update({
-        'accepted': True,
-        'decision_reason': 'two_boundary_consensus_missing_from_nearby_baseline',
-        'consensus_similarity': similarity,
-        'nearby_similarity': nearby_similarity,
-        'selected_text': accepted.text,
-        'selected_start': accepted.start,
-        'selected_end': accepted.end,
-        'selected_avg_logprob': accepted.avg_logprob,
-    })
-    return accepted, evidence
-
-
-def regression_profile_v20(
-    input_file: Path,
-    audio_seconds: float,
-    segments: list[SegmentRecord],
-) -> dict[str, object]:
-    if input_file.name.lower() != 'b.m4a' or not 850.0 <= audio_seconds <= 870.0:
-        return {'status': 'NOT_APPLICABLE', 'profile': None, 'items': []}
-    checks = [
-        ("Dad's birthday is coming up next week", 20.0, 100.0),
-        ("We're not exactly great in the kitchen", 25.0, 230.0),
-        ("Suppose we asked Emily for advice", 390.0, 500.0),
-        ("Imagine we asked Emily for advice", 390.0, 510.0),
-        ("It might be a good idea for us to discuss this together", 410.0, 530.0),
-        ("Just an idea, but we could try leaving a little earlier tomorrow", 440.0, 540.0),
-        ("It might be a good idea for us to take a break for a while", 610.0, 735.0),
-        ("We've been at this for a long time", 610.0, 735.0),
-        ("We're all a bit tired", 610.0, 735.0),
-        ("What if we baked him a cake ourselves", 735.0, 830.0),
-    ]
-    items: list[dict[str, object]] = []
-    for phrase, start, end in checks:
-        expected = normalize_for_comparison(phrase)
-        region_text = ' '.join(
-            item.text for item in segments
-            if item.end >= start and item.start <= end
-        )
-        observed = normalize_for_comparison(region_text)
-        passed = expected in observed
-        items.append({
-            'phrase': phrase,
-            'start': start,
-            'end': end,
-            'passed': passed,
-        })
-    return {
-        'status': 'PASS' if all(item['passed'] for item in items) else 'FAIL',
-        'profile': 'lesson76_embedded_regression',
-        'scope': 'KNOWN_PHRASE_TIME_REGION_REGRESSION_NOT_ACCURACY_PERCENTAGE',
-        'items': items,
-        'passed_count': sum(bool(item['passed']) for item in items),
-        'total_count': len(items),
-    }
-
-
-def run_child_v20() -> int:
-    timer = StepTimer()
-    overall_result = 'FAILED'
-    arguments = parse_arguments()
-    script_directory = Path(__file__).resolve().parent
-    run_id = os.environ.get('TRANSCRIBE_RUN_ID') or datetime.now(JST).strftime('%Y%m%d_%H%M%S')
-    input_file = resolve_path(script_directory, arguments.input)
-    output_directory = resolve_path(script_directory, arguments.output_dir)
-    output_paths = make_output_paths(output_directory, run_id)
-    reference_file = resolve_path(script_directory, arguments.reference) if arguments.reference else None
-
-    with TeeContext(output_paths.log):
-        try:
-            print('RUN_START')
-            print(f'RUN_ID={run_id}')
-            print('TRANSCRIPTION_TRANSACTION=1')
-            print('TRANSCRIPTION_VERSION=20')
-            print('CONVERGENCE_POLICY=V18_CORE_PLUS_V19_TARGETED_RECOVERY_NO_GLOBAL_RESCAN')
-            print(f'TRANSCRIPT_FILE={output_paths.transcript}')
-            print(f'LOG_FILE={output_paths.log}')
-            print(f'METRICS_FILE={output_paths.metrics}')
-
-            timer.start('check_and_update_software')
-            software_metrics = check_and_update_runtime_packages(script_directory)
-            timer.finish()
-
-            timer.start('import_transcription_libraries')
-            import ctranslate2
-            import faster_whisper
-            _v20_faster_whisper_version = faster_whisper.__version__
-            print(f'FASTER_WHISPER={_v20_faster_whisper_version}')
-            from faster_whisper import BatchedInferencePipeline, WhisperModel
-            from faster_whisper.audio import decode_audio
-            timer.finish()
-
-            timer.start('check_primary_model_revision')
-            primary_model_information = check_model(
-                script_directory,
-                repository=PRIMARY_MODEL_REPOSITORY,
-                directory_name=PRIMARY_MODEL_DIRECTORY_NAME,
-                label='PRIMARY',
-                download_now=True,
-            )
-            timer.finish()
-
-            timer.start('validate_environment')
-            validate_environment(
-                input_file,
-                arguments.batch_size,
-                arguments.opening_audit_seconds,
-                0,
-                ctranslate2,
-            )
-            if reference_file is not None and not reference_file.is_file():
-                raise FileNotFoundError(f'Reference file was not found: {reference_file}')
-            timer.finish()
-
-            print('TRANSCRIPTION_CONFIGURATION')
-            print('TRANSCRIPTION_MODE=CONVERGED_FAST_PRIMARY_PLUS_TARGETED_GAP_CONSENSUS')
-            print('PRIMARY_PASS=FAST_BATCHED_VAD_FULL_AUDIO')
-            print('OPENING_AUDIT=CONDITIONAL_ONLY_IF_BASELINE_IS_SPARSE')
-            print('TARGETED_RECOVERY=GRAMMAR_ESSENTIAL_PRACTICAL_GAPS_ONLY')
-            print('TARGETED_RECOVERY_CONSENSUS=TWO_BOUNDARY_FORCED_ENGLISH')
-            print('FULL_AUDIO_SECOND_PASS=DISABLED')
-            print('LARGE_V3_AUTOMATIC_PASS=DISABLED')
-            print('CANDIDATES_IN_TRANSCRIPT=NO')
-            print('CANDIDATES_IN_METRICS=YES')
-            print('GLOBAL_CROSS_TIME_REPLACEMENT=DISABLED')
-            print('EDUCATIONAL_FORMATTING_APPLIED=NO')
-            print(f'INPUT={input_file}')
-
-            timer.start('decode_audio')
-            audio = decode_audio(str(input_file), sampling_rate=SAMPLE_RATE)
-            audio_seconds = len(audio) / SAMPLE_RATE
-            audio_signal = analyze_audio_signal(audio)
-            timer.finish()
-            print(f'AUDIO_SECONDS={audio_seconds:.3f}')
-            print(f'AUDIO_SIGNAL_QUALITY={audio_signal["quality_status"]}')
-
-            timer.start('load_primary_model')
-            primary_model = load_model(
-                WhisperModel,
-                Path(str(primary_model_information['directory'])),
-                'turbo',
-            )
-            timer.finish()
-            requested_language = None if arguments.language == 'auto' else arguments.language
-
-            timer.start('primary_batched_transcription')
             baseline_segments, batch_size_used, detected_language = transcribe_batched_baseline(
-                primary_model,
+                model,
                 BatchedInferencePipeline,
                 audio,
                 requested_language,
@@ -3269,310 +1393,283 @@ def run_child_v20() -> int:
             )
             baseline_text = format_transcript(baseline_segments)
             timer.finish()
+            print(f"PRIMARY_BATCH_SIZE_USED={batch_size_used}")
+            print(f"DETECTED_LANGUAGE={detected_language}")
+            print(f"BASELINE_SEGMENT_COUNT={len(baseline_segments)}")
 
-            timer.start('discover_repeated_content')
-            anchors = discover_repeated_anchors(baseline_segments)
-            baseline_indicators = transcript_indicators(baseline_text, baseline_segments, anchors)
-            timer.finish()
-
-            timer.start('conditional_opening_audit')
-            opening_decision: OpeningAuditDecision | None = None
-            post_opening_segments = list(baseline_segments)
-            core_end = opening_core_end(
-                baseline_segments,
-                arguments.opening_audit_seconds,
-                audio_seconds,
-            )
-            run_opening, opening_diagnostics = opening_audit_needed_v20(
-                baseline_segments,
-                core_end,
-            ) if core_end > 0 else (False, {'decision': 'DISABLED'})
-            if run_opening:
-                opening_slice = transcribe_slice(
-                    primary_model,
-                    audio,
-                    start=0.0,
-                    end=min(audio_seconds, core_end + OPENING_AUDIT_PADDING_SECONDS),
-                    language=requested_language,
-                    source='turbo_opening_no_vad',
-                    beam_size=5,
-                )
-                opening_slice = segments_before(opening_slice, core_end)
-                baseline_opening = segments_before(baseline_segments, core_end)
-                opening_decision = decide_opening_audit(
-                    baseline_opening,
-                    opening_slice,
-                    anchors,
-                    core_end,
-                )
-                if opening_decision.accepted:
-                    post_opening_segments = apply_opening_audit(
-                        baseline_segments,
-                        opening_slice,
-                        core_end,
-                    )
-            timer.finish()
-            print(f'OPENING_AUDIT_DECISION={opening_diagnostics["decision"]}')
-            print(
-                'OPENING_AUDIT_ACCEPTED='
-                + ('YES' if opening_decision and opening_decision.accepted else 'NO')
-            )
-
-            timer.start('targeted_gap_planning')
-            gap_plan = targeted_gap_plan_v20(
-                post_opening_segments,
+            timer.start("conditional_opening_audit")
+            post_opening_segments, opening_audit = run_conditional_opening_audit(
+                model,
                 audio,
+                baseline_segments,
                 audio_seconds,
+                arguments.opening_audit_seconds,
+                requested_language,
             )
             timer.finish()
-            print(f'TARGETED_GAP_WINDOW_COUNT={len(gap_plan)}')
+            print(f"OPENING_AUDIT_STATUS={opening_audit['status']}")
 
-            timer.start('targeted_gap_recovery')
+            timer.start("section_coverage_planning")
+            intervals = section_intervals(post_opening_segments, audio_seconds)
+            section_plan = [
+                {
+                    "section": section,
+                    "start": intervals[section][0],
+                    "end": intervals[section][1],
+                    "seconds": intervals[section][1] - intervals[section][0],
+                }
+                for section in AUDITED_SECTIONS
+                if section in intervals
+            ]
+            timer.finish()
+            print(f"SECTION_COVERAGE_SECTIONS={len(section_plan)}")
+
+            timer.start("section_coverage_recovery")
             recovered_segments: list[SegmentRecord] = []
-            gap_evidence: list[dict[str, object]] = []
-            for index, gap in enumerate(gap_plan, start=1):
-                print(
-                    f'TARGETED_GAP_START INDEX={index:02d} '
-                    f'SECTION={gap["section"]} '
-                    f'START={float(gap["start"]):.3f} '
-                    f'END={float(gap["end"]):.3f}'
-                )
-                recovered, evidence = recover_targeted_gap_v20(
-                    primary_model,
+            evidence: list[dict[str, object]] = []
+            window_counts: dict[str, int] = {}
+            section_seconds: dict[str, float] = {}
+            for plan in section_plan:
+                section_name = str(plan["section"])
+                section_started = time.perf_counter()
+                audit_segments, window_count = transcribe_section_windows(
+                    model,
                     audio,
-                    gap,
-                    post_opening_segments,
-                    audio_seconds,
-                    index,
+                    section_name=section_name,
+                    start=float(plan["start"]),
+                    end=float(plan["end"]),
                 )
-                gap_evidence.append(evidence)
-                if recovered is not None:
-                    recovered_segments.append(recovered)
-                    print(
-                        f'TARGETED_GAP_ACCEPTED INDEX={index:02d} '
-                        f'TEXT={recovered.text}'
-                    )
-                else:
-                    print(
-                        f'TARGETED_GAP_REJECTED INDEX={index:02d} '
-                        f'REASON={evidence["decision_reason"]}'
-                    )
+                recovered, section_evidence = recover_time_local_consensus(
+                    post_opening_segments,
+                    audit_segments,
+                    section_name,
+                )
+                recovered_segments.extend(recovered)
+                evidence.extend(section_evidence)
+                window_counts[section_name] = window_count
+                elapsed = time.perf_counter() - section_started
+                section_seconds[section_name] = elapsed
+                print(
+                    f"SECTION_COVERAGE_RESULT SECTION={section_name} "
+                    f"WINDOWS={window_count} RECOVERED={len(recovered)} "
+                    f"ELAPSED_SECONDS={elapsed:.3f}"
+                )
+            recovered_segments = deduplicate_segments(recovered_segments)
             timer.finish()
 
-            del primary_model
+            del model
             gc.collect()
 
-            timer.start('assemble_final_transcript')
-            final_segments = deduplicate_segments([
-                *post_opening_segments,
-                *recovered_segments,
-            ])
+            timer.start("assemble_final_transcript")
+            final_segments = deduplicate_segments(
+                [*post_opening_segments, *recovered_segments]
+            )
             raw_final_text = format_transcript(final_segments)
-            final_text, consensus_corrections, unresolved_clusters = correct_repeated_english_variants(
-                raw_final_text
-            )
-            final_indicators = transcript_indicators(
-                final_text,
-                final_segments,
-                discover_repeated_anchors(final_segments),
-            )
-            language_counts = dict(
-                Counter(language_label_v20(item.text) for item in final_segments)
+            final_text, corrections = correct_repeated_english_variants(raw_final_text)
+            apply_corrections_to_segments(final_segments, corrections)
+            final_text = format_transcript(final_segments)
+            final_indicators = transcript_indicators(final_text, final_segments)
+            timer.finish()
+
+            timer.start("evaluate_regression_profile")
+            regression = lesson76_regression(
+                input_file, audio_seconds, final_segments
             )
             timer.finish()
 
-            timer.start('evaluate_regression_profile')
-            regression = regression_profile_v20(
-                input_file,
-                audio_seconds,
-                final_segments,
-            )
-            timer.finish()
-
-            timer.start('calculate_reference_metrics')
-            if reference_file is None:
-                reference_metrics: dict[str, object] = {'status': 'NOT_MEASURED'}
-            else:
-                reference_metrics = calculate_reference_metrics(
-                    reference_file.read_text(encoding='utf-8'),
+            timer.start("calculate_reference_metrics")
+            accuracy = (
+                {"status": "NOT_MEASURED"}
+                if reference_file is None
+                else reference_metrics(
+                    reference_file.read_text(encoding="utf-8"),
                     baseline_text,
                     final_text,
                 )
-            timer.finish()
-
-            timer.start('write_transcript')
-            write_text_atomically(output_paths.transcript, final_text)
-            timer.finish()
-
-            primary_seconds = timer.seconds_for('primary_batched_transcription')
-            opening_seconds = timer.seconds_for('conditional_opening_audit')
-            planning_seconds = timer.seconds_for('targeted_gap_planning')
-            recovery_seconds = timer.seconds_for('targeted_gap_recovery')
-            startup_seconds = sum(
-                timer.seconds_for(name)
-                for name in (
-                    'check_and_update_software',
-                    'import_transcription_libraries',
-                    'check_primary_model_revision',
-                    'validate_environment',
-                    'decode_audio',
-                    'load_primary_model',
-                )
             )
-            warm_core_seconds = primary_seconds + opening_seconds + planning_seconds + recovery_seconds
+            timer.finish()
+
+            timer.start("write_transcript")
+            write_text_atomically(outputs.transcript, final_text)
+            timer.finish()
+
+            startup_steps = (
+                "check_and_update_software",
+                "import_transcription_libraries",
+                "check_primary_model_revision",
+                "validate_environment",
+                "decode_audio",
+                "load_primary_model",
+            )
+            startup_seconds = sum(timer.seconds_for(name) for name in startup_steps)
+            primary_seconds = timer.seconds_for("primary_batched_transcription")
+            opening_seconds = timer.seconds_for("conditional_opening_audit")
+            planning_seconds = timer.seconds_for("section_coverage_planning")
+            recovery_seconds = timer.seconds_for("section_coverage_recovery")
+            warm_core_seconds = (
+                primary_seconds + opening_seconds + planning_seconds + recovery_seconds
+            )
             total_seconds = timer.total_seconds
-            realtime_factor = total_seconds / max(audio_seconds, 0.001)
-            warm_realtime_factor = warm_core_seconds / max(audio_seconds, 0.001)
+            total_rtf = total_seconds / max(audio_seconds, 0.001)
+            warm_rtf = warm_core_seconds / max(audio_seconds, 0.001)
             performance_class = (
-                'FAST' if warm_realtime_factor <= 0.10
-                else 'ACCEPTABLE' if warm_realtime_factor <= 0.16
-                else 'SLOW'
+                "FAST"
+                if warm_rtf <= 0.12
+                else "ACCEPTABLE"
+                if warm_rtf <= 0.18
+                else "SLOW"
             )
-            quality_gate = (
-                'PASS'
-                if regression.get('status') in {'PASS', 'NOT_APPLICABLE'}
-                and not bool(final_indicators['decoder_loop'])
-                and int(final_indicators['replacement_characters']) == 0
-                else 'FAIL'
+            structural_pass = (
+                not bool(final_indicators["decoder_loop"])
+                and int(final_indicators["replacement_characters"]) == 0
+                and int(final_indicators["strict_section_count"]) == 4
+            )
+            regression_pass = regression.get("status") in {"PASS", "NOT_APPLICABLE"}
+            quality_gate = "PASS" if structural_pass and regression_pass else "FAIL"
+            acceptance = (
+                "ACCEPT_TRANSACTION_1"
+                if quality_gate == "PASS" and total_seconds <= 150.0
+                else "REVIEW_REQUIRED"
             )
 
             metrics = {
-                'run_id': run_id,
-                'created_at': datetime.now(JST).isoformat(),
-                'transaction': 1,
-                'version': 20,
-                'convergence': {
-                    'status': 'CANDIDATE_FOR_FINAL_ACCEPTANCE',
-                    'source_versions_combined': [14, 16, 18, 19],
-                    'previous_run_timings': V20_PREVIOUS_RUNS,
-                    'v19_components_removed': [
-                        'full_audio_no_vad_second_pass',
-                        'automatic_large_v3_gap_recovery',
-                        'candidate_text_in_main_transcript',
-                        'energy_gap_markers_in_main_transcript',
+                "run_id": run_id,
+                "created_at": datetime.now(JST).isoformat(),
+                "transaction": 1,
+                "version": TRANSCRIPTION_VERSION,
+                "convergence": {
+                    "status": "FINAL_ACCEPTANCE_TEST",
+                    "source_versions_combined": [14, 16, 18, 19, 20],
+                    "v19_removed": [
+                        "full_audio_second_pass",
+                        "automatic_large_v3_gap_recovery",
+                        "candidate_text_in_transcript",
+                        "uncertain_markers_in_transcript",
                     ],
-                    'v19_components_retained': [
-                        'timestamp_targeted_gap_detection',
-                        'per_stage_timing',
-                        'embedded_regression_profile',
+                    "v20_removed": [
+                        "gap_length_ranking",
+                        "two_boundary_gap_only_consensus",
                     ],
                 },
-                'input': str(input_file),
-                'output_files': {
-                    'transcript': str(output_paths.transcript),
-                    'log': str(output_paths.log),
-                    'metrics': str(output_paths.metrics),
+                "input": str(input_file),
+                "output_files": {
+                    "transcript": str(outputs.transcript),
+                    "log": str(outputs.log),
+                    "metrics": str(outputs.metrics),
                 },
-                'configuration': {
-                    'mode': 'fast_primary_conditional_opening_targeted_gap_consensus',
-                    'batch_size_requested': arguments.batch_size,
-                    'batch_size_used': batch_size_used,
-                    'opening_audit_seconds': arguments.opening_audit_seconds,
-                    'large_v3_automatic': False,
-                    'full_audio_second_pass': False,
-                    'candidate_text_written_to_transcript': False,
+                "configuration": {
+                    "batch_size_requested": arguments.batch_size,
+                    "batch_size_used": batch_size_used,
+                    "opening_audit_seconds": arguments.opening_audit_seconds,
+                    "section_window_seconds": SECTION_WINDOW_SECONDS,
+                    "section_window_hop_seconds": SECTION_WINDOW_HOP_SECONDS,
+                    "full_audio_second_pass": False,
+                    "large_v3_automatic": False,
+                    "candidate_text_written_to_transcript": False,
                 },
-                'software': software_metrics,
-                'model': primary_model_information,
-                'audio_seconds': audio_seconds,
-                'audio_signal': audio_signal,
-                'detected_language': detected_language,
-                'baseline': baseline_indicators,
-                'opening_audit': {
-                    'diagnostics': opening_diagnostics,
-                    'decision': opening_decision_to_dict(opening_decision),
-                },
-                'targeted_gap_recovery': {
-                    'planned_count': len(gap_plan),
-                    'accepted_count': len(recovered_segments),
-                    'plan': gap_plan,
-                    'evidence': gap_evidence,
-                    'accepted_segments': [
+                "software": software,
+                "model": model_information,
+                "audio_seconds": audio_seconds,
+                "audio_signal": audio_signal,
+                "detected_language": detected_language,
+                "baseline": transcript_indicators(
+                    baseline_text, baseline_segments
+                ),
+                "opening_audit": opening_audit,
+                "section_coverage_recovery": {
+                    "section_count": len(section_plan),
+                    "plan": section_plan,
+                    "window_counts": window_counts,
+                    "section_seconds": section_seconds,
+                    "accepted_count": len(recovered_segments),
+                    "accepted_segments": [
                         {
-                            'start': item.start,
-                            'end': item.end,
-                            'text': item.text,
-                            'avg_logprob': item.avg_logprob,
-                            'source': item.source,
+                            "start": segment.start,
+                            "end": segment.end,
+                            "text": segment.text,
+                            "avg_logprob": segment.avg_logprob,
+                            "source": segment.source,
                         }
-                        for item in recovered_segments
+                        for segment in recovered_segments
                     ],
+                    "evidence": evidence,
                 },
-                'repeated_english_consensus': {
-                    'correction_count': len(consensus_corrections),
-                    'corrections': consensus_corrections,
-                    'unresolved_cluster_count': unresolved_clusters,
+                "repeated_english_consensus": {
+                    "correction_count": len(corrections),
+                    "corrections": corrections,
                 },
-                'regression': regression,
-                'final': {
-                    **final_indicators,
-                    'language_segment_counts': language_counts,
+                "regression": regression,
+                "final": final_indicators,
+                "reference_accuracy": accuracy,
+                "quality_gate": {
+                    "status": quality_gate,
+                    "acceptance": acceptance,
+                    "is_accuracy_percentage": False,
                 },
-                'reference_accuracy': reference_metrics,
-                'quality_gate': {
-                    'status': quality_gate,
-                    'is_accuracy_percentage': False,
+                "performance": {
+                    "startup_seconds": startup_seconds,
+                    "primary_seconds": primary_seconds,
+                    "opening_audit_seconds": opening_seconds,
+                    "section_coverage_planning_seconds": planning_seconds,
+                    "section_coverage_recovery_seconds": recovery_seconds,
+                    "section_seconds": section_seconds,
+                    "warm_core_seconds": warm_core_seconds,
+                    "total_seconds": total_seconds,
+                    "total_realtime_factor": total_rtf,
+                    "warm_core_realtime_factor": warm_rtf,
+                    "audio_minutes_per_processing_minute_total": audio_seconds
+                    / max(total_seconds, 0.001),
+                    "audio_minutes_per_processing_minute_warm": audio_seconds
+                    / max(warm_core_seconds, 0.001),
+                    "performance_class": performance_class,
                 },
-                'performance': {
-                    'startup_seconds': startup_seconds,
-                    'primary_seconds': primary_seconds,
-                    'opening_audit_seconds': opening_seconds,
-                    'targeted_gap_planning_seconds': planning_seconds,
-                    'targeted_gap_recovery_seconds': recovery_seconds,
-                    'warm_core_seconds': warm_core_seconds,
-                    'total_seconds': total_seconds,
-                    'total_realtime_factor': realtime_factor,
-                    'warm_core_realtime_factor': warm_realtime_factor,
-                    'audio_minutes_per_processing_minute_total': audio_seconds / max(total_seconds, 0.001),
-                    'audio_minutes_per_processing_minute_warm': audio_seconds / max(warm_core_seconds, 0.001),
-                    'performance_class': performance_class,
-                },
-                'timings': timer.steps,
+                "timings": timer.steps,
             }
-            write_json_atomically(output_paths.metrics, metrics)
+            write_json_atomically(outputs.metrics, metrics)
 
-            print('TRANSCRIPTION_RESULT=PASS')
-            print(f'OUTPUT_FILE={output_paths.transcript}')
-            print(f'LOG_FILE={output_paths.log}')
-            print(f'METRICS_FILE={output_paths.metrics}')
-            print(f'STARTUP_SECONDS={startup_seconds:.3f}')
-            print(f'PRIMARY_SECONDS={primary_seconds:.3f}')
-            print(f'OPENING_AUDIT_SECONDS={opening_seconds:.3f}')
-            print(f'TARGETED_GAP_PLANNING_SECONDS={planning_seconds:.3f}')
-            print(f'TARGETED_GAP_RECOVERY_SECONDS={recovery_seconds:.3f}')
-            print(f'WARM_CORE_SECONDS={warm_core_seconds:.3f}')
-            print(f'TOTAL_SECONDS={total_seconds:.3f}')
-            print(f'PERFORMANCE_CLASS={performance_class}')
-            print(f'TARGETED_GAPS_PLANNED={len(gap_plan)}')
-            print(f'TARGETED_GAPS_ACCEPTED={len(recovered_segments)}')
-            print(f'CONSENSUS_CORRECTIONS_APPLIED={len(consensus_corrections)}')
-            print(f'REGRESSION_STATUS={regression.get("status")}')
-            print(f'QUALITY_GATE={quality_gate}')
-            print('FULL_AUDIO_SECOND_PASS_USED=NO')
-            print('LARGE_V3_USED=NO')
-            print('CANDIDATE_TEXT_WRITTEN_TO_TRANSCRIPT=NO')
-            print('EDUCATIONAL_FORMATTING_APPLIED=NO')
-            overall_result = 'PASS'
+            print("TRANSCRIPTION_RESULT=PASS")
+            print(f"OUTPUT_FILE={outputs.transcript}")
+            print(f"LOG_FILE={outputs.log}")
+            print(f"METRICS_FILE={outputs.metrics}")
+            print(f"STARTUP_SECONDS={startup_seconds:.3f}")
+            print(f"PRIMARY_SECONDS={primary_seconds:.3f}")
+            print(f"OPENING_AUDIT_SECONDS={opening_seconds:.3f}")
+            print(f"SECTION_COVERAGE_PLANNING_SECONDS={planning_seconds:.3f}")
+            print(f"SECTION_COVERAGE_RECOVERY_SECONDS={recovery_seconds:.3f}")
+            print(f"WARM_CORE_SECONDS={warm_core_seconds:.3f}")
+            print(f"TOTAL_SECONDS={total_seconds:.3f}")
+            print(f"PERFORMANCE_CLASS={performance_class}")
+            print(f"SECTION_RECOVERED_SEGMENTS={len(recovered_segments)}")
+            print(f"CONSENSUS_CORRECTIONS_APPLIED={len(corrections)}")
+            print(f"REGRESSION_STATUS={regression.get('status')}")
+            print(f"QUALITY_GATE={quality_gate}")
+            print(f"TRANSACTION_1_ACCEPTANCE={acceptance}")
+            print("FULL_AUDIO_SECOND_PASS_USED=NO")
+            print("LARGE_V3_USED=NO")
+            print("CANDIDATE_TEXT_WRITTEN_TO_TRANSCRIPT=NO")
+            print("EDUCATIONAL_FORMATTING_APPLIED=NO")
+            overall_result = "PASS"
             return 0
         except KeyboardInterrupt:
             timer.fail_current()
-            print('TRANSCRIPTION_RESULT=CANCELLED', file=sys.stderr)
-            overall_result = 'CANCELLED'
+            overall_result = "CANCELLED"
+            print("TRANSCRIPTION_RESULT=CANCELLED", file=sys.stderr)
             return 130
         except Exception as exception:
             timer.fail_current()
-            print('TRANSCRIPTION_RESULT=FAILED', file=sys.stderr)
-            print(f'ERROR={type(exception).__name__}: {exception}', file=sys.stderr)
-            print(f'OUTPUT_FILE_NOT_CREATED={output_paths.transcript}', file=sys.stderr)
-            overall_result = 'FAILED'
+            print("TRANSCRIPTION_RESULT=FAILED", file=sys.stderr)
+            print(f"ERROR={type(exception).__name__}: {exception}", file=sys.stderr)
+            print(f"OUTPUT_FILE_NOT_CREATED={outputs.transcript}", file=sys.stderr)
+            overall_result = "FAILED"
             return 1
         finally:
             timer.print_summary(overall_result)
 
+
 def main() -> int:
     script_directory = Path(__file__).resolve().parent
     ensure_stt_virtual_environment(script_directory)
-    return run_child_v20()
+    return run_transcription()
 
 
 if __name__ == "__main__":
