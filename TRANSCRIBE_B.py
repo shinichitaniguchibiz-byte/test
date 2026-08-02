@@ -2449,7 +2449,6 @@ def run_child() -> int:
             gc.collect()
 
             timer.start("detect_strong_repair_windows")
-            post_opening_text = format_transcript(post_section_segments)
             strong_events = detect_strong_events(post_section_segments)
             repair_windows = build_repair_windows(
                 strong_events,
