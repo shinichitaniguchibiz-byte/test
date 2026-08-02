@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import gc
 import importlib.metadata
 import json
@@ -10,6 +11,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.request
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -30,6 +32,7 @@ OPENING_AUDIT_PADDING_SECONDS = 2.5
 SECTION_AUDIT_PADDING_SECONDS = 2.0
 REPAIR_PADDING_SECONDS = 4.0
 V15_PATCH_APPLIED = True
+V16_PATCH_APPLIED = True
 JST = timezone(timedelta(hours=9), name="JST")
 
 RUNTIME_PACKAGES = (
@@ -394,36 +397,98 @@ def installed_package_versions() -> dict[str, str | None]:
     return versions
 
 
+def fetch_latest_pypi_version(package: str) -> str:
+    request = urllib.request.Request(
+        f"https://pypi.org/pypi/{package}/json",
+        headers={"User-Agent": "radio-transcription-version-check/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = json.load(response)
+    except Exception as exception:
+        raise TranscriptionError(
+            f"The latest software version could not be checked for {package}. "
+            f"{type(exception).__name__}: {exception}"
+        ) from exception
+    version = str(payload.get("info", {}).get("version", "")).strip()
+    if not version:
+        raise TranscriptionError(
+            f"PyPI returned no current version for {package}."
+        )
+    return version
+
+
+def version_is_newer(latest: str, installed: str | None) -> bool:
+    try:
+        from packaging.version import Version
+    except ImportError:
+        from pip._vendor.packaging.version import Version
+    if installed is None:
+        return True
+    return Version(latest) > Version(installed)
+
+
 def check_and_update_runtime_packages(script_directory: Path) -> dict[str, object]:
     print("SOFTWARE_VERSION_CHECK_START")
+    print("SOFTWARE_CHECK_METHOD=PYPI_JSON_THEN_PIP_ONLY_IF_UPDATE_REQUIRED")
     before = installed_package_versions()
     print(
         "SOFTWARE_VERSIONS_BEFORE="
         + json.dumps(before, ensure_ascii=False, sort_keys=True)
     )
-    completed = run_command(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--upgrade",
-            "--upgrade-strategy",
-            "only-if-needed",
-            "--disable-pip-version-check",
-            "--timeout",
-            "30",
-            *RUNTIME_PACKAGES,
-        ],
-        cwd=script_directory,
-        timeout_seconds=900,
+
+    latest: dict[str, str] = {}
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(RUNTIME_PACKAGES)
+    ) as executor:
+        futures = {
+            executor.submit(fetch_latest_pypi_version, package): package
+            for package in RUNTIME_PACKAGES
+        }
+        for future in concurrent.futures.as_completed(futures):
+            package = futures[future]
+            latest[package] = future.result()
+
+    latest = {package: latest[package] for package in RUNTIME_PACKAGES}
+    outdated = [
+        package
+        for package in RUNTIME_PACKAGES
+        if version_is_newer(latest[package], before.get(package))
+    ]
+    print(
+        "SOFTWARE_LATEST_VERSIONS="
+        + json.dumps(latest, ensure_ascii=False, sort_keys=True)
     )
-    if completed.returncode != 0:
-        details = completed.stderr.strip() or completed.stdout.strip()
-        raise TranscriptionError(
-            "The latest transcription software could not be checked or installed. "
-            + details
+    print(
+        "SOFTWARE_UPDATE_REQUIRED="
+        + (",".join(outdated) if outdated else "NONE")
+    )
+
+    if outdated:
+        completed = run_command(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--upgrade",
+                "--upgrade-strategy",
+                "only-if-needed",
+                "--disable-pip-version-check",
+                "--timeout",
+                "30",
+                *outdated,
+            ],
+            cwd=script_directory,
+            timeout_seconds=900,
         )
+        if completed.returncode != 0:
+            details = completed.stderr.strip() or completed.stdout.strip()
+            raise TranscriptionError(
+                "Newer transcription software was found but could not be installed. "
+                + details
+            )
+
     after = installed_package_versions()
     changed = {
         package: {"before": before.get(package), "after": after.get(package)}
@@ -443,7 +508,14 @@ def check_and_update_runtime_packages(script_directory: Path) -> dict[str, objec
         )
     )
     print("SOFTWARE_VERSION_CHECK_RESULT=PASS")
-    return {"before": before, "after": after, "updated": changed}
+    return {
+        "check_method": "pypi_json_then_pip_only_if_update_required",
+        "before": before,
+        "latest": latest,
+        "update_required": outdated,
+        "after": after,
+        "updated": changed,
+    }
 
 
 def model_files_are_complete(model_directory: Path) -> bool:
@@ -795,6 +867,107 @@ def correct_repeated_english_variants(
             unresolved += 1
 
     return corrected, corrections, unresolved
+
+
+def recover_repeated_section_examples(
+    baseline_text: str,
+    audit_text: str,
+) -> list[dict[str, object]]:
+    baseline_candidates = split_english_candidates(baseline_text)
+    audit_candidates = split_english_candidates(audit_text)
+    clusters: list[list[tuple[int, str]]] = []
+
+    for position, candidate in enumerate(audit_candidates):
+        normalized = normalize_for_comparison(candidate)
+        best_index: int | None = None
+        best_ratio = 0.0
+        for index, cluster in enumerate(clusters):
+            ratio = SequenceMatcher(
+                None,
+                normalized,
+                normalize_for_comparison(cluster[0][1]),
+            ).ratio()
+            if ratio > best_ratio:
+                best_index = index
+                best_ratio = ratio
+        if best_index is not None and best_ratio >= 0.90:
+            clusters[best_index].append((position, candidate))
+        else:
+            clusters.append([(position, candidate)])
+
+    recovered: list[dict[str, object]] = []
+    for cluster in clusters:
+        if len(cluster) < 2:
+            continue
+        normalized_counts = Counter(
+            normalize_for_comparison(candidate)
+            for _position, candidate in cluster
+        )
+        canonical_normalized, occurrence_count = max(
+            normalized_counts.items(),
+            key=lambda item: (item[1], len(item[0])),
+        )
+        if occurrence_count < 2:
+            continue
+        matching = [
+            (position, candidate)
+            for position, candidate in cluster
+            if normalize_for_comparison(candidate) == canonical_normalized
+        ]
+        first_position = min(position for position, _candidate in matching)
+        canonical = max((candidate for _position, candidate in matching), key=len)
+        words = english_words(canonical)
+        compact = re.sub(r"\s+", "", canonical)
+        if not 5 <= len(words) <= 28 or not compact:
+            continue
+        if latin_character_count(canonical) / len(compact) < 0.82:
+            continue
+        if any(section.lower() in canonical.lower() for section in STRICT_SECTION_ALIASES):
+            continue
+        if any(
+            SequenceMatcher(
+                None,
+                canonical_normalized,
+                normalize_for_comparison(existing),
+            ).ratio()
+            >= 0.84
+            for existing in baseline_candidates
+        ):
+            continue
+        recovered.append(
+            {
+                "text": canonical,
+                "occurrences": occurrence_count,
+                "first_position": first_position,
+                "evidence": "repeated_in_forced_english_section_audit",
+            }
+        )
+
+    recovered.sort(key=lambda item: int(item["first_position"]))
+    return recovered
+
+
+def insert_recovered_examples(
+    text: str,
+    recovered_examples: list[dict[str, object]],
+) -> str:
+    if not recovered_examples:
+        return text
+    recovered_lines: list[str] = []
+    for item in recovered_examples:
+        sentence = str(item["text"]).strip()
+        occurrences = max(1, int(item["occurrences"]))
+        recovered_lines.extend(sentence for _index in range(occurrences))
+    insertion = "\n".join(recovered_lines).strip()
+    if not insertion:
+        return text
+
+    match = re.search(r"(?mi)^Practical Usage\s*$", text)
+    if match is None:
+        return text.rstrip() + "\n\n" + insertion + "\n"
+    before = text[:match.start()].rstrip()
+    after = text[match.start():].lstrip()
+    return before + "\n\n" + insertion + "\n\n" + after
 
 
 def anchor_exact_hits(text: str, anchors: Iterable[str]) -> int:
@@ -1707,7 +1880,7 @@ def run_child() -> int:
             print("TRANSCRIPTION_MODE=BATCHED_TURBO_GUARDED_OPENING_AND_SECTION_AUDIT")
             print("PRIMARY_POLICY=FAST_BATCHED_VAD_FULL_PROGRAM_PASS")
             print("OPENING_AUDIT_POLICY=NO_VAD_ADD_COVERAGE_ONLY_WITH_CONTENT_GUARDS")
-            print("SECTION_AUDIT_POLICY=ESSENTIAL_EXPRESSIONS_NO_VAD_ONLY_WHEN_EXAMPLES_ARE_SPARSE")
+            print("SECTION_AUDIT_POLICY=FORCED_ENGLISH_NO_VAD_RECOVER_REPEATED_MISSING_EXAMPLES_ONLY")
             print("REPEATED_ENGLISH_POLICY=WITHIN_RECORDING_MAJORITY_CONSENSUS_ONLY")
             print("COMPLEMENTARY_LANGUAGE_RECOVERY=DISABLED_NO_MEASURABLE_GAIN")
             print("LARGE_V3_POLICY=RARE_STRONG_ANOMALIES_ONLY")
@@ -1832,6 +2005,7 @@ def run_child() -> int:
 
             timer.start("essential_section_no_vad_audit")
             section_decision: SectionAuditDecision | None = None
+            section_recovered_examples: list[dict[str, object]] = []
             post_section_segments = list(post_opening_segments)
             section_interval = find_section_interval(
                 post_opening_segments,
@@ -1858,8 +2032,8 @@ def run_child() -> int:
                         audio,
                         start=audit_start,
                         end=audit_end,
-                        language=requested_language,
-                        source="turbo_essential_no_vad",
+                        language="en",
+                        source="turbo_essential_forced_en_no_vad",
                         beam_size=5,
                     )
                     section_audit_segments = segments_between(
@@ -1875,6 +2049,16 @@ def run_child() -> int:
                         section_start,
                         section_end,
                     )
+                    section_recovered_examples = recover_repeated_section_examples(
+                        baseline_section_text,
+                        section_decision.audit_text,
+                    )
+                    section_decision.accepted = bool(section_recovered_examples)
+                    section_decision.reason = (
+                        "repeated_english_examples_recovered"
+                        if section_recovered_examples
+                        else "no_safe_repeated_english_examples"
+                    )
                     print(
                         "SECTION_AUDIT_DECISION "
                         f"ACCEPTED={'YES' if section_decision.accepted else 'NO'} "
@@ -1885,14 +2069,16 @@ def run_child() -> int:
                         f"TOKEN_RECALL={section_decision.token_recall:.3f} "
                         f"BASELINE_EXAMPLES={section_decision.baseline_english_candidates} "
                         f"AUDIT_EXAMPLES={section_decision.audit_english_candidates} "
+                        f"RECOVERED_EXAMPLES={len(section_recovered_examples)} "
                         f"REASON={section_decision.reason}"
                     )
-                    if section_decision.accepted:
-                        post_section_segments = apply_section_audit(
-                            post_opening_segments,
-                            section_audit_segments,
-                            section_start,
-                            section_end,
+                    for example_index, item in enumerate(
+                        section_recovered_examples,
+                        start=1,
+                    ):
+                        print(
+                            f"SECTION_RECOVERED_EXAMPLE_{example_index:02d}="
+                            f"{item['text']} | OCCURRENCES={item['occurrences']}"
                         )
                 else:
                     print("SECTION_AUDIT_DECISION=SKIPPED_SUFFICIENT_ENGLISH_COVERAGE")
@@ -1996,7 +2182,15 @@ def run_child() -> int:
             final_text, consensus_corrections, unresolved_variant_clusters = (
                 correct_repeated_english_variants(final_text)
             )
+            final_text = insert_recovered_examples(
+                final_text,
+                section_recovered_examples,
+            )
             print(f"CONSENSUS_CORRECTIONS_APPLIED={len(consensus_corrections)}")
+            print(
+                f"SECTION_RECOVERED_EXAMPLES_INSERTED="
+                f"{len(section_recovered_examples)}"
+            )
             print(f"REPEATED_VARIANT_CLUSTERS_UNRESOLVED={unresolved_variant_clusters}")
             final_indicators = transcript_indicators(
                 final_text,
@@ -2013,10 +2207,12 @@ def run_child() -> int:
                 baseline_indicators,
                 final_indicators,
             )
-            if consensus_corrections:
+            if consensus_corrections and section_recovered_examples:
+                effect = "MEASURABLE_EXAMPLE_RECOVERY_AND_CONSENSUS_CORRECTION"
+            elif consensus_corrections:
                 effect = "MEASURABLE_CONSENSUS_CORRECTION"
-            elif section_decision is not None and section_decision.accepted:
-                effect = "SECTION_COVERAGE_GAIN"
+            elif section_recovered_examples:
+                effect = "MEASURABLE_REPEATED_EXAMPLE_RECOVERY"
             elif effect == "MEASURABLE_GAIN":
                 effect = "COVERAGE_CHANGE_NOT_ACCURACY_MEASUREMENT"
             timer.finish()
@@ -2054,7 +2250,7 @@ def run_child() -> int:
                     "metrics": str(output_paths.metrics),
                 },
                 "configuration": {
-                    "mode": "batched_turbo_guarded_opening_and_section_audit",
+                    "mode": "batched_turbo_guarded_opening_and_repeated_example_recovery",
                     "language": arguments.language,
                     "batch_size_requested": arguments.batch_size,
                     "batch_size_used": batch_size_used,
@@ -2074,6 +2270,12 @@ def run_child() -> int:
                 "baseline": baseline_indicators,
                 "opening_audit": opening_decision_to_dict(opening_decision),
                 "essential_section_audit": section_decision_to_dict(section_decision),
+                "essential_section_recovery": {
+                    "forced_language": "en",
+                    "recovered_example_count": len(section_recovered_examples),
+                    "recovered_examples": section_recovered_examples,
+                    "merge_policy": "append_repeated_missing_examples_without_replacing_baseline_section",
+                },
                 "repeated_english_consensus": {
                     "correction_count": len(consensus_corrections),
                     "corrections": consensus_corrections,
@@ -2113,7 +2315,10 @@ def run_child() -> int:
                     "effect": effect,
                     "opening_audit_accepted": opening_accepted,
                     "essential_section_audit_accepted": bool(
-                        section_decision and section_decision.accepted
+                        section_recovered_examples
+                    ),
+                    "essential_section_recovered_examples": len(
+                        section_recovered_examples
                     ),
                     "consensus_corrections_applied": len(consensus_corrections),
                     "large_v3_repairs_accepted": accepted_repairs,
@@ -2145,9 +2350,33 @@ def run_child() -> int:
                 },
                 "timings": timer.steps,
             }
+            total_seconds = timer.total_seconds
+            startup_seconds = sum(
+                timer.seconds_for(name)
+                for name in (
+                    "check_and_update_software",
+                    "import_transcription_libraries",
+                    "check_model_revisions",
+                    "validate_environment",
+                    "decode_audio",
+                    "load_primary_model",
+                )
+            )
+            core_processing_seconds = (
+                primary_seconds + opening_seconds + section_seconds + repair_seconds
+            )
+            performance_class = (
+                "FAST"
+                if total_seconds / audio_seconds <= 0.10
+                else "MODERATE"
+                if total_seconds / audio_seconds <= 0.20
+                else "SLOW"
+            )
+            metrics["performance"]["startup_seconds"] = startup_seconds
+            metrics["performance"]["core_processing_seconds"] = core_processing_seconds
+            metrics["performance"]["performance_class"] = performance_class
             write_json_atomically(output_paths.metrics, metrics)
 
-            total_seconds = timer.total_seconds
             print("TRANSCRIPTION_RESULT=PASS")
             print(f"OUTPUT_FILE={output_paths.transcript}")
             print(f"LOG_FILE={output_paths.log}")
@@ -2160,12 +2389,15 @@ def run_child() -> int:
                 f"SECONDARY_SECONDS="
                 f"{opening_seconds + section_seconds + repair_seconds:.3f}"
             )
+            print(f"STARTUP_SECONDS={startup_seconds:.3f}")
+            print(f"CORE_PROCESSING_SECONDS={core_processing_seconds:.3f}")
             print(f"TOTAL_SECONDS={total_seconds:.3f}")
+            print(f"PERFORMANCE_CLASS={performance_class}")
             print(f"TOTAL_PROCESS_REALTIME_FACTOR={total_seconds / audio_seconds:.4f}")
             print(f"OPENING_AUDIT_ACCEPTED={'YES' if opening_accepted else 'NO'}")
             print(
                 f"ESSENTIAL_SECTION_AUDIT_ACCEPTED="
-                f"{'YES' if section_decision and section_decision.accepted else 'NO'}"
+                f"{'YES' if section_recovered_examples else 'NO'}"
             )
             print(f"LARGE_V3_WINDOWS_PROCESSED={len(repair_windows)}")
             print(f"LARGE_V3_REPAIRS_ACCEPTED={accepted_repairs}")
