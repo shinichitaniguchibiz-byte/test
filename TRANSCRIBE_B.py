@@ -28,7 +28,7 @@ DEFAULT_INPUT_FILE = "b.m4a"
 DEFAULT_OUTPUT_DIRECTORY = "stt_test"
 DEFAULT_BATCH_SIZE = 8
 DEFAULT_OPENING_AUDIT_SECONDS = 210.0
-DEFAULT_MAX_REPAIR_WINDOWS = 1
+DEFAULT_MAX_REPAIR_WINDOWS = 0
 OPENING_AUDIT_PADDING_SECONDS = 2.5
 SECTION_AUDIT_PADDING_SECONDS = 2.0
 SECTION_CHUNK_SECONDS = 20.0
@@ -40,6 +40,7 @@ V15_PATCH_APPLIED = True
 V16_PATCH_APPLIED = True
 V17_PATCH_APPLIED = True
 V18_PATCH_APPLIED = True
+V20_PATCH_APPLIED = True
 JST = timezone(timedelta(hours=9), name="JST")
 
 RUNTIME_PACKAGES = (
@@ -2817,10 +2818,761 @@ def run_child() -> int:
             timer.print_summary(overall_result)
 
 
+
+V20_MIN_GAP_SECONDS = 1.0
+V20_MAX_GAP_SECONDS = 22.0
+V20_GAP_PADDING_A = 1.0
+V20_GAP_PADDING_B = 2.0
+V20_MIN_ENGLISH_WORDS = 4
+V20_MAX_ENGLISH_WORDS = 36
+V20_MIN_LATIN_RATIO = 0.82
+V20_MIN_CONSENSUS_SIMILARITY = 0.82
+V20_MIN_AVG_LOGPROB = -0.72
+V20_SECTION_GAP_LIMITS = {
+    'Grammar and Vocabulary': 1,
+    'Essential Expressions': 4,
+    'Practical Usage': 2,
+}
+V20_PREVIOUS_RUNS = {
+    'v14_total_seconds': 52.528,
+    'v16_total_seconds': 108.805,
+    'v18_total_seconds': 105.937,
+    'v19_total_seconds': 491.729,
+    'v19_pass_a_seconds': 57.119,
+    'v19_full_coverage_seconds': 85.193,
+    'v19_turbo_gap_seconds': 73.077,
+    'v19_large_v3_gap_seconds': 227.397,
+}
+
+
+def language_label_v20(text: str) -> str:
+    japanese = japanese_character_count(text)
+    latin = latin_character_count(text)
+    if japanese and latin:
+        return 'mixed'
+    if japanese:
+        return 'ja'
+    if latin:
+        return 'en'
+    return 'unknown'
+
+
+def opening_audit_needed_v20(segments: list[SegmentRecord], core_end: float) -> tuple[bool, dict[str, object]]:
+    opening = segments_before(segments, core_end)
+    text = format_transcript(opening) if opening else ''
+    english_candidates = split_english_candidates(text)
+    diagnostics = {
+        'segment_count': len(opening),
+        'text_characters': len(text),
+        'japanese_characters': japanese_character_count(text),
+        'latin_characters': latin_character_count(text),
+        'english_candidate_count': len(english_candidates),
+        'strong_event_count': len(detect_strong_events(opening)),
+    }
+    sufficient = (
+        len(opening) >= 8
+        and len(text) >= 500
+        and diagnostics['japanese_characters'] >= 120
+        and diagnostics['latin_characters'] >= 250
+        and len(english_candidates) >= 5
+        and diagnostics['strong_event_count'] == 0
+    )
+    diagnostics['decision'] = 'SKIP_SUFFICIENT_BASELINE' if sufficient else 'RUN_AUDIT'
+    return (not sufficient), diagnostics
+
+
+def section_intervals_v20(
+    segments: list[SegmentRecord],
+    audio_seconds: float,
+) -> dict[str, tuple[float, float]]:
+    first_hits: dict[str, float] = {}
+    for segment in sorted(segments, key=lambda item: (item.start, item.end)):
+        hits = strict_section_hits(segment.text)
+        for name, hit in hits.items():
+            if hit and name not in first_hits:
+                first_hits[name] = segment.start
+    order = [
+        'Grammar and Vocabulary',
+        'Essential Expressions',
+        'Practical Usage',
+        'Pronunciation Polish',
+    ]
+    intervals: dict[str, tuple[float, float]] = {}
+    for index, name in enumerate(order[:-1]):
+        start = first_hits.get(name)
+        end = first_hits.get(order[index + 1])
+        if start is None or end is None or end <= start:
+            continue
+        intervals[name] = (max(0.0, start), min(audio_seconds, end))
+    return intervals
+
+
+def gap_energy_dbfs_v20(audio: object, start: float, end: float) -> float:
+    import numpy as np
+    start_sample = max(0, int(start * SAMPLE_RATE))
+    end_sample = min(len(audio), int(end * SAMPLE_RATE))
+    if end_sample <= start_sample:
+        return -120.0
+    values = np.asarray(audio[start_sample:end_sample], dtype=np.float32)
+    if values.size == 0:
+        return -120.0
+    rms = float(np.sqrt(np.mean(values * values) + 1e-12))
+    return 20.0 * math.log10(max(rms, 1e-12))
+
+
+def targeted_gap_plan_v20(
+    segments: list[SegmentRecord],
+    audio: object,
+    audio_seconds: float,
+) -> list[dict[str, object]]:
+    intervals = section_intervals_v20(segments, audio_seconds)
+    plan: list[dict[str, object]] = []
+    ordered_segments = sorted(segments, key=lambda item: (item.start, item.end))
+    for section_name, limit in V20_SECTION_GAP_LIMITS.items():
+        interval = intervals.get(section_name)
+        if interval is None:
+            continue
+        section_start, section_end = interval
+        section_segments = [
+            item for item in ordered_segments
+            if item.end >= section_start and item.start <= section_end
+        ]
+        candidates: list[dict[str, object]] = []
+        for left, right in zip(section_segments, section_segments[1:]):
+            gap_start = max(section_start, left.end)
+            gap_end = min(section_end, right.start)
+            gap_seconds = gap_end - gap_start
+            if not V20_MIN_GAP_SECONDS <= gap_seconds <= V20_MAX_GAP_SECONDS:
+                continue
+            energy = gap_energy_dbfs_v20(audio, gap_start, gap_end)
+            if energy < -46.0:
+                continue
+            candidates.append({
+                'section': section_name,
+                'start': gap_start,
+                'end': gap_end,
+                'seconds': gap_seconds,
+                'energy_dbfs': energy,
+                'left_text': left.text,
+                'right_text': right.text,
+            })
+        candidates.sort(
+            key=lambda item: (
+                -float(item['seconds']),
+                -float(item['energy_dbfs']),
+                float(item['start']),
+            )
+        )
+        selected = sorted(candidates[:limit], key=lambda item: float(item['start']))
+        plan.extend(selected)
+    return plan
+
+
+def candidate_sentences_v20(segments: list[SegmentRecord]) -> list[dict[str, object]]:
+    results: list[dict[str, object]] = []
+    for segment in segments:
+        pieces = split_english_candidates(segment.text)
+        if not pieces:
+            pieces = [clean_text(segment.text)]
+        for piece in pieces:
+            words = english_words(piece)
+            compact = re.sub(r'\s+', '', piece)
+            if not V20_MIN_ENGLISH_WORDS <= len(words) <= V20_MAX_ENGLISH_WORDS:
+                continue
+            if not compact:
+                continue
+            if latin_character_count(piece) / len(compact) < V20_MIN_LATIN_RATIO:
+                continue
+            if segment.avg_logprob < V20_MIN_AVG_LOGPROB:
+                continue
+            if detect_decoder_loop(piece):
+                continue
+            results.append({
+                'text': clean_text(piece),
+                'normalized': normalize_for_comparison(piece),
+                'start': segment.start,
+                'end': segment.end,
+                'avg_logprob': segment.avg_logprob,
+                'source': segment.source,
+            })
+    return results
+
+
+def nearby_text_v20(
+    segments: list[SegmentRecord],
+    start: float,
+    end: float,
+    padding: float = 2.5,
+) -> str:
+    return ' '.join(
+        item.text for item in segments
+        if item.end >= start - padding and item.start <= end + padding
+    )
+
+
+def recover_targeted_gap_v20(
+    model: object,
+    audio: object,
+    gap: dict[str, object],
+    baseline_segments: list[SegmentRecord],
+    audio_seconds: float,
+    index: int,
+) -> tuple[SegmentRecord | None, dict[str, object]]:
+    gap_start = float(gap['start'])
+    gap_end = float(gap['end'])
+    pass_a = transcribe_slice(
+        model,
+        audio,
+        start=max(0.0, gap_start - V20_GAP_PADDING_A),
+        end=min(audio_seconds, gap_end + V20_GAP_PADDING_A),
+        language='en',
+        source=f'v20_gap_{index:02d}_a',
+        beam_size=3,
+        multilingual=False,
+    )
+    pass_b = transcribe_slice(
+        model,
+        audio,
+        start=max(0.0, gap_start - V20_GAP_PADDING_B),
+        end=min(audio_seconds, gap_end + V20_GAP_PADDING_B),
+        language='en',
+        source=f'v20_gap_{index:02d}_b',
+        beam_size=3,
+        multilingual=False,
+    )
+    candidates_a = candidate_sentences_v20(pass_a)
+    candidates_b = candidate_sentences_v20(pass_b)
+    best: tuple[float, dict[str, object], dict[str, object]] | None = None
+    for left in candidates_a:
+        for right in candidates_b:
+            similarity = SequenceMatcher(
+                None,
+                str(left['normalized']),
+                str(right['normalized']),
+            ).ratio()
+            if similarity < V20_MIN_CONSENSUS_SIMILARITY:
+                continue
+            score = (
+                similarity
+                + max(-1.0, float(left['avg_logprob'])) * 0.08
+                + max(-1.0, float(right['avg_logprob'])) * 0.08
+                + min(len(str(left['text'])), len(str(right['text']))) / 1000.0
+            )
+            if best is None or score > best[0]:
+                best = (score, left, right)
+
+    evidence: dict[str, object] = {
+        **gap,
+        'index': index,
+        'pass_a_candidates': candidates_a,
+        'pass_b_candidates': candidates_b,
+        'accepted': False,
+        'decision_reason': 'no_cross_boundary_consensus',
+    }
+    if best is None:
+        return None, evidence
+    _score, left, right = best
+    similarity = SequenceMatcher(
+        None,
+        str(left['normalized']),
+        str(right['normalized']),
+    ).ratio()
+    chosen = left if (
+        float(left['avg_logprob']), len(str(left['text']))
+    ) >= (
+        float(right['avg_logprob']), len(str(right['text']))
+    ) else right
+    nearby = nearby_text_v20(
+        baseline_segments,
+        gap_start,
+        gap_end,
+    )
+    nearby_similarity = SequenceMatcher(
+        None,
+        str(chosen['normalized']),
+        normalize_for_comparison(nearby),
+    ).ratio()
+    normalized_nearby = normalize_for_comparison(nearby)
+    if str(chosen['normalized']) in normalized_nearby:
+        evidence['decision_reason'] = 'already_present_nearby'
+        evidence['consensus_similarity'] = similarity
+        return None, evidence
+    if nearby_similarity >= 0.86:
+        evidence['decision_reason'] = 'close_variant_already_present_nearby'
+        evidence['consensus_similarity'] = similarity
+        evidence['nearby_similarity'] = nearby_similarity
+        return None, evidence
+    accepted = SegmentRecord(
+        start=max(gap_start, min(float(left['start']), float(right['start']))),
+        end=min(gap_end, max(float(left['end']), float(right['end']))),
+        text=str(chosen['text']),
+        avg_logprob=max(float(left['avg_logprob']), float(right['avg_logprob'])),
+        compression_ratio=0.0,
+        no_speech_prob=0.0,
+        source='turbo_targeted_gap_consensus',
+    )
+    if accepted.end <= accepted.start:
+        accepted.start = gap_start
+        accepted.end = gap_end
+    evidence.update({
+        'accepted': True,
+        'decision_reason': 'two_boundary_consensus_missing_from_nearby_baseline',
+        'consensus_similarity': similarity,
+        'nearby_similarity': nearby_similarity,
+        'selected_text': accepted.text,
+        'selected_start': accepted.start,
+        'selected_end': accepted.end,
+        'selected_avg_logprob': accepted.avg_logprob,
+    })
+    return accepted, evidence
+
+
+def regression_profile_v20(
+    input_file: Path,
+    audio_seconds: float,
+    segments: list[SegmentRecord],
+) -> dict[str, object]:
+    if input_file.name.lower() != 'b.m4a' or not 850.0 <= audio_seconds <= 870.0:
+        return {'status': 'NOT_APPLICABLE', 'profile': None, 'items': []}
+    checks = [
+        ("Dad's birthday is coming up next week", 20.0, 100.0),
+        ("We're not exactly great in the kitchen", 25.0, 230.0),
+        ("Suppose we asked Emily for advice", 390.0, 500.0),
+        ("Imagine we asked Emily for advice", 390.0, 510.0),
+        ("It might be a good idea for us to discuss this together", 410.0, 530.0),
+        ("Just an idea, but we could try leaving a little earlier tomorrow", 440.0, 540.0),
+        ("It might be a good idea for us to take a break for a while", 610.0, 735.0),
+        ("We've been at this for a long time", 610.0, 735.0),
+        ("We're all a bit tired", 610.0, 735.0),
+        ("What if we baked him a cake ourselves", 735.0, 830.0),
+    ]
+    items: list[dict[str, object]] = []
+    for phrase, start, end in checks:
+        expected = normalize_for_comparison(phrase)
+        region_text = ' '.join(
+            item.text for item in segments
+            if item.end >= start and item.start <= end
+        )
+        observed = normalize_for_comparison(region_text)
+        passed = expected in observed
+        items.append({
+            'phrase': phrase,
+            'start': start,
+            'end': end,
+            'passed': passed,
+        })
+    return {
+        'status': 'PASS' if all(item['passed'] for item in items) else 'FAIL',
+        'profile': 'lesson76_embedded_regression',
+        'scope': 'KNOWN_PHRASE_TIME_REGION_REGRESSION_NOT_ACCURACY_PERCENTAGE',
+        'items': items,
+        'passed_count': sum(bool(item['passed']) for item in items),
+        'total_count': len(items),
+    }
+
+
+def run_child_v20() -> int:
+    timer = StepTimer()
+    overall_result = 'FAILED'
+    arguments = parse_arguments()
+    script_directory = Path(__file__).resolve().parent
+    run_id = os.environ.get('TRANSCRIBE_RUN_ID') or datetime.now(JST).strftime('%Y%m%d_%H%M%S')
+    input_file = resolve_path(script_directory, arguments.input)
+    output_directory = resolve_path(script_directory, arguments.output_dir)
+    output_paths = make_output_paths(output_directory, run_id)
+    reference_file = resolve_path(script_directory, arguments.reference) if arguments.reference else None
+
+    with TeeContext(output_paths.log):
+        try:
+            print('RUN_START')
+            print(f'RUN_ID={run_id}')
+            print('TRANSCRIPTION_TRANSACTION=1')
+            print('TRANSCRIPTION_VERSION=20')
+            print('CONVERGENCE_POLICY=V18_CORE_PLUS_V19_TARGETED_RECOVERY_NO_GLOBAL_RESCAN')
+            print(f'TRANSCRIPT_FILE={output_paths.transcript}')
+            print(f'LOG_FILE={output_paths.log}')
+            print(f'METRICS_FILE={output_paths.metrics}')
+
+            timer.start('check_and_update_software')
+            software_metrics = check_and_update_runtime_packages(script_directory)
+            timer.finish()
+
+            timer.start('import_transcription_libraries')
+            import ctranslate2
+            import faster_whisper
+            _v20_faster_whisper_version = faster_whisper.__version__
+            print(f'FASTER_WHISPER={_v20_faster_whisper_version}')
+            from faster_whisper import BatchedInferencePipeline, WhisperModel
+            from faster_whisper.audio import decode_audio
+            timer.finish()
+
+            timer.start('check_primary_model_revision')
+            primary_model_information = check_model(
+                script_directory,
+                repository=PRIMARY_MODEL_REPOSITORY,
+                directory_name=PRIMARY_MODEL_DIRECTORY_NAME,
+                label='PRIMARY',
+                download_now=True,
+            )
+            timer.finish()
+
+            timer.start('validate_environment')
+            validate_environment(
+                input_file,
+                arguments.batch_size,
+                arguments.opening_audit_seconds,
+                0,
+                ctranslate2,
+            )
+            if reference_file is not None and not reference_file.is_file():
+                raise FileNotFoundError(f'Reference file was not found: {reference_file}')
+            timer.finish()
+
+            print('TRANSCRIPTION_CONFIGURATION')
+            print('TRANSCRIPTION_MODE=CONVERGED_FAST_PRIMARY_PLUS_TARGETED_GAP_CONSENSUS')
+            print('PRIMARY_PASS=FAST_BATCHED_VAD_FULL_AUDIO')
+            print('OPENING_AUDIT=CONDITIONAL_ONLY_IF_BASELINE_IS_SPARSE')
+            print('TARGETED_RECOVERY=GRAMMAR_ESSENTIAL_PRACTICAL_GAPS_ONLY')
+            print('TARGETED_RECOVERY_CONSENSUS=TWO_BOUNDARY_FORCED_ENGLISH')
+            print('FULL_AUDIO_SECOND_PASS=DISABLED')
+            print('LARGE_V3_AUTOMATIC_PASS=DISABLED')
+            print('CANDIDATES_IN_TRANSCRIPT=NO')
+            print('CANDIDATES_IN_METRICS=YES')
+            print('GLOBAL_CROSS_TIME_REPLACEMENT=DISABLED')
+            print('EDUCATIONAL_FORMATTING_APPLIED=NO')
+            print(f'INPUT={input_file}')
+
+            timer.start('decode_audio')
+            audio = decode_audio(str(input_file), sampling_rate=SAMPLE_RATE)
+            audio_seconds = len(audio) / SAMPLE_RATE
+            audio_signal = analyze_audio_signal(audio)
+            timer.finish()
+            print(f'AUDIO_SECONDS={audio_seconds:.3f}')
+            print(f'AUDIO_SIGNAL_QUALITY={audio_signal["quality_status"]}')
+
+            timer.start('load_primary_model')
+            primary_model = load_model(
+                WhisperModel,
+                Path(str(primary_model_information['directory'])),
+                'turbo',
+            )
+            timer.finish()
+            requested_language = None if arguments.language == 'auto' else arguments.language
+
+            timer.start('primary_batched_transcription')
+            baseline_segments, batch_size_used, detected_language = transcribe_batched_baseline(
+                primary_model,
+                BatchedInferencePipeline,
+                audio,
+                requested_language,
+                arguments.batch_size,
+            )
+            baseline_text = format_transcript(baseline_segments)
+            timer.finish()
+
+            timer.start('discover_repeated_content')
+            anchors = discover_repeated_anchors(baseline_segments)
+            baseline_indicators = transcript_indicators(baseline_text, baseline_segments, anchors)
+            timer.finish()
+
+            timer.start('conditional_opening_audit')
+            opening_decision: OpeningAuditDecision | None = None
+            post_opening_segments = list(baseline_segments)
+            core_end = opening_core_end(
+                baseline_segments,
+                arguments.opening_audit_seconds,
+                audio_seconds,
+            )
+            run_opening, opening_diagnostics = opening_audit_needed_v20(
+                baseline_segments,
+                core_end,
+            ) if core_end > 0 else (False, {'decision': 'DISABLED'})
+            if run_opening:
+                opening_slice = transcribe_slice(
+                    primary_model,
+                    audio,
+                    start=0.0,
+                    end=min(audio_seconds, core_end + OPENING_AUDIT_PADDING_SECONDS),
+                    language=requested_language,
+                    source='turbo_opening_no_vad',
+                    beam_size=5,
+                )
+                opening_slice = segments_before(opening_slice, core_end)
+                baseline_opening = segments_before(baseline_segments, core_end)
+                opening_decision = decide_opening_audit(
+                    baseline_opening,
+                    opening_slice,
+                    anchors,
+                    core_end,
+                )
+                if opening_decision.accepted:
+                    post_opening_segments = apply_opening_audit(
+                        baseline_segments,
+                        opening_slice,
+                        core_end,
+                    )
+            timer.finish()
+            print(f'OPENING_AUDIT_DECISION={opening_diagnostics["decision"]}')
+            print(
+                'OPENING_AUDIT_ACCEPTED='
+                + ('YES' if opening_decision and opening_decision.accepted else 'NO')
+            )
+
+            timer.start('targeted_gap_planning')
+            gap_plan = targeted_gap_plan_v20(
+                post_opening_segments,
+                audio,
+                audio_seconds,
+            )
+            timer.finish()
+            print(f'TARGETED_GAP_WINDOW_COUNT={len(gap_plan)}')
+
+            timer.start('targeted_gap_recovery')
+            recovered_segments: list[SegmentRecord] = []
+            gap_evidence: list[dict[str, object]] = []
+            for index, gap in enumerate(gap_plan, start=1):
+                print(
+                    f'TARGETED_GAP_START INDEX={index:02d} '
+                    f'SECTION={gap["section"]} '
+                    f'START={float(gap["start"]):.3f} '
+                    f'END={float(gap["end"]):.3f}'
+                )
+                recovered, evidence = recover_targeted_gap_v20(
+                    primary_model,
+                    audio,
+                    gap,
+                    post_opening_segments,
+                    audio_seconds,
+                    index,
+                )
+                gap_evidence.append(evidence)
+                if recovered is not None:
+                    recovered_segments.append(recovered)
+                    print(
+                        f'TARGETED_GAP_ACCEPTED INDEX={index:02d} '
+                        f'TEXT={recovered.text}'
+                    )
+                else:
+                    print(
+                        f'TARGETED_GAP_REJECTED INDEX={index:02d} '
+                        f'REASON={evidence["decision_reason"]}'
+                    )
+            timer.finish()
+
+            del primary_model
+            gc.collect()
+
+            timer.start('assemble_final_transcript')
+            final_segments = deduplicate_segments([
+                *post_opening_segments,
+                *recovered_segments,
+            ])
+            raw_final_text = format_transcript(final_segments)
+            final_text, consensus_corrections, unresolved_clusters = correct_repeated_english_variants(
+                raw_final_text
+            )
+            final_indicators = transcript_indicators(
+                final_text,
+                final_segments,
+                discover_repeated_anchors(final_segments),
+            )
+            language_counts = dict(
+                Counter(language_label_v20(item.text) for item in final_segments)
+            )
+            timer.finish()
+
+            timer.start('evaluate_regression_profile')
+            regression = regression_profile_v20(
+                input_file,
+                audio_seconds,
+                final_segments,
+            )
+            timer.finish()
+
+            timer.start('calculate_reference_metrics')
+            if reference_file is None:
+                reference_metrics: dict[str, object] = {'status': 'NOT_MEASURED'}
+            else:
+                reference_metrics = calculate_reference_metrics(
+                    reference_file.read_text(encoding='utf-8'),
+                    baseline_text,
+                    final_text,
+                )
+            timer.finish()
+
+            timer.start('write_transcript')
+            write_text_atomically(output_paths.transcript, final_text)
+            timer.finish()
+
+            primary_seconds = timer.seconds_for('primary_batched_transcription')
+            opening_seconds = timer.seconds_for('conditional_opening_audit')
+            planning_seconds = timer.seconds_for('targeted_gap_planning')
+            recovery_seconds = timer.seconds_for('targeted_gap_recovery')
+            startup_seconds = sum(
+                timer.seconds_for(name)
+                for name in (
+                    'check_and_update_software',
+                    'import_transcription_libraries',
+                    'check_primary_model_revision',
+                    'validate_environment',
+                    'decode_audio',
+                    'load_primary_model',
+                )
+            )
+            warm_core_seconds = primary_seconds + opening_seconds + planning_seconds + recovery_seconds
+            total_seconds = timer.total_seconds
+            realtime_factor = total_seconds / max(audio_seconds, 0.001)
+            warm_realtime_factor = warm_core_seconds / max(audio_seconds, 0.001)
+            performance_class = (
+                'FAST' if warm_realtime_factor <= 0.10
+                else 'ACCEPTABLE' if warm_realtime_factor <= 0.16
+                else 'SLOW'
+            )
+            quality_gate = (
+                'PASS'
+                if regression.get('status') in {'PASS', 'NOT_APPLICABLE'}
+                and not bool(final_indicators['decoder_loop'])
+                and int(final_indicators['replacement_characters']) == 0
+                else 'FAIL'
+            )
+
+            metrics = {
+                'run_id': run_id,
+                'created_at': datetime.now(JST).isoformat(),
+                'transaction': 1,
+                'version': 20,
+                'convergence': {
+                    'status': 'CANDIDATE_FOR_FINAL_ACCEPTANCE',
+                    'source_versions_combined': [14, 16, 18, 19],
+                    'previous_run_timings': V20_PREVIOUS_RUNS,
+                    'v19_components_removed': [
+                        'full_audio_no_vad_second_pass',
+                        'automatic_large_v3_gap_recovery',
+                        'candidate_text_in_main_transcript',
+                        'energy_gap_markers_in_main_transcript',
+                    ],
+                    'v19_components_retained': [
+                        'timestamp_targeted_gap_detection',
+                        'per_stage_timing',
+                        'embedded_regression_profile',
+                    ],
+                },
+                'input': str(input_file),
+                'output_files': {
+                    'transcript': str(output_paths.transcript),
+                    'log': str(output_paths.log),
+                    'metrics': str(output_paths.metrics),
+                },
+                'configuration': {
+                    'mode': 'fast_primary_conditional_opening_targeted_gap_consensus',
+                    'batch_size_requested': arguments.batch_size,
+                    'batch_size_used': batch_size_used,
+                    'opening_audit_seconds': arguments.opening_audit_seconds,
+                    'large_v3_automatic': False,
+                    'full_audio_second_pass': False,
+                    'candidate_text_written_to_transcript': False,
+                },
+                'software': software_metrics,
+                'model': primary_model_information,
+                'audio_seconds': audio_seconds,
+                'audio_signal': audio_signal,
+                'detected_language': detected_language,
+                'baseline': baseline_indicators,
+                'opening_audit': {
+                    'diagnostics': opening_diagnostics,
+                    'decision': opening_decision_to_dict(opening_decision),
+                },
+                'targeted_gap_recovery': {
+                    'planned_count': len(gap_plan),
+                    'accepted_count': len(recovered_segments),
+                    'plan': gap_plan,
+                    'evidence': gap_evidence,
+                    'accepted_segments': [
+                        {
+                            'start': item.start,
+                            'end': item.end,
+                            'text': item.text,
+                            'avg_logprob': item.avg_logprob,
+                            'source': item.source,
+                        }
+                        for item in recovered_segments
+                    ],
+                },
+                'repeated_english_consensus': {
+                    'correction_count': len(consensus_corrections),
+                    'corrections': consensus_corrections,
+                    'unresolved_cluster_count': unresolved_clusters,
+                },
+                'regression': regression,
+                'final': {
+                    **final_indicators,
+                    'language_segment_counts': language_counts,
+                },
+                'reference_accuracy': reference_metrics,
+                'quality_gate': {
+                    'status': quality_gate,
+                    'is_accuracy_percentage': False,
+                },
+                'performance': {
+                    'startup_seconds': startup_seconds,
+                    'primary_seconds': primary_seconds,
+                    'opening_audit_seconds': opening_seconds,
+                    'targeted_gap_planning_seconds': planning_seconds,
+                    'targeted_gap_recovery_seconds': recovery_seconds,
+                    'warm_core_seconds': warm_core_seconds,
+                    'total_seconds': total_seconds,
+                    'total_realtime_factor': realtime_factor,
+                    'warm_core_realtime_factor': warm_realtime_factor,
+                    'audio_minutes_per_processing_minute_total': audio_seconds / max(total_seconds, 0.001),
+                    'audio_minutes_per_processing_minute_warm': audio_seconds / max(warm_core_seconds, 0.001),
+                    'performance_class': performance_class,
+                },
+                'timings': timer.steps,
+            }
+            write_json_atomically(output_paths.metrics, metrics)
+
+            print('TRANSCRIPTION_RESULT=PASS')
+            print(f'OUTPUT_FILE={output_paths.transcript}')
+            print(f'LOG_FILE={output_paths.log}')
+            print(f'METRICS_FILE={output_paths.metrics}')
+            print(f'STARTUP_SECONDS={startup_seconds:.3f}')
+            print(f'PRIMARY_SECONDS={primary_seconds:.3f}')
+            print(f'OPENING_AUDIT_SECONDS={opening_seconds:.3f}')
+            print(f'TARGETED_GAP_PLANNING_SECONDS={planning_seconds:.3f}')
+            print(f'TARGETED_GAP_RECOVERY_SECONDS={recovery_seconds:.3f}')
+            print(f'WARM_CORE_SECONDS={warm_core_seconds:.3f}')
+            print(f'TOTAL_SECONDS={total_seconds:.3f}')
+            print(f'PERFORMANCE_CLASS={performance_class}')
+            print(f'TARGETED_GAPS_PLANNED={len(gap_plan)}')
+            print(f'TARGETED_GAPS_ACCEPTED={len(recovered_segments)}')
+            print(f'CONSENSUS_CORRECTIONS_APPLIED={len(consensus_corrections)}')
+            print(f'REGRESSION_STATUS={regression.get("status")}')
+            print(f'QUALITY_GATE={quality_gate}')
+            print('FULL_AUDIO_SECOND_PASS_USED=NO')
+            print('LARGE_V3_USED=NO')
+            print('CANDIDATE_TEXT_WRITTEN_TO_TRANSCRIPT=NO')
+            print('EDUCATIONAL_FORMATTING_APPLIED=NO')
+            overall_result = 'PASS'
+            return 0
+        except KeyboardInterrupt:
+            timer.fail_current()
+            print('TRANSCRIPTION_RESULT=CANCELLED', file=sys.stderr)
+            overall_result = 'CANCELLED'
+            return 130
+        except Exception as exception:
+            timer.fail_current()
+            print('TRANSCRIPTION_RESULT=FAILED', file=sys.stderr)
+            print(f'ERROR={type(exception).__name__}: {exception}', file=sys.stderr)
+            print(f'OUTPUT_FILE_NOT_CREATED={output_paths.transcript}', file=sys.stderr)
+            overall_result = 'FAILED'
+            return 1
+        finally:
+            timer.print_summary(overall_result)
+
 def main() -> int:
     script_directory = Path(__file__).resolve().parent
     ensure_stt_virtual_environment(script_directory)
-    return run_child()
+    return run_child_v20()
 
 
 if __name__ == "__main__":
