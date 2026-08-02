@@ -1,0 +1,104 @@
+name: Build Clean Transaction 1 v19
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/build_clean_v19.yml
+
+permissions:
+  contents: write
+
+jobs:
+  build-clean-v19:
+    if: github.head_ref == 'deliverables/20260802-transaction1-transcription-v19'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build the single-file v19 program
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          program_path = Path('TRANSCRIBE_B.py')
+          extension_path = Path('tools/v19_extension.txt')
+          source = program_path.read_text(encoding='utf-8')
+          extension = extension_path.read_text(encoding='utf-8').strip() + '\n\n'
+
+          if 'def run_child_v19()' not in source:
+              source = source.replace(
+                  'V18_PATCH_APPLIED = True\n',
+                  'V18_PATCH_APPLIED = True\nV19_PATCH_APPLIED = True\n',
+                  1,
+              )
+              marker = '\ndef main() -> int:\n'
+              if marker not in source:
+                  raise RuntimeError('main marker not found')
+              source = source.replace(marker, '\n' + extension + marker, 1)
+
+          old_main = '''def main() -> int:\n    script_directory = Path(__file__).resolve().parent\n    ensure_stt_virtual_environment(script_directory)\n    return run_child()\n'''
+          new_main = '''def main() -> int:\n    script_directory = Path(__file__).resolve().parent\n    ensure_stt_virtual_environment(script_directory)\n    return run_child_v19()\n'''
+          if old_main in source:
+              source = source.replace(old_main, new_main, 1)
+          elif 'return run_child_v19()' not in source:
+              raise RuntimeError('main body not found')
+
+          program_path.write_text(source, encoding='utf-8')
+          PY
+          python -m py_compile TRANSCRIBE_B.py
+      - name: Run pure-function validation
+        shell: bash
+        run: |
+          python - <<'PY'
+          import importlib.util
+          import sys
+          from pathlib import Path
+
+          spec = importlib.util.spec_from_file_location('transcribe_v19', Path('TRANSCRIBE_B.py'))
+          module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
+          assert spec.loader is not None
+          spec.loader.exec_module(module)
+
+          baseline = [module.SegmentRecord(0.0, 5.0, '日本語の説明です', -0.2, 1.0, 0.0, 'a')]
+          coverage = [module.SegmentRecord(1.0, 4.0, 'Suppose we asked Emily for advice.', -0.2, 1.0, 0.0, 'b')]
+          merged, additions, _ = module.merge_add_only_v19(baseline, coverage, stage='selftest')
+          assert len(merged) == 2
+          assert additions
+          assert module.classify_language_v19(coverage[0].text) == 'en'
+          gaps = module.subtract_intervals_v19([(0.0, 10.0)], [(0.0, 4.0), (6.0, 10.0)])
+          assert gaps == [(4.0, 6.0)]
+          marker = module.uncertain_marker_segments_v19([(4.0, 6.0)])[0]
+          assert '聞き取り不確実' in marker.text
+          benchmark = {
+              'status': 'CONFIGURED',
+              'items': [
+                  {
+                      'phrase': 'Suppose we asked Emily for advice.',
+                      'start': 0.0,
+                      'end': 10.0,
+                      'min_count': 1,
+                  }
+              ],
+          }
+          result = module.evaluate_benchmark_v19(benchmark, merged)
+          assert result['status'] == 'PASS'
+          print('V19_PURE_FUNCTION_SELFTEST=PASS')
+          PY
+      - name: Commit the validated program
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add TRANSCRIBE_B.py
+          git commit -m "Build validated Transaction 1 transcription v19"
+          git push origin HEAD:${{ github.head_ref }}
