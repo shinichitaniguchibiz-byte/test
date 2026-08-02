@@ -51,14 +51,10 @@ jobs:
           python -m pip install --quiet pyflakes 'ctranslate2==4.8.1' 'faster-whisper==1.2.1'
           pyflakes TRANSCRIBE_B.py
           python - <<'PY'
-          import inspect
           from pathlib import Path
-          from faster_whisper import WhisperModel
+          import ctranslate2
 
           source = Path('TRANSCRIBE_B.py').read_text(encoding='utf-8')
-          signature = inspect.signature(WhisperModel.__init__)
-          if 'flash_attention' not in signature.parameters:
-              raise SystemExit(f'WhisperModel does not accept flash_attention: {signature}')
           required = [
               'TRANSCRIPTION_VERSION = 22',
               'V22_PATCH_APPLIED = True',
@@ -70,8 +66,21 @@ jobs:
               raise SystemExit(f'missing v22 markers: {missing}')
           if 'use_flash_attention=' in source:
               raise SystemExit('obsolete argument still present')
+
+          try:
+              ctranslate2.models.Whisper(
+                  '/tmp/intentionally_missing_model',
+                  device='cpu',
+                  compute_type='default',
+                  flash_attention=False,
+              )
+          except TypeError as exc:
+              raise SystemExit(f'flash_attention constructor rejected: {exc}') from exc
+          except Exception as exc:
+              print(f'EXPECTED_MODEL_PATH_FAILURE={type(exc).__name__}: {exc}')
+
           print('V22_STATIC_VALIDATION=PASS')
-          print(f'WHISPER_MODEL_SIGNATURE={signature}')
+          print(f'CTRANSLATE2_VERSION={ctranslate2.__version__}')
           PY
       - name: Commit validated v22
         shell: bash
