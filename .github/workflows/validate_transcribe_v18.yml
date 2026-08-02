@@ -25,3 +25,7 @@ jobs:
           ! grep -q 'section_chunk_recovered_examples' TRANSCRIBE_B.py
           ! grep -q 'section_chunk_seconds' TRANSCRIBE_B.py
           ! grep -q 'SECTION_TARGET_RECOVERED_EXAMPLES' TRANSCRIBE_B.py
+      - name: Confirm final v18 invariants
+        run: |
+          grep -q 'V18_PATCH_APPLIED = True' TRANSCRIBE_B.py
+          grep -q 'timestamped_add_only_cross_window_consensus_never_replace_baseline' TRANSCRIBE_B.py
