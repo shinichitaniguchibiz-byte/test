@@ -6,6 +6,7 @@ import gc
 import importlib.metadata
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -30,13 +31,15 @@ DEFAULT_OPENING_AUDIT_SECONDS = 210.0
 DEFAULT_MAX_REPAIR_WINDOWS = 1
 OPENING_AUDIT_PADDING_SECONDS = 2.5
 SECTION_AUDIT_PADDING_SECONDS = 2.0
-SECTION_CHUNK_SECONDS = 32.0
-SECTION_CHUNK_OVERLAP_SECONDS = 4.0
-SECTION_TARGET_RECOVERED_EXAMPLES = 4
+SECTION_CHUNK_SECONDS = 20.0
+SECTION_CHUNK_OVERLAP_SECONDS = 10.0
+SECTION_EVENT_CLUSTER_SECONDS = 6.0
+SECTION_CROSS_WINDOW_MIN_SUPPORT = 2
 REPAIR_PADDING_SECONDS = 4.0
 V15_PATCH_APPLIED = True
 V16_PATCH_APPLIED = True
 V17_PATCH_APPLIED = True
+V18_PATCH_APPLIED = True
 JST = timezone(timedelta(hours=9), name="JST")
 
 RUNTIME_PACKAGES = (
@@ -68,7 +71,8 @@ MODEL_REQUIRED_FILES = (
 TRANSCRIPTION_GLOSSARY = (
     "Grammar and Vocabulary, Essential Expressions, Practical Usage, "
     "Pronunciation Polish, lesson, dialogue, key sentence, example, "
-    "pronunciation, 仮定法, 目的格, 不定詞, 意味上の主語, 現在進行形, "
+    "pronunciation, Suppose, Imagine, ask for advice, 仮定法, 目的格, 不定詞, "
+    "意味上の主語, 現在進行形, "
     "説明型オーバーラッピング, come out, not exactly, what if, for us"
 )
 
@@ -704,6 +708,61 @@ def segment_from_object(
     )
 
 
+def analyze_audio_signal(audio: object) -> dict[str, object]:
+    import numpy as np
+
+    samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if samples.size == 0:
+        raise TranscriptionError("The decoded audio contains no samples.")
+
+    absolute = np.abs(samples)
+    peak = float(np.max(absolute))
+    rms = float(np.sqrt(np.mean(samples * samples)))
+    clipped_ratio = float(np.mean(absolute >= 0.999))
+
+    frame_size = max(1, int(SAMPLE_RATE * 0.03))
+    frame_count = samples.size // frame_size
+    if frame_count > 0:
+        frames = samples[: frame_count * frame_size].reshape(frame_count, frame_size)
+        frame_rms = np.sqrt(np.mean(frames * frames, axis=1) + 1e-12)
+        frame_dbfs = 20.0 * np.log10(np.maximum(frame_rms, 1e-12))
+        low_level_frame_ratio = float(np.mean(frame_dbfs < -50.0))
+        p10_dbfs = float(np.percentile(frame_dbfs, 10))
+        p50_dbfs = float(np.percentile(frame_dbfs, 50))
+        p95_dbfs = float(np.percentile(frame_dbfs, 95))
+    else:
+        low_level_frame_ratio = 0.0
+        p10_dbfs = p50_dbfs = p95_dbfs = -120.0
+
+    peak_dbfs = 20.0 * math.log10(max(peak, 1e-12))
+    rms_dbfs = 20.0 * math.log10(max(rms, 1e-12))
+    flags: list[str] = []
+    if clipped_ratio > 0.001:
+        flags.append("clipping_detected")
+    if rms_dbfs < -35.0:
+        flags.append("low_recording_level")
+    if low_level_frame_ratio > 0.70:
+        flags.append("high_low_level_frame_ratio")
+    if p95_dbfs - p10_dbfs < 8.0:
+        flags.append("low_dynamic_range")
+
+    return {
+        "sample_rate": SAMPLE_RATE,
+        "sample_count": int(samples.size),
+        "peak_dbfs": round(peak_dbfs, 3),
+        "rms_dbfs": round(rms_dbfs, 3),
+        "clipped_sample_ratio": clipped_ratio,
+        "low_level_frame_ratio": low_level_frame_ratio,
+        "frame_dbfs_p10": round(p10_dbfs, 3),
+        "frame_dbfs_p50": round(p50_dbfs, 3),
+        "frame_dbfs_p95": round(p95_dbfs, 3),
+        "dynamic_range_p95_minus_p10_db": round(p95_dbfs - p10_dbfs, 3),
+        "quality_flags": flags,
+        "quality_status": "PASS" if not flags else "REVIEW",
+        "scope": "SIGNAL_LEVEL_DIAGNOSTIC_NOT_TRANSCRIPTION_ACCURACY",
+    }
+
+
 def normalize_for_comparison(text: str) -> str:
     return re.sub(r"[^0-9A-Za-zぁ-んァ-ヶ一-龯々]+", "", text.lower())
 
@@ -949,6 +1008,203 @@ def recover_repeated_section_examples(
 
     recovered.sort(key=lambda item: int(item["first_position"]))
     return recovered
+
+
+def recover_cross_window_section_examples(
+    baseline_text: str,
+    audit_segments: list[SegmentRecord],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    baseline_candidates = split_english_candidates(baseline_text)
+    observations: list[dict[str, object]] = []
+    for segment in audit_segments:
+        for candidate in split_english_candidates(segment.text):
+            words = english_words(candidate)
+            compact = re.sub(r"\s+", "", candidate)
+            if not 5 <= len(words) <= 24 or not compact:
+                continue
+            if latin_character_count(candidate) / len(compact) < 0.88:
+                continue
+            unique_ratio = len({word.lower() for word in words}) / len(words)
+            if unique_ratio < 0.45:
+                continue
+            observations.append(
+                {
+                    "text": candidate,
+                    "normalized": normalize_for_comparison(candidate),
+                    "start": segment.start,
+                    "end": segment.end,
+                    "midpoint": (segment.start + segment.end) / 2.0,
+                    "source": segment.source,
+                    "avg_logprob": segment.avg_logprob,
+                }
+            )
+
+    clusters: list[list[dict[str, object]]] = []
+    for observation in observations:
+        best_index: int | None = None
+        best_ratio = 0.0
+        for index, cluster in enumerate(clusters):
+            ratio = SequenceMatcher(
+                None,
+                str(observation["normalized"]),
+                str(cluster[0]["normalized"]),
+            ).ratio()
+            if ratio > best_ratio:
+                best_index = index
+                best_ratio = ratio
+        if best_index is not None and best_ratio >= 0.88:
+            clusters[best_index].append(observation)
+        else:
+            clusters.append([observation])
+
+    recovered: list[dict[str, object]] = []
+    evidence_log: list[dict[str, object]] = []
+    for cluster_index, cluster in enumerate(clusters):
+        variant_counts = Counter(clean_text(str(item["text"])) for item in cluster)
+        canonical = max(
+            variant_counts,
+            key=lambda value: (variant_counts[value], len(value)),
+        )
+        canonical_normalized = normalize_for_comparison(canonical)
+        matching = [
+            item
+            for item in cluster
+            if SequenceMatcher(
+                None,
+                canonical_normalized,
+                str(item["normalized"]),
+            ).ratio()
+            >= 0.90
+        ]
+        matching.sort(key=lambda item: float(item["midpoint"]))
+
+        temporal_events: list[list[dict[str, object]]] = []
+        for item in matching:
+            midpoint = float(item["midpoint"])
+            if (
+                not temporal_events
+                or midpoint
+                - sum(float(value["midpoint"]) for value in temporal_events[-1])
+                / len(temporal_events[-1])
+                > SECTION_EVENT_CLUSTER_SECONDS
+            ):
+                temporal_events.append([item])
+            else:
+                temporal_events[-1].append(item)
+
+        distinct_sources = {str(item["source"]) for item in matching}
+        supported_events = [
+            event
+            for event in temporal_events
+            if len({str(item["source"]) for item in event})
+            >= SECTION_CROSS_WINDOW_MIN_SUPPORT
+        ]
+        evidence_type = "cross_window_same_utterance"
+        if not supported_events and len(temporal_events) >= 2 and len(distinct_sources) >= 2:
+            supported_events = temporal_events
+            evidence_type = "same_sentence_repeated_at_separate_times"
+
+        average_probability = (
+            sum(float(item["avg_logprob"]) for item in matching) / len(matching)
+            if matching
+            else -10.0
+        )
+        existing_similarity = max(
+            (
+                SequenceMatcher(
+                    None,
+                    canonical_normalized,
+                    normalize_for_comparison(existing),
+                ).ratio()
+                for existing in baseline_candidates
+            ),
+            default=0.0,
+        )
+        accepted = bool(supported_events)
+        reason = "accepted"
+        if existing_similarity >= 0.84:
+            accepted = False
+            reason = "already_present_or_close_variant"
+        elif average_probability < -0.65:
+            accepted = False
+            reason = "low_cross_window_confidence"
+        elif not supported_events:
+            reason = "insufficient_independent_support"
+
+        event_records = []
+        for event in supported_events:
+            event_records.append(
+                {
+                    "start": min(float(item["start"]) for item in event),
+                    "end": max(float(item["end"]) for item in event),
+                    "window_support": len(
+                        {str(item["source"]) for item in event}
+                    ),
+                    "sources": sorted(
+                        {str(item["source"]) for item in event}
+                    ),
+                    "avg_logprob": (
+                        sum(float(item["avg_logprob"]) for item in event)
+                        / len(event)
+                    ),
+                }
+            )
+
+        evidence = {
+            "cluster_index": cluster_index,
+            "text": canonical,
+            "observation_count": len(matching),
+            "distinct_window_count": len(distinct_sources),
+            "temporal_event_count": len(temporal_events),
+            "supported_event_count": len(supported_events),
+            "average_logprob": round(average_probability, 6),
+            "existing_similarity": round(existing_similarity, 6),
+            "accepted": accepted,
+            "decision_reason": reason,
+            "evidence_type": evidence_type,
+            "events": event_records,
+        }
+        evidence_log.append(evidence)
+        if not accepted:
+            continue
+        recovered.append(
+            {
+                "text": canonical,
+                "occurrences": len(event_records),
+                "first_position": int(min(event["start"] for event in event_records) * 1000),
+                "evidence": evidence_type,
+                "average_logprob": average_probability,
+                "events": event_records,
+            }
+        )
+
+    recovered.sort(key=lambda item: int(item["first_position"]))
+    return recovered, evidence_log
+
+
+def recovered_examples_to_segments(
+    recovered_examples: list[dict[str, object]],
+) -> list[SegmentRecord]:
+    segments: list[SegmentRecord] = []
+    for example_index, item in enumerate(recovered_examples):
+        text = str(item["text"]).strip()
+        for event_index, event in enumerate(item.get("events", [])):
+            event_data = dict(event)
+            segments.append(
+                SegmentRecord(
+                    start=float(event_data["start"]),
+                    end=float(event_data["end"]),
+                    text=text,
+                    avg_logprob=float(event_data["avg_logprob"]),
+                    compression_ratio=0.0,
+                    no_speech_prob=0.0,
+                    source=(
+                        f"turbo_essential_dense_consensus_"
+                        f"{example_index:02d}_{event_index:02d}"
+                    ),
+                )
+            )
+    return segments
 
 
 def merge_recovered_examples(
@@ -1221,7 +1477,7 @@ def transcribe_chunked_english_section(
         chunk_end = min(end, cursor + SECTION_CHUNK_SECONDS)
         window_count += 1
         print(
-            f"SECTION_CHUNK_AUDIT_WINDOW={window_count:02d} "
+            f"SECTION_DENSE_AUDIT_WINDOW={window_count:02d} "
             f"START={cursor:.3f} END={chunk_end:.3f}"
         )
         records.extend(
@@ -1231,7 +1487,7 @@ def transcribe_chunked_english_section(
                 start=cursor,
                 end=chunk_end,
                 language="en",
-                source="turbo_essential_chunked_forced_en",
+                source=f"turbo_essential_dense_en_w{window_count:02d}",
                 beam_size=3,
                 multilingual=False,
             )
@@ -1242,7 +1498,7 @@ def transcribe_chunked_english_section(
         if next_cursor <= cursor:
             next_cursor = cursor + 1.0
         cursor = next_cursor
-    return deduplicate_segments(records), window_count
+    return records, window_count
 
 
 def average_logprob(segments: Iterable[SegmentRecord]) -> float:
@@ -1962,7 +2218,8 @@ def run_child() -> int:
             print("TRANSCRIPTION_MODE=BATCHED_TURBO_GUARDED_OPENING_AND_SECTION_AUDIT")
             print("PRIMARY_POLICY=FAST_BATCHED_VAD_FULL_PROGRAM_PASS")
             print("OPENING_AUDIT_POLICY=NO_VAD_ADD_COVERAGE_ONLY_WITH_CONTENT_GUARDS")
-            print("SECTION_AUDIT_POLICY=FORCED_ENGLISH_FULL_THEN_CHUNKED_IF_RECOVERY_BELOW_TARGET")
+            print("SECTION_AUDIT_POLICY=DENSE_OVERLAPPED_FORCED_ENGLISH_CROSS_WINDOW_CONSENSUS")
+            print("SECTION_MERGE_POLICY=TIMESTAMPED_ADD_ONLY_NEVER_REPLACE_BASELINE")
             print("REPEATED_ENGLISH_POLICY=WITHIN_RECORDING_MAJORITY_CONSENSUS_ONLY")
             print("COMPLEMENTARY_LANGUAGE_RECOVERY=DISABLED_NO_MEASURABLE_GAIN")
             print("LARGE_V3_POLICY=RARE_STRONG_ANOMALIES_ONLY")
@@ -1988,8 +2245,16 @@ def run_child() -> int:
             timer.start("decode_audio")
             audio = decode_audio(str(input_file), sampling_rate=SAMPLE_RATE)
             audio_seconds = len(audio) / SAMPLE_RATE
+            audio_signal = analyze_audio_signal(audio)
             timer.finish()
             print(f"AUDIO_SECONDS={audio_seconds:.3f}")
+            print(f"AUDIO_SIGNAL_QUALITY={audio_signal['quality_status']}")
+            print(f"AUDIO_SIGNAL_RMS_DBFS={audio_signal['rms_dbfs']}")
+            print(f"AUDIO_SIGNAL_PEAK_DBFS={audio_signal['peak_dbfs']}")
+            print(
+                "AUDIO_SIGNAL_FLAGS="
+                + json.dumps(audio_signal["quality_flags"], ensure_ascii=False)
+            )
 
             timer.start("load_primary_model")
             primary_model = load_model(
@@ -2085,12 +2350,12 @@ def run_child() -> int:
                 print("OPENING_AUDIT_DECISION=NOT_RUN")
             timer.finish()
 
-            timer.start("essential_section_no_vad_audit")
+            timer.start("essential_section_dense_english_audit")
             section_decision: SectionAuditDecision | None = None
             section_recovered_examples: list[dict[str, object]] = []
-            section_chunk_recovered_examples: list[dict[str, object]] = []
-            section_chunk_seconds = 0.0
-            section_chunk_windows = 0
+            section_recovery_evidence: list[dict[str, object]] = []
+            section_dense_seconds = 0.0
+            section_dense_windows = 0
             post_section_segments = list(post_opening_segments)
             section_interval = find_section_interval(
                 post_opening_segments,
@@ -2109,102 +2374,70 @@ def run_child() -> int:
                     if baseline_section_segments
                     else ""
                 )
-                if len(split_english_candidates(baseline_section_text)) < 6:
-                    audit_start = max(0.0, section_start - SECTION_AUDIT_PADDING_SECONDS)
-                    audit_end = min(audio_seconds, section_end + SECTION_AUDIT_PADDING_SECONDS)
-                    section_audit_slice = transcribe_slice(
-                        primary_model,
-                        audio,
-                        start=audit_start,
-                        end=audit_end,
-                        language="en",
-                        source="turbo_essential_forced_en_no_vad",
-                        beam_size=5,
+                if len(split_english_candidates(baseline_section_text)) < 8:
+                    dense_started = time.perf_counter()
+                    dense_segments, section_dense_windows = (
+                        transcribe_chunked_english_section(
+                            primary_model,
+                            audio,
+                            start=max(0.0, section_start - SECTION_AUDIT_PADDING_SECONDS),
+                            end=min(audio_seconds, section_end + SECTION_AUDIT_PADDING_SECONDS),
+                        )
                     )
-                    section_audit_segments = segments_between(
-                        section_audit_slice,
-                        section_start,
-                        section_end,
-                    )
+                    section_dense_seconds = time.perf_counter() - dense_started
+                    dense_deduplicated = deduplicate_segments(dense_segments)
                     section_decision = decide_section_audit(
                         "Essential Expressions",
                         baseline_section_segments,
-                        section_audit_segments,
+                        dense_deduplicated,
                         anchors,
                         section_start,
                         section_end,
                     )
-                    section_recovered_examples = recover_repeated_section_examples(
+                    (
+                        section_recovered_examples,
+                        section_recovery_evidence,
+                    ) = recover_cross_window_section_examples(
                         baseline_section_text,
-                        section_decision.audit_text,
+                        dense_segments,
                     )
-                    if (
-                        len(section_recovered_examples)
-                        < SECTION_TARGET_RECOVERED_EXAMPLES
-                    ):
-                        chunk_started = time.perf_counter()
-                        chunked_segments, section_chunk_windows = (
-                            transcribe_chunked_english_section(
-                                primary_model,
-                                audio,
-                                start=section_start,
-                                end=section_end,
-                            )
-                        )
-                        section_chunk_seconds = time.perf_counter() - chunk_started
-                        chunked_text = (
-                            format_transcript(chunked_segments)
-                            if chunked_segments
-                            else ""
-                        )
-                        existing_recovered_text = "\n".join(
-                            str(item["text"])
-                            for item in section_recovered_examples
-                        )
-                        section_chunk_recovered_examples = (
-                            recover_repeated_section_examples(
-                                baseline_section_text
-                                + "\n"
-                                + existing_recovered_text,
-                                chunked_text,
-                            )
-                        )
-                        for item in section_chunk_recovered_examples:
-                            item["evidence"] = (
-                                "repeated_in_chunked_forced_english_audit"
-                            )
-                        section_recovered_examples = merge_recovered_examples(
-                            section_recovered_examples,
-                            section_chunk_recovered_examples,
-                        )
                     section_decision.accepted = bool(section_recovered_examples)
                     section_decision.reason = (
-                        "repeated_english_examples_recovered"
+                        "timestamped_cross_window_examples_recovered"
                         if section_recovered_examples
-                        else "no_safe_repeated_english_examples"
+                        else "no_safe_cross_window_examples"
                     )
+                    recovered_segments = recovered_examples_to_segments(
+                        section_recovered_examples
+                    )
+                    if recovered_segments:
+                        post_section_segments = deduplicate_segments(
+                            [*post_opening_segments, *recovered_segments]
+                        )
                     print(
                         "SECTION_AUDIT_DECISION "
                         f"ACCEPTED={'YES' if section_decision.accepted else 'NO'} "
                         f"SECTION={section_decision.section_name} "
                         f"CORE_START={section_decision.core_start:.3f} "
                         f"CORE_END={section_decision.core_end:.3f} "
-                        f"COVERAGE_RATIO={section_decision.coverage_ratio:.3f} "
-                        f"TOKEN_RECALL={section_decision.token_recall:.3f} "
                         f"BASELINE_EXAMPLES={section_decision.baseline_english_candidates} "
-                        f"AUDIT_EXAMPLES={section_decision.audit_english_candidates} "
                         f"RECOVERED_EXAMPLES={len(section_recovered_examples)} "
-                        f"CHUNK_WINDOWS={section_chunk_windows} "
-                        f"CHUNK_SECONDS={section_chunk_seconds:.3f} "
+                        f"DENSE_WINDOWS={section_dense_windows} "
+                        f"DENSE_SECONDS={section_dense_seconds:.3f} "
                         f"REASON={section_decision.reason}"
                     )
                     for example_index, item in enumerate(
                         section_recovered_examples,
                         start=1,
                     ):
+                        event_starts = [
+                            round(float(event["start"]), 3)
+                            for event in item.get("events", [])
+                        ]
                         print(
                             f"SECTION_RECOVERED_EXAMPLE_{example_index:02d}="
-                            f"{item['text']} | OCCURRENCES={item['occurrences']}"
+                            f"{item['text']} | OCCURRENCES={item['occurrences']} "
+                            f"| STARTS={event_starts} | EVIDENCE={item['evidence']}"
                         )
                 else:
                     print("SECTION_AUDIT_DECISION=SKIPPED_SUFFICIENT_ENGLISH_COVERAGE")
@@ -2308,10 +2541,6 @@ def run_child() -> int:
             final_text, consensus_corrections, unresolved_variant_clusters = (
                 correct_repeated_english_variants(final_text)
             )
-            final_text = insert_recovered_examples(
-                final_text,
-                section_recovered_examples,
-            )
             print(f"CONSENSUS_CORRECTIONS_APPLIED={len(consensus_corrections)}")
             print(
                 f"SECTION_RECOVERED_EXAMPLES_INSERTED="
@@ -2334,11 +2563,11 @@ def run_child() -> int:
                 final_indicators,
             )
             if consensus_corrections and section_recovered_examples:
-                effect = "MEASURABLE_EXAMPLE_RECOVERY_AND_CONSENSUS_CORRECTION"
+                effect = "MEASURABLE_TIMESTAMPED_EXAMPLE_RECOVERY_AND_CONSENSUS_CORRECTION"
             elif consensus_corrections:
                 effect = "MEASURABLE_CONSENSUS_CORRECTION"
             elif section_recovered_examples:
-                effect = "MEASURABLE_REPEATED_EXAMPLE_RECOVERY"
+                effect = "MEASURABLE_TIMESTAMPED_EXAMPLE_RECOVERY"
             elif effect == "MEASURABLE_GAIN":
                 effect = "COVERAGE_CHANGE_NOT_ACCURACY_MEASUREMENT"
             timer.finish()
@@ -2361,7 +2590,7 @@ def run_child() -> int:
 
             primary_seconds = timer.seconds_for("primary_batched_transcription")
             opening_seconds = timer.seconds_for("opening_no_vad_audit")
-            section_seconds = timer.seconds_for("essential_section_no_vad_audit")
+            section_seconds = timer.seconds_for("essential_section_dense_english_audit")
             repair_seconds = timer.seconds_for("selective_large_v3_repairs")
             accepted_repairs = sum(item.accepted for item in repair_decisions)
             opening_accepted = bool(opening_decision and opening_decision.accepted)
@@ -2376,7 +2605,7 @@ def run_child() -> int:
                     "metrics": str(output_paths.metrics),
                 },
                 "configuration": {
-                    "mode": "batched_turbo_guarded_opening_full_and_chunked_example_recovery",
+                    "mode": "batched_turbo_opening_audit_dense_cross_window_example_recovery",
                     "language": arguments.language,
                     "batch_size_requested": arguments.batch_size,
                     "batch_size_used": batch_size_used,
@@ -2391,6 +2620,7 @@ def run_child() -> int:
                     "repair_model_updated_during_run": repair_model_updated,
                 },
                 "audio_seconds": audio_seconds,
+                "audio_signal": audio_signal,
                 "detected_language": detected_language,
                 "repeated_phrase_anchors": anchors,
                 "baseline": baseline_indicators,
@@ -2400,17 +2630,14 @@ def run_child() -> int:
                     "forced_language": "en",
                     "recovered_example_count": len(section_recovered_examples),
                     "recovered_examples": section_recovered_examples,
-                    "full_section_recovered_count": (
-                        len(section_recovered_examples)
-                        - len(section_chunk_recovered_examples)
-                    ),
-                    "chunked_recovered_count": len(section_chunk_recovered_examples),
-                    "chunked_window_count": section_chunk_windows,
-                    "chunked_seconds": section_chunk_seconds,
-                    "chunk_seconds": SECTION_CHUNK_SECONDS,
-                    "chunk_overlap_seconds": SECTION_CHUNK_OVERLAP_SECONDS,
-                    "target_recovered_examples": SECTION_TARGET_RECOVERED_EXAMPLES,
-                    "merge_policy": "append_repeated_missing_examples_without_replacing_baseline_section",
+                    "candidate_evidence": section_recovery_evidence,
+                    "dense_window_count": section_dense_windows,
+                    "dense_seconds": section_dense_seconds,
+                    "window_seconds": SECTION_CHUNK_SECONDS,
+                    "window_overlap_seconds": SECTION_CHUNK_OVERLAP_SECONDS,
+                    "event_cluster_seconds": SECTION_EVENT_CLUSTER_SECONDS,
+                    "minimum_cross_window_support": SECTION_CROSS_WINDOW_MIN_SUPPORT,
+                    "merge_policy": "timestamped_add_only_cross_window_consensus_never_replace_baseline",
                 },
                 "repeated_english_consensus": {
                     "correction_count": len(consensus_corrections),
@@ -2475,8 +2702,8 @@ def run_child() -> int:
                     "primary_seconds": primary_seconds,
                     "opening_audit_seconds": opening_seconds,
                     "essential_section_audit_seconds": section_seconds,
-                    "essential_section_chunk_audit_seconds": section_chunk_seconds,
-                    "essential_section_chunk_windows": section_chunk_windows,
+                    "essential_section_dense_asr_seconds": section_dense_seconds,
+                    "essential_section_dense_windows": section_dense_windows,
                     "large_v3_repair_seconds": repair_seconds,
                     "secondary_seconds": opening_seconds + section_seconds + repair_seconds,
                     "total_seconds": timer.total_seconds,
@@ -2523,10 +2750,10 @@ def run_child() -> int:
             print(f"OPENING_AUDIT_SECONDS={opening_seconds:.3f}")
             print(f"ESSENTIAL_SECTION_AUDIT_SECONDS={section_seconds:.3f}")
             print(
-                f"ESSENTIAL_SECTION_CHUNK_AUDIT_SECONDS="
-                f"{section_chunk_seconds:.3f}"
+                f"ESSENTIAL_SECTION_DENSE_ASR_SECONDS="
+                f"{section_dense_seconds:.3f}"
             )
-            print(f"ESSENTIAL_SECTION_CHUNK_WINDOWS={section_chunk_windows}")
+            print(f"ESSENTIAL_SECTION_DENSE_WINDOWS={section_dense_windows}")
             print(f"LARGE_V3_REPAIR_SECONDS={repair_seconds:.3f}")
             print(
                 f"SECONDARY_SECONDS="
