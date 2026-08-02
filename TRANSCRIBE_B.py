@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Iterable, TextIO
 
 
-TRANSCRIPTION_VERSION = 22
+TRANSCRIPTION_VERSION = 23
 DEVICE = "cuda"
 COMPUTE_TYPE = "float16"
 SAMPLE_RATE = 16000
@@ -75,14 +75,15 @@ AUDITED_SECTIONS = (
     "Practical Usage",
 )
 
-SECTION_WINDOW_SECONDS = 30.0
-SECTION_WINDOW_HOP_SECONDS = 10.0
-EVENT_CLUSTER_SECONDS = 7.0
+SECTION_WINDOW_SECONDS = 90.0
+SECTION_WINDOW_HOP_SECONDS = 45.0
+EVENT_CLUSTER_GAP_SECONDS = 6.0
 LOCAL_DUPLICATE_PADDING_SECONDS = 5.0
 MIN_EVENT_SOURCE_SUPPORT = 2
 MIN_EVENT_AVG_LOGPROB = -0.55
 MIN_REPEATED_EVENT_AVG_LOGPROB = -0.48
 V22_PATCH_APPLIED = True
+V23_PATCH_APPLIED = True
 
 
 class TranscriptionError(RuntimeError):
@@ -281,7 +282,7 @@ def installed_versions() -> dict[str, str | None]:
 def latest_pypi_version(package: str) -> str:
     request = urllib.request.Request(
         f"https://pypi.org/pypi/{package}/json",
-        headers={"User-Agent": "radio-transcription-v21"},
+        headers={"User-Agent": "radio-transcription-v23"},
     )
     with urllib.request.urlopen(request, timeout=15) as response:
         payload = json.load(response)
@@ -489,6 +490,7 @@ def clean_text(text: str) -> str:
     text = text.replace("\u3000", " ").replace("�", "")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\s+([,.!?;:])", r"\1", text)
+    text = re.sub(r"([.!?])\1+", r"\1", text)
     return text.strip()
 
 
@@ -793,7 +795,7 @@ def transcribe_section_windows(
                 start=cursor,
                 end=chunk_end,
                 language="en",
-                source=f"v21_{slug}_w{window_count:02d}",
+                source=f"v23_{slug}_w{window_count:02d}",
                 beam_size=3,
                 multilingual=False,
             )
@@ -886,14 +888,11 @@ def recover_time_local_consensus(
 
         events: list[list[dict[str, object]]] = []
         for observation in matching:
-            midpoint = float(observation["midpoint"])
             if not events:
                 events.append([observation])
                 continue
-            previous_midpoint = sum(float(item["midpoint"]) for item in events[-1]) / len(
-                events[-1]
-            )
-            if midpoint - previous_midpoint > EVENT_CLUSTER_SECONDS:
+            previous_end = max(float(item["end"]) for item in events[-1])
+            if float(observation["start"]) > previous_end + EVENT_CLUSTER_GAP_SECONDS:
                 events.append([observation])
             else:
                 events[-1].append(observation)
@@ -978,7 +977,7 @@ def recover_time_local_consensus(
                         avg_logprob=event_avg_logprob,
                         compression_ratio=0.0,
                         no_speech_prob=0.0,
-                        source="turbo_v21_time_local_section_consensus",
+                        source="turbo_v23_time_local_section_consensus",
                     )
                 )
 
@@ -1179,7 +1178,7 @@ def transcript_indicators(text: str, segments: list[SegmentRecord]) -> dict[str,
         "japanese_characters": japanese_character_count(text),
         "latin_characters": latin_character_count(text),
         "replacement_characters": text.count("�"),
-        "decoder_loop": detect_decoder_loop(text),
+        "decoder_loop": any(detect_decoder_loop(segment.text) for segment in segments),
         "strict_section_hits": sections,
         "strict_section_count": sum(sections.values()),
         "language_segment_counts": dict(
@@ -1237,7 +1236,7 @@ def lesson76_regression(
         )
     return {
         "status": "PASS" if all(bool(item["passed"]) for item in items) else "FAIL",
-        "profile": "lesson76_time_local_repetition_regression_v21",
+        "profile": "lesson76_time_local_repetition_regression_v23",
         "scope": "KNOWN_PHRASE_TIME_AND_OCCURRENCE_REGRESSION_NOT_ACCURACY_PERCENTAGE",
         "passed_count": sum(bool(item["passed"]) for item in items),
         "total_count": len(items),
@@ -1326,11 +1325,11 @@ def run_transcription() -> int:
             print(f"RUN_ID={run_id}")
             print("TRANSCRIPTION_TRANSACTION=1")
             print(f"TRANSCRIPTION_VERSION={TRANSCRIPTION_VERSION}")
-            print("TRANSCRIPTION_MODE=FAST_PRIMARY_PLUS_TIME_LOCAL_SECTION_CONSENSUS")
+            print("TRANSCRIPTION_MODE=FAST_PRIMARY_PLUS_COMPACT_SECTION_CONSENSUS")
             print("PRIMARY_PASS=FAST_BATCHED_VAD_FULL_AUDIO")
             print("SECTION_RECOVERY=GRAMMAR_ESSENTIAL_PRACTICAL_ONLY")
-            print("SECTION_RECOVERY_WINDOW=30_SECONDS_HOP_10_SECONDS")
-            print("SECTION_RECOVERY_CONSENSUS=TIME_LOCAL_OVERLAPPING_WINDOWS")
+            print("SECTION_RECOVERY_WINDOW=90_SECONDS_HOP_45_SECONDS")
+            print("SECTION_RECOVERY_CONSENSUS=COMPACT_OVERLAP_EVENT_CONSENSUS")
             print("FULL_AUDIO_SECOND_PASS=DISABLED")
             print("LARGE_V3_AUTOMATIC_PASS=DISABLED")
             print("CANDIDATES_IN_TRANSCRIPT=NO")
@@ -1540,7 +1539,7 @@ def run_transcription() -> int:
                 "version": TRANSCRIPTION_VERSION,
                 "convergence": {
                     "status": "FINAL_ACCEPTANCE_TEST",
-                    "source_versions_combined": [14, 16, 18, 19, 20],
+                    "source_versions_combined": [14, 16, 18, 19, 20, 22],
                     "v19_removed": [
                         "full_audio_second_pass",
                         "automatic_large_v3_gap_recovery",
