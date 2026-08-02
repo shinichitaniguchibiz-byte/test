@@ -1,0 +1,1012 @@
+name: Build Transaction 1 Transcription v19
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/patch_transcribe_v19.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-validate:
+    if: github.head_ref == 'deliverables/20260802-transaction1-transcription-v19'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply v19 Transaction 1 patch
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('TRANSCRIBE_B.py')
+          source = path.read_text(encoding='utf-8')
+          if 'def run_child_v19()' in source:
+              raise SystemExit(0)
+
+          source = source.replace(
+              'V18_PATCH_APPLIED = True\n',
+              'V18_PATCH_APPLIED = True\nV19_PATCH_APPLIED = True\n',
+              1,
+          )
+
+          insertion = r'''
+
+COVERAGE_WINDOW_SECONDS_V19 = 30.0
+COVERAGE_WINDOW_OVERLAP_SECONDS_V19 = 5.0
+COVERAGE_TIME_PADDING_SECONDS_V19 = 0.45
+VOICED_FRAME_SECONDS_V19 = 0.20
+VOICED_HOP_SECONDS_V19 = 0.10
+VOICED_BRIDGE_GAP_SECONDS_V19 = 0.35
+VOICED_MIN_INTERVAL_SECONDS_V19 = 0.40
+UNRESOLVED_MIN_SECONDS_V19 = 0.45
+UNRESOLVED_PADDING_SECONDS_V19 = 1.00
+
+
+def classify_language_v19(text: str) -> str:
+    latin = latin_character_count(text)
+    japanese = japanese_character_count(text)
+    english_word_count = len(english_words(text))
+    if english_word_count >= 3 and latin >= max(12, japanese * 2):
+        return "en"
+    if japanese >= 8 and japanese >= latin:
+        return "ja"
+    if latin >= 10 and japanese >= 6:
+        return "mixed"
+    if english_word_count >= 2:
+        return "en"
+    if japanese >= 2:
+        return "ja"
+    return "unknown"
+
+
+def segment_to_dict_v19(segment: SegmentRecord) -> dict[str, object]:
+    return {
+        "start": round(segment.start, 3),
+        "end": round(segment.end, 3),
+        "language": classify_language_v19(segment.text),
+        "text": segment.text,
+        "source": segment.source,
+        "avg_logprob": round(segment.avg_logprob, 6),
+        "compression_ratio": round(segment.compression_ratio, 6),
+        "no_speech_prob": round(segment.no_speech_prob, 6),
+    }
+
+
+def transcribe_full_coverage_pass_v19(
+    model: object,
+    audio: object,
+    *,
+    audio_seconds: float,
+    language: str | None,
+) -> tuple[list[SegmentRecord], int]:
+    records: list[SegmentRecord] = []
+    cursor = 0.0
+    window_count = 0
+    while cursor < audio_seconds:
+        window_end = min(audio_seconds, cursor + COVERAGE_WINDOW_SECONDS_V19)
+        window_count += 1
+        print(
+            f"FULL_COVERAGE_WINDOW={window_count:03d} "
+            f"START={cursor:.3f} END={window_end:.3f}"
+        )
+        records.extend(
+            transcribe_slice(
+                model,
+                audio,
+                start=cursor,
+                end=window_end,
+                language=language,
+                source=f"turbo_full_no_vad_w{window_count:03d}",
+                beam_size=3,
+                multilingual=True,
+            )
+        )
+        if window_end >= audio_seconds:
+            break
+        next_cursor = window_end - COVERAGE_WINDOW_OVERLAP_SECONDS_V19
+        if next_cursor <= cursor:
+            next_cursor = cursor + 1.0
+        cursor = next_cursor
+    return records, window_count
+
+
+def nearby_segments_v19(
+    segments: list[SegmentRecord],
+    candidate: SegmentRecord,
+    padding: float = COVERAGE_TIME_PADDING_SECONDS_V19,
+) -> list[SegmentRecord]:
+    return [
+        segment
+        for segment in segments
+        if candidate.start <= segment.end + padding
+        and candidate.end >= segment.start - padding
+    ]
+
+
+def merge_add_only_v19(
+    baseline: list[SegmentRecord],
+    candidates: list[SegmentRecord],
+    *,
+    stage: str,
+) -> tuple[list[SegmentRecord], list[dict[str, object]], list[dict[str, object]]]:
+    merged = list(baseline)
+    additions: list[dict[str, object]] = []
+    conflicts: list[dict[str, object]] = []
+
+    for candidate in sorted(candidates, key=lambda item: (item.start, item.end)):
+        candidate_text = clean_text(candidate.text)
+        if not candidate_text or candidate.no_speech_prob >= 0.90:
+            continue
+        if detect_decoder_loop(candidate_text) or "�" in candidate_text:
+            continue
+
+        overlaps = nearby_segments_v19(merged, candidate)
+        if not overlaps:
+            merged.append(candidate)
+            additions.append(
+                {
+                    "stage": stage,
+                    "reason": "previously_uncovered_time",
+                    **segment_to_dict_v19(candidate),
+                }
+            )
+            continue
+
+        overlap_text = " ".join(
+            segment.text for segment in sorted(overlaps, key=lambda item: item.start)
+        )
+        candidate_normalized = normalize_for_comparison(candidate_text)
+        overlap_normalized = normalize_for_comparison(overlap_text)
+        similarity = SequenceMatcher(
+            None,
+            candidate_normalized,
+            overlap_normalized,
+        ).ratio()
+        candidate_language = classify_language_v19(candidate_text)
+        candidate_english = len(english_words(candidate_text))
+        overlap_english = len(english_words(overlap_text))
+        candidate_japanese = japanese_character_count(candidate_text)
+        overlap_japanese = japanese_character_count(overlap_text)
+
+        reason: str | None = None
+        if (
+            candidate_language in {"en", "mixed"}
+            and candidate_english >= 5
+            and overlap_english < max(3, int(candidate_english * 0.45))
+            and candidate.avg_logprob >= -0.80
+        ):
+            reason = "english_content_missing_from_parallel_pass"
+        elif (
+            candidate_language in {"ja", "mixed"}
+            and candidate_japanese >= 12
+            and overlap_japanese < max(6, int(candidate_japanese * 0.45))
+            and candidate.avg_logprob >= -0.85
+        ):
+            reason = "japanese_content_missing_from_parallel_pass"
+        elif (
+            similarity < 0.42
+            and candidate.avg_logprob >= -0.70
+            and len(candidate_normalized) >= 12
+        ):
+            reason = "independent_parallel_decode_disagrees"
+
+        if reason is None:
+            continue
+
+        conflict_text = candidate_text
+        if similarity < 0.30 and overlaps:
+            language_label = candidate_language.upper()
+            conflict_text = f"[{language_label}候補] {candidate_text}"
+            candidate = SegmentRecord(
+                start=candidate.start,
+                end=candidate.end,
+                text=conflict_text,
+                avg_logprob=candidate.avg_logprob,
+                compression_ratio=candidate.compression_ratio,
+                no_speech_prob=candidate.no_speech_prob,
+                source=candidate.source + "_parallel_candidate",
+            )
+            conflicts.append(
+                {
+                    "stage": stage,
+                    "reason": reason,
+                    "similarity": round(similarity, 6),
+                    "existing_text": overlap_text,
+                    "candidate_text": candidate_text,
+                    "start": round(candidate.start, 3),
+                    "end": round(candidate.end, 3),
+                }
+            )
+
+        merged.append(candidate)
+        additions.append(
+            {
+                "stage": stage,
+                "reason": reason,
+                "similarity": round(similarity, 6),
+                **segment_to_dict_v19(candidate),
+            }
+        )
+
+    return deduplicate_segments(merged), additions, conflicts
+
+
+def merge_numeric_intervals_v19(
+    intervals: list[tuple[float, float]],
+    *,
+    bridge_gap: float = 0.0,
+) -> list[tuple[float, float]]:
+    merged: list[list[float]] = []
+    for start, end in sorted(intervals):
+        if end <= start:
+            continue
+        if not merged or start > merged[-1][1] + bridge_gap:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    return [(start, end) for start, end in merged]
+
+
+def detect_voiced_intervals_v19(audio: object) -> tuple[list[tuple[float, float]], dict[str, object]]:
+    import numpy as np
+
+    samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+    frame_size = max(1, int(SAMPLE_RATE * VOICED_FRAME_SECONDS_V19))
+    hop_size = max(1, int(SAMPLE_RATE * VOICED_HOP_SECONDS_V19))
+    if samples.size < frame_size:
+        return [], {
+            "threshold_dbfs": -50.0,
+            "frame_count": 0,
+            "scope": "ENERGY_BASED_SPEECH_COVERAGE_DIAGNOSTIC",
+        }
+
+    starts = list(range(0, samples.size - frame_size + 1, hop_size))
+    levels: list[float] = []
+    for start_sample in starts:
+        frame = samples[start_sample : start_sample + frame_size]
+        rms = float(np.sqrt(np.mean(frame * frame) + 1e-12))
+        levels.append(20.0 * math.log10(max(rms, 1e-12)))
+
+    noise_floor = float(np.percentile(levels, 15))
+    threshold = min(-34.0, max(-50.0, noise_floor + 11.0))
+    voiced_frames = [
+        (
+            start_sample / SAMPLE_RATE,
+            min(samples.size, start_sample + frame_size) / SAMPLE_RATE,
+        )
+        for start_sample, level in zip(starts, levels)
+        if level >= threshold
+    ]
+    merged = merge_numeric_intervals_v19(
+        voiced_frames,
+        bridge_gap=VOICED_BRIDGE_GAP_SECONDS_V19,
+    )
+    merged = [
+        (start, end)
+        for start, end in merged
+        if end - start >= VOICED_MIN_INTERVAL_SECONDS_V19
+    ]
+    return merged, {
+        "threshold_dbfs": round(threshold, 3),
+        "noise_floor_p15_dbfs": round(noise_floor, 3),
+        "frame_count": len(levels),
+        "voiced_interval_count": len(merged),
+        "voiced_seconds": round(sum(end - start for start, end in merged), 3),
+        "scope": "ENERGY_BASED_SPEECH_COVERAGE_DIAGNOSTIC_NOT_ACCURACY_MEASUREMENT",
+    }
+
+
+def covered_intervals_v19(segments: list[SegmentRecord]) -> list[tuple[float, float]]:
+    intervals = [
+        (
+            max(0.0, segment.start - COVERAGE_TIME_PADDING_SECONDS_V19),
+            segment.end + COVERAGE_TIME_PADDING_SECONDS_V19,
+        )
+        for segment in segments
+        if segment.text.strip()
+        and not segment.text.startswith("[聞き取り不確実")
+    ]
+    return merge_numeric_intervals_v19(intervals, bridge_gap=0.15)
+
+
+def subtract_intervals_v19(
+    source_intervals: list[tuple[float, float]],
+    covered_intervals: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    uncovered: list[tuple[float, float]] = []
+    covered = merge_numeric_intervals_v19(covered_intervals)
+    for source_start, source_end in source_intervals:
+        cursor = source_start
+        for cover_start, cover_end in covered:
+            if cover_end <= cursor:
+                continue
+            if cover_start >= source_end:
+                break
+            if cover_start > cursor:
+                uncovered.append((cursor, min(cover_start, source_end)))
+            cursor = max(cursor, cover_end)
+            if cursor >= source_end:
+                break
+        if cursor < source_end:
+            uncovered.append((cursor, source_end))
+    return merge_numeric_intervals_v19(
+        [
+            (start, end)
+            for start, end in uncovered
+            if end - start >= UNRESOLVED_MIN_SECONDS_V19
+        ],
+        bridge_gap=0.20,
+    )
+
+
+def valid_forced_candidate_v19(segment: SegmentRecord, language: str) -> bool:
+    if segment.avg_logprob < -1.10 or segment.no_speech_prob >= 0.85:
+        return False
+    if detect_decoder_loop(segment.text) or "�" in segment.text:
+        return False
+    if language == "en":
+        return len(english_words(segment.text)) >= 2 and latin_character_count(segment.text) >= 8
+    return japanese_character_count(segment.text) >= 3
+
+
+def recover_gaps_with_model_v19(
+    model: object,
+    audio: object,
+    gaps: list[tuple[float, float]],
+    *,
+    model_label: str,
+    include_auto: bool,
+) -> tuple[list[SegmentRecord], list[dict[str, object]]]:
+    recovered: list[SegmentRecord] = []
+    evidence: list[dict[str, object]] = []
+    for index, (gap_start, gap_end) in enumerate(gaps, start=1):
+        slice_start = max(0.0, gap_start - UNRESOLVED_PADDING_SECONDS_V19)
+        slice_end = gap_end + UNRESOLVED_PADDING_SECONDS_V19
+        candidates_by_language: dict[str, list[SegmentRecord]] = {}
+        languages: list[str | None] = [None] if include_auto else []
+        languages.extend(["ja", "en"])
+        for language in languages:
+            language_key = language or "auto"
+            candidates = transcribe_slice(
+                model,
+                audio,
+                start=slice_start,
+                end=slice_end,
+                language=language,
+                source=f"{model_label}_gap_{index:03d}_{language_key}",
+                beam_size=5 if model_label == "large_v3" else 3,
+                multilingual=language is None,
+            )
+            core = segments_in_core(candidates, gap_start, gap_end)
+            if language in {"ja", "en"}:
+                core = [
+                    segment
+                    for segment in core
+                    if valid_forced_candidate_v19(segment, language)
+                ]
+            else:
+                core = [
+                    segment
+                    for segment in core
+                    if segment.avg_logprob >= -1.10
+                    and segment.no_speech_prob < 0.85
+                    and not detect_decoder_loop(segment.text)
+                ]
+            if core:
+                candidates_by_language[language_key] = core
+
+        flattened = [
+            segment
+            for candidate_group in candidates_by_language.values()
+            for segment in candidate_group
+        ]
+        if not flattened:
+            evidence.append(
+                {
+                    "gap_index": index,
+                    "start": round(gap_start, 3),
+                    "end": round(gap_end, 3),
+                    "model": model_label,
+                    "result": "NO_CANDIDATE",
+                }
+            )
+            continue
+
+        auto_candidates = candidates_by_language.get("auto", [])
+        if auto_candidates:
+            selected = auto_candidates
+            selection_reason = "auto_candidate_available"
+        else:
+            ja_candidates = candidates_by_language.get("ja", [])
+            en_candidates = candidates_by_language.get("en", [])
+            if ja_candidates and en_candidates:
+                ja_text = " ".join(item.text for item in ja_candidates)
+                en_text = " ".join(item.text for item in en_candidates)
+                similarity = SequenceMatcher(
+                    None,
+                    normalize_for_comparison(ja_text),
+                    normalize_for_comparison(en_text),
+                ).ratio()
+                if similarity < 0.35:
+                    combined = SegmentRecord(
+                        start=min(item.start for item in [*ja_candidates, *en_candidates]),
+                        end=max(item.end for item in [*ja_candidates, *en_candidates]),
+                        text=(
+                            f"[JA候補] {ja_text}\n"
+                            f"[EN候補] {en_text}"
+                        ),
+                        avg_logprob=max(
+                            average_logprob(ja_candidates),
+                            average_logprob(en_candidates),
+                        ),
+                        compression_ratio=0.0,
+                        no_speech_prob=0.0,
+                        source=f"{model_label}_bilingual_uncertain_{index:03d}",
+                    )
+                    selected = [combined]
+                    selection_reason = "bilingual_candidates_preserved"
+                else:
+                    selected = (
+                        ja_candidates
+                        if average_logprob(ja_candidates) >= average_logprob(en_candidates)
+                        else en_candidates
+                    )
+                    selection_reason = "higher_confidence_forced_candidate"
+            else:
+                selected = ja_candidates or en_candidates
+                selection_reason = "single_language_candidate"
+
+        recovered.extend(selected)
+        evidence.append(
+            {
+                "gap_index": index,
+                "start": round(gap_start, 3),
+                "end": round(gap_end, 3),
+                "model": model_label,
+                "result": "CANDIDATE_RECOVERED",
+                "selection_reason": selection_reason,
+                "candidate_languages": sorted(candidates_by_language),
+                "selected": [segment_to_dict_v19(item) for item in selected],
+            }
+        )
+    return recovered, evidence
+
+
+def timecode_v19(seconds: float) -> str:
+    milliseconds = int(round(max(0.0, seconds) * 1000.0))
+    hours, milliseconds = divmod(milliseconds, 3_600_000)
+    minutes, milliseconds = divmod(milliseconds, 60_000)
+    whole_seconds, milliseconds = divmod(milliseconds, 1000)
+    return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d}.{milliseconds:03d}"
+
+
+def uncertain_marker_segments_v19(
+    gaps: list[tuple[float, float]],
+) -> list[SegmentRecord]:
+    return [
+        SegmentRecord(
+            start=start,
+            end=end,
+            text=(
+                f"[聞き取り不確実 {timecode_v19(start)}-"
+                f"{timecode_v19(end)}]"
+            ),
+            avg_logprob=-10.0,
+            compression_ratio=0.0,
+            no_speech_prob=0.0,
+            source="unresolved_voiced_interval",
+        )
+        for start, end in gaps
+    ]
+
+
+def load_benchmark_v19(
+    script_directory: Path,
+    input_file: Path,
+) -> dict[str, object]:
+    benchmark_file = script_directory / "TRANSCRIPTION_BENCHMARK.json"
+    if not benchmark_file.is_file():
+        return {"status": "NOT_CONFIGURED", "items": []}
+    payload = json.loads(benchmark_file.read_text(encoding="utf-8"))
+    expected_input = str(payload.get("input_basename", "")).strip()
+    if expected_input and input_file.name.lower() != expected_input.lower():
+        return {
+            "status": "SKIPPED_INPUT_MISMATCH",
+            "expected_input_basename": expected_input,
+            "actual_input_basename": input_file.name,
+            "items": [],
+        }
+    return {"status": "CONFIGURED", "items": list(payload.get("items", []))}
+
+
+def evaluate_benchmark_v19(
+    benchmark: dict[str, object],
+    segments: list[SegmentRecord],
+) -> dict[str, object]:
+    if benchmark.get("status") != "CONFIGURED":
+        return benchmark
+    results: list[dict[str, object]] = []
+    for item in benchmark.get("items", []):
+        record = dict(item)
+        phrase = str(record.get("phrase", "")).strip()
+        start = float(record.get("start", 0.0))
+        end = float(record.get("end", float("inf")))
+        minimum = int(record.get("min_count", 1))
+        selected = [
+            segment
+            for segment in segments
+            if segment.end >= start and segment.start <= end
+        ]
+        selected_text = " ".join(segment.text for segment in selected)
+        phrase_normalized = normalize_for_comparison(phrase)
+        count = (
+            normalize_for_comparison(selected_text).count(phrase_normalized)
+            if phrase_normalized
+            else 0
+        )
+        passed = count >= minimum
+        result = {
+            **record,
+            "observed_count": count,
+            "passed": passed,
+        }
+        results.append(result)
+        print(
+            f"BENCHMARK_ITEM={'PASS' if passed else 'FAIL'} "
+            f"COUNT={count} MIN={minimum} PHRASE={phrase}"
+        )
+    failed = [item for item in results if not bool(item["passed"])]
+    return {
+        "status": "PASS" if not failed else "FAIL",
+        "item_count": len(results),
+        "passed_count": len(results) - len(failed),
+        "failed_count": len(failed),
+        "items": results,
+    }
+
+
+def run_child_v19() -> int:
+    timer = StepTimer()
+    overall_result = "FAILED"
+    arguments = parse_arguments()
+    script_directory = Path(__file__).resolve().parent
+    run_id = os.environ.get("TRANSCRIBE_RUN_ID") or datetime.now(JST).strftime(
+        "%Y%m%d_%H%M%S"
+    )
+    input_file = resolve_path(script_directory, arguments.input)
+    output_directory = resolve_path(script_directory, arguments.output_dir)
+    output_paths = make_output_paths(output_directory, run_id)
+    reference_file = (
+        resolve_path(script_directory, arguments.reference)
+        if arguments.reference
+        else None
+    )
+
+    with TeeContext(output_paths.log):
+        try:
+            print("RUN_START")
+            print(f"RUN_ID={run_id}")
+            print("TRANSCRIPTION_TRANSACTION=1")
+            print("TRANSCRIPTION_VERSION=19")
+            print("OUTPUT_DIRECTORY_POLICY=TRANSCRIPT_LOG_METRICS_SAME_DIRECTORY")
+            print(f"TRANSCRIPT_FILE={output_paths.transcript}")
+            print(f"LOG_FILE={output_paths.log}")
+            print(f"METRICS_FILE={output_paths.metrics}")
+
+            timer.start("check_and_update_software")
+            software_metrics = check_and_update_runtime_packages(script_directory)
+            timer.finish()
+
+            timer.start("import_transcription_libraries")
+            import ctranslate2
+            import faster_whisper
+            from faster_whisper import BatchedInferencePipeline, WhisperModel
+            from faster_whisper.audio import decode_audio
+            timer.finish()
+
+            timer.start("check_model_revisions")
+            print("MODEL_VERSION_CHECK_START")
+            primary_model_information = check_model(
+                script_directory,
+                repository=PRIMARY_MODEL_REPOSITORY,
+                directory_name=PRIMARY_MODEL_DIRECTORY_NAME,
+                label="PRIMARY",
+                download_now=True,
+            )
+            repair_model_information = check_model(
+                script_directory,
+                repository=REPAIR_MODEL_REPOSITORY,
+                directory_name=REPAIR_MODEL_DIRECTORY_NAME,
+                label="REPAIR",
+                download_now=False,
+            )
+            print("MODEL_VERSION_CHECK_RESULT=PASS")
+            timer.finish()
+
+            timer.start("validate_environment")
+            validate_environment(
+                input_file,
+                arguments.batch_size,
+                0.0,
+                arguments.max_repair_windows,
+                ctranslate2,
+            )
+            if reference_file is not None and not reference_file.is_file():
+                raise FileNotFoundError(f"Reference file was not found: {reference_file}")
+            timer.finish()
+
+            print("TRANSCRIPTION_CONFIGURATION")
+            print("TRANSCRIPTION_MODE=TRANSACTION1_DUAL_FULL_AUDIO_COVERAGE")
+            print("PASS_A=FAST_BATCHED_VAD_FULL_AUDIO")
+            print("PASS_B=FULL_AUDIO_NO_VAD_OVERLAPPED_WINDOWS")
+            print("MERGE_POLICY=TIMESTAMP_ADD_ONLY_NO_SECTION_REPLACEMENT")
+            print("LANGUAGE_POLICY=SEGMENT_LANGUAGE_RECORDED_JA_EN_MIXED_UNKNOWN")
+            print("UNCERTAIN_POLICY=NEVER_SILENTLY_DROP_UNRESOLVED_VOICED_INTERVAL")
+            print("GLOBAL_CROSS_TIME_REPLACEMENT=DISABLED")
+            print("EDUCATIONAL_FORMATTING_APPLIED=NO")
+            print("PARAPHRASING_APPLIED=NO")
+            print("TRANSLATION_APPLIED=NO")
+            print(f"PYTHON={sys.executable}")
+            print(f"FASTER_WHISPER={faster_whisper.__version__}")
+            print(f"CTRANSLATE2={ctranslate2.__version__}")
+            print(f"CUDA_DEVICES={ctranslate2.get_cuda_device_count()}")
+            print(f"COMPUTE_TYPE={COMPUTE_TYPE}")
+            print(f"LANGUAGE={arguments.language}")
+            print(f"BATCH_SIZE_REQUESTED={arguments.batch_size}")
+            print(f"INPUT={input_file}")
+            print(f"REFERENCE={reference_file or 'NONE'}")
+
+            timer.start("decode_audio")
+            audio = decode_audio(str(input_file), sampling_rate=SAMPLE_RATE)
+            audio_seconds = len(audio) / SAMPLE_RATE
+            audio_signal = analyze_audio_signal(audio)
+            voiced_intervals, voiced_diagnostics = detect_voiced_intervals_v19(audio)
+            timer.finish()
+            print(f"AUDIO_SECONDS={audio_seconds:.3f}")
+            print(f"AUDIO_SIGNAL_QUALITY={audio_signal['quality_status']}")
+            print(f"VOICED_INTERVAL_COUNT={len(voiced_intervals)}")
+            print(f"VOICED_SECONDS={voiced_diagnostics['voiced_seconds']}")
+            print(f"VOICED_THRESHOLD_DBFS={voiced_diagnostics['threshold_dbfs']}")
+
+            timer.start("load_primary_model")
+            primary_model = load_model(
+                WhisperModel,
+                Path(str(primary_model_information["directory"])),
+                "turbo",
+            )
+            timer.finish()
+            requested_language = None if arguments.language == "auto" else arguments.language
+
+            timer.start("pass_a_batched_transcription")
+            baseline_segments, batch_size_used, detected_language = transcribe_batched_baseline(
+                primary_model,
+                BatchedInferencePipeline,
+                audio,
+                requested_language,
+                arguments.batch_size,
+            )
+            baseline_text = format_transcript(baseline_segments)
+            timer.finish()
+
+            timer.start("pass_b_full_no_vad_coverage")
+            coverage_segments, coverage_window_count = transcribe_full_coverage_pass_v19(
+                primary_model,
+                audio,
+                audio_seconds=audio_seconds,
+                language=requested_language,
+            )
+            timer.finish()
+
+            timer.start("merge_pass_a_and_b")
+            merged_segments, coverage_additions, coverage_conflicts = merge_add_only_v19(
+                baseline_segments,
+                coverage_segments,
+                stage="full_audio_no_vad",
+            )
+            initial_gaps = subtract_intervals_v19(
+                voiced_intervals,
+                covered_intervals_v19(merged_segments),
+            )
+            timer.finish()
+            print(f"PASS_A_SEGMENTS={len(baseline_segments)}")
+            print(f"PASS_B_SEGMENTS={len(coverage_segments)}")
+            print(f"PASS_B_WINDOWS={coverage_window_count}")
+            print(f"PASS_B_ADDITIONS={len(coverage_additions)}")
+            print(f"PASS_B_CONFLICTS_PRESERVED={len(coverage_conflicts)}")
+            print(f"UNCOVERED_AFTER_DUAL_PASS={len(initial_gaps)}")
+
+            timer.start("turbo_gap_language_recovery")
+            turbo_gap_segments, turbo_gap_evidence = recover_gaps_with_model_v19(
+                primary_model,
+                audio,
+                initial_gaps,
+                model_label="turbo",
+                include_auto=False,
+            )
+            merged_segments, turbo_additions, turbo_conflicts = merge_add_only_v19(
+                merged_segments,
+                turbo_gap_segments,
+                stage="turbo_gap_language_recovery",
+            )
+            gaps_after_turbo = subtract_intervals_v19(
+                voiced_intervals,
+                covered_intervals_v19(merged_segments),
+            )
+            timer.finish()
+            print(f"TURBO_GAP_CANDIDATES={len(turbo_gap_segments)}")
+            print(f"TURBO_GAP_ADDITIONS={len(turbo_additions)}")
+            print(f"UNCOVERED_AFTER_TURBO_GAP_RECOVERY={len(gaps_after_turbo)}")
+
+            del primary_model
+            gc.collect()
+
+            timer.start("large_v3_unresolved_recovery")
+            large_gap_segments: list[SegmentRecord] = []
+            large_gap_evidence: list[dict[str, object]] = []
+            large_additions: list[dict[str, object]] = []
+            large_conflicts: list[dict[str, object]] = []
+            repair_model_updated = False
+            if gaps_after_turbo:
+                repair_model_information = ensure_repair_model(
+                    script_directory,
+                    repair_model_information,
+                )
+                repair_model_updated = bool(repair_model_information["updated"])
+                repair_model = load_model(
+                    WhisperModel,
+                    Path(str(repair_model_information["directory"])),
+                    "large_v3",
+                )
+                large_gap_segments, large_gap_evidence = recover_gaps_with_model_v19(
+                    repair_model,
+                    audio,
+                    gaps_after_turbo,
+                    model_label="large_v3",
+                    include_auto=True,
+                )
+                merged_segments, large_additions, large_conflicts = merge_add_only_v19(
+                    merged_segments,
+                    large_gap_segments,
+                    stage="large_v3_unresolved_recovery",
+                )
+                del repair_model
+                gc.collect()
+            final_gaps = subtract_intervals_v19(
+                voiced_intervals,
+                covered_intervals_v19(merged_segments),
+            )
+            timer.finish()
+            print(f"LARGE_V3_GAP_CANDIDATES={len(large_gap_segments)}")
+            print(f"LARGE_V3_GAP_ADDITIONS={len(large_additions)}")
+            print(f"UNCOVERED_AFTER_LARGE_V3={len(final_gaps)}")
+
+            timer.start("assemble_transaction1_transcript")
+            uncertainty_segments = uncertain_marker_segments_v19(final_gaps)
+            final_segments = deduplicate_segments([*merged_segments, *uncertainty_segments])
+            final_text = format_transcript(final_segments)
+            anchors = discover_repeated_anchors(final_segments)
+            baseline_indicators = transcript_indicators(
+                baseline_text,
+                baseline_segments,
+                discover_repeated_anchors(baseline_segments),
+            )
+            final_indicators = transcript_indicators(final_text, final_segments, anchors)
+            language_counts = dict(
+                Counter(classify_language_v19(segment.text) for segment in final_segments)
+            )
+            timer.finish()
+
+            timer.start("evaluate_benchmark")
+            benchmark_configuration = load_benchmark_v19(script_directory, input_file)
+            benchmark_results = evaluate_benchmark_v19(
+                benchmark_configuration,
+                final_segments,
+            )
+            timer.finish()
+
+            if benchmark_results.get("status") == "FAIL":
+                coverage_status = "INCOMPLETE"
+            elif final_gaps:
+                coverage_status = "UNCERTAIN_INTERVALS_PRESENT"
+            else:
+                coverage_status = "COMPLETE"
+
+            timer.start("calculate_reference_metrics")
+            if reference_file is None:
+                reference_metrics: dict[str, object] = {"status": "NOT_MEASURED"}
+            else:
+                reference_metrics = calculate_reference_metrics(
+                    reference_file.read_text(encoding="utf-8"),
+                    baseline_text,
+                    final_text,
+                )
+            timer.finish()
+
+            timer.start("write_transcript")
+            write_text_atomically(output_paths.transcript, final_text)
+            timer.finish()
+
+            pass_a_seconds = timer.seconds_for("pass_a_batched_transcription")
+            pass_b_seconds = timer.seconds_for("pass_b_full_no_vad_coverage")
+            turbo_gap_seconds = timer.seconds_for("turbo_gap_language_recovery")
+            large_gap_seconds = timer.seconds_for("large_v3_unresolved_recovery")
+            total_seconds = timer.total_seconds
+            metrics = {
+                "run_id": run_id,
+                "created_at": datetime.now(JST).isoformat(),
+                "transaction": 1,
+                "version": 19,
+                "input": str(input_file),
+                "output_files": {
+                    "transcript": str(output_paths.transcript),
+                    "log": str(output_paths.log),
+                    "metrics": str(output_paths.metrics),
+                },
+                "configuration": {
+                    "mode": "dual_full_audio_coverage_timestamp_add_only",
+                    "pass_a": "batched_vad",
+                    "pass_b": "no_vad_overlapped_full_audio",
+                    "coverage_window_seconds": COVERAGE_WINDOW_SECONDS_V19,
+                    "coverage_overlap_seconds": COVERAGE_WINDOW_OVERLAP_SECONDS_V19,
+                    "global_cross_time_replacement": False,
+                    "educational_formatting": False,
+                },
+                "software": software_metrics,
+                "models": {
+                    "primary": primary_model_information,
+                    "repair": repair_model_information,
+                    "repair_model_updated_during_run": repair_model_updated,
+                },
+                "audio_seconds": audio_seconds,
+                "audio_signal": audio_signal,
+                "voiced_detection": voiced_diagnostics,
+                "detected_language": detected_language,
+                "pass_a": {
+                    "batch_size_used": batch_size_used,
+                    "segment_count": len(baseline_segments),
+                    "text_characters": len(baseline_text),
+                    "indicators": baseline_indicators,
+                },
+                "pass_b": {
+                    "window_count": coverage_window_count,
+                    "segment_count": len(coverage_segments),
+                    "additions": coverage_additions,
+                    "conflicts_preserved": coverage_conflicts,
+                },
+                "coverage": {
+                    "status": coverage_status,
+                    "status_is_accuracy_measurement": False,
+                    "voiced_interval_count": len(voiced_intervals),
+                    "voiced_seconds": sum(end - start for start, end in voiced_intervals),
+                    "initial_uncovered_interval_count": len(initial_gaps),
+                    "after_turbo_uncovered_interval_count": len(gaps_after_turbo),
+                    "final_uncovered_interval_count": len(final_gaps),
+                    "final_uncovered_seconds": sum(end - start for start, end in final_gaps),
+                    "final_uncovered_intervals": [
+                        {"start": round(start, 3), "end": round(end, 3)}
+                        for start, end in final_gaps
+                    ],
+                    "uncertain_markers_written": len(uncertainty_segments),
+                },
+                "turbo_gap_recovery": {
+                    "evidence": turbo_gap_evidence,
+                    "additions": turbo_additions,
+                    "conflicts_preserved": turbo_conflicts,
+                },
+                "large_v3_gap_recovery": {
+                    "evidence": large_gap_evidence,
+                    "additions": large_additions,
+                    "conflicts_preserved": large_conflicts,
+                },
+                "benchmark": benchmark_results,
+                "final": {
+                    **final_indicators,
+                    "language_segment_counts": language_counts,
+                    "segments": [segment_to_dict_v19(item) for item in final_segments],
+                },
+                "reference_accuracy": reference_metrics,
+                "performance": {
+                    "pass_a_seconds": pass_a_seconds,
+                    "pass_b_seconds": pass_b_seconds,
+                    "turbo_gap_recovery_seconds": turbo_gap_seconds,
+                    "large_v3_gap_recovery_seconds": large_gap_seconds,
+                    "total_seconds": total_seconds,
+                    "total_realtime_factor": total_seconds / max(audio_seconds, 0.001),
+                    "audio_minutes_per_processing_minute": audio_seconds / max(total_seconds, 0.001),
+                },
+                "timings": timer.steps,
+            }
+            write_json_atomically(output_paths.metrics, metrics)
+
+            print("TRANSCRIPTION_RESULT=PASS")
+            print(f"OUTPUT_FILE={output_paths.transcript}")
+            print(f"LOG_FILE={output_paths.log}")
+            print(f"METRICS_FILE={output_paths.metrics}")
+            print(f"PASS_A_SECONDS={pass_a_seconds:.3f}")
+            print(f"PASS_B_SECONDS={pass_b_seconds:.3f}")
+            print(f"TURBO_GAP_RECOVERY_SECONDS={turbo_gap_seconds:.3f}")
+            print(f"LARGE_V3_GAP_RECOVERY_SECONDS={large_gap_seconds:.3f}")
+            print(f"TOTAL_SECONDS={total_seconds:.3f}")
+            print(f"FINAL_SEGMENT_COUNT={len(final_segments)}")
+            print(f"FINAL_TEXT_CHARACTERS={len(final_text)}")
+            print(f"LANGUAGE_SEGMENT_COUNTS={json.dumps(language_counts, ensure_ascii=False)}")
+            print(f"BENCHMARK_STATUS={benchmark_results.get('status')}")
+            print(f"TRANSCRIPTION_COVERAGE_STATUS={coverage_status}")
+            print(f"UNCOVERED_VOICED_INTERVAL_COUNT={len(final_gaps)}")
+            print(f"UNCOVERED_VOICED_SECONDS={sum(end - start for start, end in final_gaps):.3f}")
+            print("TRANSCRIPTION_COVERAGE_STATUS_IS_ACCURACY_MEASUREMENT=NO")
+            print("EDUCATIONAL_FORMATTING_APPLIED=NO")
+
+            overall_result = "PASS"
+            return 0
+        except KeyboardInterrupt:
+            timer.fail_current()
+            print("TRANSCRIPTION_RESULT=CANCELLED", file=sys.stderr)
+            overall_result = "CANCELLED"
+            return 130
+        except Exception as exception:
+            timer.fail_current()
+            print("TRANSCRIPTION_RESULT=FAILED", file=sys.stderr)
+            print(f"ERROR={type(exception).__name__}: {exception}", file=sys.stderr)
+            print(f"OUTPUT_FILE_NOT_CREATED={output_paths.transcript}", file=sys.stderr)
+            overall_result = "FAILED"
+            return 1
+        finally:
+            timer.print_summary(overall_result)
+'''
+
+          marker = '\ndef main() -> int:\n'
+          if marker not in source:
+              raise RuntimeError('main marker not found')
+          source = source.replace(marker, insertion + marker, 1)
+          old_main = '''def main() -> int:\n    script_directory = Path(__file__).resolve().parent\n    ensure_stt_virtual_environment(script_directory)\n    return run_child()\n'''
+          new_main = '''def main() -> int:\n    script_directory = Path(__file__).resolve().parent\n    ensure_stt_virtual_environment(script_directory)\n    return run_child_v19()\n'''
+          if old_main not in source:
+              raise RuntimeError('main body not found')
+          source = source.replace(old_main, new_main, 1)
+          path.write_text(source, encoding='utf-8')
+          PY
+      - name: Validate syntax and pure-function behavior
+        shell: bash
+        run: |
+          python -m py_compile TRANSCRIBE_B.py
+          python - <<'PY'
+          import importlib.util
+          from pathlib import Path
+
+          spec = importlib.util.spec_from_file_location('transcribe_v19', Path('TRANSCRIBE_B.py'))
+          module = importlib.util.module_from_spec(spec)
+          assert spec.loader is not None
+          spec.loader.exec_module(module)
+
+          baseline = [module.SegmentRecord(0.0, 5.0, '日本語の説明です', -0.2, 1.0, 0.0, 'a')]
+          coverage = [module.SegmentRecord(1.0, 4.0, 'Suppose we asked Emily for advice.', -0.2, 1.0, 0.0, 'b')]
+          merged, additions, conflicts = module.merge_add_only_v19(baseline, coverage, stage='selftest')
+          assert len(merged) == 2
+          assert additions
+          assert module.classify_language_v19(coverage[0].text) == 'en'
+          gaps = module.subtract_intervals_v19([(0.0, 10.0)], [(0.0, 4.0), (6.0, 10.0)])
+          assert gaps == [(4.0, 6.0)]
+          marker = module.uncertain_marker_segments_v19([(4.0, 6.0)])[0]
+          assert '聞き取り不確実' in marker.text
+          print('V19_PURE_FUNCTION_SELFTEST=PASS')
+          PY
+      - name: Commit v19 program
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add TRANSCRIBE_B.py
+          git commit -m "Implement Transaction 1 dual full-audio coverage transcription v19"
+          git push origin HEAD:${{ github.head_ref }}
