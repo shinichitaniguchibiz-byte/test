@@ -1,17 +1,17 @@
-name: Trigger converged transcription v21 build
+name: Validate converged transcription v21
 
 on:
   push:
     branches:
       - deliverables/20260802-converged-transcription-v21
     paths:
-      - .github/workflows/trigger_v21_build.yml
+      - TRANSCRIBE_B.py
 
 permissions:
   contents: write
 
 jobs:
-  build-v21:
+  validate-v21:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,25 +21,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Extract and run v21 builder
+      - name: Validate source
         shell: bash
         run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          workflow = Path('.github/workflows/build_converged_v21.yml').read_text(encoding='utf-8')
-          start_marker = "          python - <<'PY'\n"
-          end_marker = "\n          PY\n          python -m py_compile TRANSCRIBE_B.py"
-          start = workflow.index(start_marker) + len(start_marker)
-          end = workflow.index(end_marker, start)
-          lines = workflow[start:end].splitlines()
-          builder = '\n'.join(
-              line[10:] if line.startswith('          ') else line
-              for line in lines
-          ) + '\n'
-          Path('/tmp/build_v21.py').write_text(builder, encoding='utf-8')
-          PY
-          python /tmp/build_v21.py
           python -m py_compile TRANSCRIBE_B.py
           python -m pip install --quiet pyflakes
           pyflakes TRANSCRIBE_B.py
@@ -52,33 +36,31 @@ jobs:
           tree = ast.parse(source)
           names = {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
           required = {
-              'run_child_v21',
-              'section_coverage_plan_v21',
-              'transcribe_section_windows_v21',
-              'recover_time_local_consensus_v21',
-              'regression_profile_v21',
+              'main',
+              'run_transcription',
+              'transcribe_batched_baseline',
+              'transcribe_section_windows',
+              'recover_time_local_consensus',
+              'lesson76_regression',
           }
           missing = required - names
           if missing:
-              raise SystemExit(f'missing v21 functions: {sorted(missing)}')
-          assert 'V21_PATCH_APPLIED = True' in source
-          assert 'return run_child_v21()' in source
-          assert 'FULL_AUDIO_SECOND_PASS=DISABLED' in source
-          assert 'LARGE_V3_AUTOMATIC_PASS=DISABLED' in source
-          assert "'version': 21" in source
+              raise SystemExit(f'missing functions: {sorted(missing)}')
+          assert 'TRANSCRIPTION_VERSION = 21' in source
+          assert 'use_flash_attention=False' in source
+          assert 'FULL_AUDIO_SECOND_PASS_USED=NO' in source
+          assert 'LARGE_V3_USED=NO' in source
           module = runpy.run_path('TRANSCRIBE_B.py', run_name='v21_validation')
-          result = module['regression_profile_v21'](Path('not-b.m4a'), 10.0, [])
+          result = module['lesson76_regression'](Path('other.m4a'), 10.0, [])
           assert result['status'] == 'NOT_APPLICABLE'
-          print('V21_STATIC_AND_PURE_VALIDATION=PASS')
+          print('V21_VALIDATION=PASS')
           PY
-      - name: Commit validated v21
+      - name: Record validation
         shell: bash
         run: |
-          if git diff --quiet; then
-            exit 0
-          fi
+          printf 'V21_VALIDATION=PASS\nSOURCE_SHA=%s\n' "$GITHUB_SHA" > V21_VALIDATION.txt
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add TRANSCRIBE_B.py
-          git commit -m "Converge transcription with time-local section consensus"
+          git add V21_VALIDATION.txt
+          git commit -m "Record v21 source validation"
           git push origin HEAD:deliverables/20260802-converged-transcription-v21
