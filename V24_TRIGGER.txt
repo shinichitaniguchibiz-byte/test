@@ -1,1 +1,0 @@
-Trigger temporary v24 validation after the base-branch workflow was installed.
