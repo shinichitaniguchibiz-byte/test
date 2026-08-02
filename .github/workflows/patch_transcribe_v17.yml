@@ -1,0 +1,116 @@
+name: Patch TRANSCRIBE_B v17
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/patch_transcribe_v17.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.head_ref == 'deliverables/20260802-balanced-transcription-v17'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply v17 convergence patch
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('TRANSCRIBE_B.py')
+          source = path.read_text(encoding='utf-8')
+          if 'V17_PATCH_APPLIED = True' in source:
+              raise SystemExit(0)
+
+          def replace_once(old: str, new: str) -> None:
+              global source
+              count = source.count(old)
+              if count != 1:
+                  raise RuntimeError(f'Expected one match, found {count}: {old[:120]!r}')
+              source = source.replace(old, new, 1)
+
+          replace_once(
+              'SECTION_AUDIT_PADDING_SECONDS = 2.0\nREPAIR_PADDING_SECONDS = 4.0\nV15_PATCH_APPLIED = True\nV16_PATCH_APPLIED = True\n',
+              'SECTION_AUDIT_PADDING_SECONDS = 2.0\nSECTION_CHUNK_SECONDS = 32.0\nSECTION_CHUNK_OVERLAP_SECONDS = 4.0\nSECTION_TARGET_RECOVERED_EXAMPLES = 4\nREPAIR_PADDING_SECONDS = 4.0\nV15_PATCH_APPLIED = True\nV16_PATCH_APPLIED = True\nV17_PATCH_APPLIED = True\n',
+          )
+
+          replace_once(
+              '    source: str,\n    beam_size: int,\n) -> list[SegmentRecord]:\n',
+              '    source: str,\n    beam_size: int,\n    multilingual: bool = True,\n) -> list[SegmentRecord]:\n',
+          )
+          replace_once(
+              '        multilingual=True,\n        beam_size=beam_size,\n',
+              '        multilingual=multilingual,\n        beam_size=beam_size,\n',
+          )
+
+          marker = '''def average_logprob(segments: Iterable[SegmentRecord]) -> float:\n'''
+          insertion = '''def transcribe_chunked_english_section(\n    model: object,\n    audio: object,\n    *,\n    start: float,\n    end: float,\n) -> tuple[list[SegmentRecord], int]:\n    if end <= start:\n        return [], 0\n    records: list[SegmentRecord] = []\n    window_count = 0\n    cursor = start\n    while cursor < end:\n        chunk_end = min(end, cursor + SECTION_CHUNK_SECONDS)\n        window_count += 1\n        print(\n            f"SECTION_CHUNK_AUDIT_WINDOW={window_count:02d} "\n            f"START={cursor:.3f} END={chunk_end:.3f}"\n        )\n        records.extend(\n            transcribe_slice(\n                model,\n                audio,\n                start=cursor,\n                end=chunk_end,\n                language="en",\n                source="turbo_essential_chunked_forced_en",\n                beam_size=3,\n                multilingual=False,\n            )\n        )\n        if chunk_end >= end:\n            break\n        next_cursor = chunk_end - SECTION_CHUNK_OVERLAP_SECONDS\n        if next_cursor <= cursor:\n            next_cursor = cursor + 1.0\n        cursor = next_cursor\n    return deduplicate_segments(records), window_count\n\n\ndef average_logprob(segments: Iterable[SegmentRecord]) -> float:\n'''
+          replace_once(marker, insertion)
+
+          marker = '''def insert_recovered_examples(\n'''
+          insertion = '''def merge_recovered_examples(\n    *groups: list[dict[str, object]],\n) -> list[dict[str, object]]:\n    merged: dict[str, dict[str, object]] = {}\n    for group in groups:\n        for item in group:\n            text = str(item.get("text", "")).strip()\n            normalized = normalize_for_comparison(text)\n            if not normalized:\n                continue\n            current = merged.get(normalized)\n            if current is None:\n                merged[normalized] = dict(item)\n                continue\n            current["occurrences"] = max(\n                int(current.get("occurrences", 1)),\n                int(item.get("occurrences", 1)),\n            )\n            current["first_position"] = min(\n                int(current.get("first_position", 0)),\n                int(item.get("first_position", 0)),\n            )\n            evidence = {\n                str(current.get("evidence", "")),\n                str(item.get("evidence", "")),\n            }\n            current["evidence"] = "+".join(sorted(value for value in evidence if value))\n    results = list(merged.values())\n    results.sort(\n        key=lambda item: (\n            int(item.get("first_position", 0)),\n            str(item.get("text", "")),\n        )\n    )\n    return results\n\n\ndef insert_recovered_examples(\n'''
+          replace_once(marker, insertion)
+
+          replace_once(
+              '            print("SECTION_AUDIT_POLICY=FORCED_ENGLISH_NO_VAD_RECOVER_REPEATED_MISSING_EXAMPLES_ONLY")\n',
+              '            print("SECTION_AUDIT_POLICY=FORCED_ENGLISH_FULL_THEN_CHUNKED_IF_RECOVERY_BELOW_TARGET")\n',
+          )
+
+          replace_once(
+              '            section_recovered_examples: list[dict[str, object]] = []\n            post_section_segments = list(post_opening_segments)\n',
+              '            section_recovered_examples: list[dict[str, object]] = []\n            section_chunk_recovered_examples: list[dict[str, object]] = []\n            section_chunk_seconds = 0.0\n            section_chunk_windows = 0\n            post_section_segments = list(post_opening_segments)\n',
+          )
+
+          old = '''                    section_recovered_examples = recover_repeated_section_examples(\n                        baseline_section_text,\n                        section_decision.audit_text,\n                    )\n                    section_decision.accepted = bool(section_recovered_examples)\n'''
+          new = '''                    section_recovered_examples = recover_repeated_section_examples(\n                        baseline_section_text,\n                        section_decision.audit_text,\n                    )\n                    if (\n                        len(section_recovered_examples)\n                        < SECTION_TARGET_RECOVERED_EXAMPLES\n                    ):\n                        chunk_started = time.perf_counter()\n                        chunked_segments, section_chunk_windows = (\n                            transcribe_chunked_english_section(\n                                primary_model,\n                                audio,\n                                start=section_start,\n                                end=section_end,\n                            )\n                        )\n                        section_chunk_seconds = time.perf_counter() - chunk_started\n                        chunked_text = (\n                            format_transcript(chunked_segments)\n                            if chunked_segments\n                            else ""\n                        )\n                        existing_recovered_text = "\\n".join(\n                            str(item["text"])\n                            for item in section_recovered_examples\n                        )\n                        section_chunk_recovered_examples = (\n                            recover_repeated_section_examples(\n                                baseline_section_text\n                                + "\\n"\n                                + existing_recovered_text,\n                                chunked_text,\n                            )\n                        )\n                        for item in section_chunk_recovered_examples:\n                            item["evidence"] = (\n                                "repeated_in_chunked_forced_english_audit"\n                            )\n                        section_recovered_examples = merge_recovered_examples(\n                            section_recovered_examples,\n                            section_chunk_recovered_examples,\n                        )\n                    section_decision.accepted = bool(section_recovered_examples)\n'''
+          replace_once(old, new)
+
+          replace_once(
+              '                        f"RECOVERED_EXAMPLES={len(section_recovered_examples)} "\n                        f"REASON={section_decision.reason}"\n',
+              '                        f"RECOVERED_EXAMPLES={len(section_recovered_examples)} "\n                        f"CHUNK_WINDOWS={section_chunk_windows} "\n                        f"CHUNK_SECONDS={section_chunk_seconds:.3f} "\n                        f"REASON={section_decision.reason}"\n',
+          )
+
+          replace_once(
+              '                    "mode": "batched_turbo_guarded_opening_and_repeated_example_recovery",\n',
+              '                    "mode": "batched_turbo_guarded_opening_full_and_chunked_example_recovery",\n',
+          )
+
+          replace_once(
+              '                    "recovered_examples": section_recovered_examples,\n                    "merge_policy": "append_repeated_missing_examples_without_replacing_baseline_section",\n',
+              '                    "recovered_examples": section_recovered_examples,\n                    "full_section_recovered_count": (\n                        len(section_recovered_examples)\n                        - len(section_chunk_recovered_examples)\n                    ),\n                    "chunked_recovered_count": len(section_chunk_recovered_examples),\n                    "chunked_window_count": section_chunk_windows,\n                    "chunked_seconds": section_chunk_seconds,\n                    "chunk_seconds": SECTION_CHUNK_SECONDS,\n                    "chunk_overlap_seconds": SECTION_CHUNK_OVERLAP_SECONDS,\n                    "target_recovered_examples": SECTION_TARGET_RECOVERED_EXAMPLES,\n                    "merge_policy": "append_repeated_missing_examples_without_replacing_baseline_section",\n',
+          )
+
+          replace_once(
+              '                    "essential_section_audit_seconds": section_seconds,\n                    "large_v3_repair_seconds": repair_seconds,\n',
+              '                    "essential_section_audit_seconds": section_seconds,\n                    "essential_section_chunk_audit_seconds": section_chunk_seconds,\n                    "essential_section_chunk_windows": section_chunk_windows,\n                    "large_v3_repair_seconds": repair_seconds,\n',
+          )
+
+          replace_once(
+              '            print(f"ESSENTIAL_SECTION_AUDIT_SECONDS={section_seconds:.3f}")\n',
+              '            print(f"ESSENTIAL_SECTION_AUDIT_SECONDS={section_seconds:.3f}")\n            print(\n                f"ESSENTIAL_SECTION_CHUNK_AUDIT_SECONDS="\n                f"{section_chunk_seconds:.3f}"\n            )\n            print(f"ESSENTIAL_SECTION_CHUNK_WINDOWS={section_chunk_windows}")\n',
+          )
+
+          path.write_text(source, encoding='utf-8')
+          PY
+      - name: Validate Python syntax
+        run: python -m py_compile TRANSCRIBE_B.py
+      - name: Commit patched program
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add TRANSCRIBE_B.py
+          git commit -m "Add chunked fallback for unresolved repeated examples"
+          git push origin HEAD:${{ github.head_ref }}
