@@ -1,0 +1,176 @@
+name: Build converged transcription v23
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/build_v23.yml
+      - TRANSCRIBE_B.py
+
+permissions:
+  contents: write
+
+jobs:
+  build-v23:
+    if: github.head_ref == 'deliverables/20260802-converged-transcription-v23'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Patch v23 source
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path('TRANSCRIBE_B.py')
+          source = path.read_text(encoding='utf-8')
+
+          source = source.replace('TRANSCRIPTION_VERSION = 22', 'TRANSCRIPTION_VERSION = 23', 1)
+          source = source.replace('radio-transcription-v21', 'radio-transcription-v23')
+
+          old_constants = '''SECTION_WINDOW_SECONDS = 30.0
+          SECTION_WINDOW_HOP_SECONDS = 10.0
+          EVENT_CLUSTER_SECONDS = 7.0
+          LOCAL_DUPLICATE_PADDING_SECONDS = 5.0
+          MIN_EVENT_SOURCE_SUPPORT = 2
+          MIN_EVENT_AVG_LOGPROB = -0.55
+          MIN_REPEATED_EVENT_AVG_LOGPROB = -0.48
+          V22_PATCH_APPLIED = True
+          '''
+          new_constants = '''SECTION_WINDOW_SECONDS = 90.0
+          SECTION_WINDOW_HOP_SECONDS = 45.0
+          EVENT_CLUSTER_GAP_SECONDS = 6.0
+          LOCAL_DUPLICATE_PADDING_SECONDS = 5.0
+          MIN_EVENT_SOURCE_SUPPORT = 2
+          MIN_EVENT_AVG_LOGPROB = -0.55
+          MIN_REPEATED_EVENT_AVG_LOGPROB = -0.48
+          V22_PATCH_APPLIED = True
+          V23_PATCH_APPLIED = True
+          '''
+          if old_constants in source:
+              source = source.replace(old_constants, new_constants, 1)
+          elif 'V23_PATCH_APPLIED = True' not in source:
+              raise RuntimeError('v23 constants block not found')
+
+          old_clean = '''    text = re.sub(r"\\s+([,.!?;:])", r"\\1", text)
+              return text.strip()
+          '''
+          new_clean = '''    text = re.sub(r"\\s+([,.!?;:])", r"\\1", text)
+              text = re.sub(r"([.!?])\\1+", r"\\1", text)
+              return text.strip()
+          '''
+          if old_clean in source:
+              source = source.replace(old_clean, new_clean, 1)
+          elif 'text = re.sub(r"([.!?])\\1+", r"\\1", text)' not in source:
+              raise RuntimeError('clean_text patch point not found')
+
+          old_events = '''        events: list[list[dict[str, object]]] = []
+                  for observation in matching:
+                      midpoint = float(observation["midpoint"])
+                      if not events:
+                          events.append([observation])
+                          continue
+                      previous_midpoint = sum(float(item["midpoint"]) for item in events[-1]) / len(
+                          events[-1]
+                      )
+                      if midpoint - previous_midpoint > EVENT_CLUSTER_SECONDS:
+                          events.append([observation])
+                      else:
+                          events[-1].append(observation)
+          '''
+          new_events = '''        events: list[list[dict[str, object]]] = []
+                  for observation in matching:
+                      if not events:
+                          events.append([observation])
+                          continue
+                      previous_end = max(float(item["end"]) for item in events[-1])
+                      if float(observation["start"]) > previous_end + EVENT_CLUSTER_GAP_SECONDS:
+                          events.append([observation])
+                      else:
+                          events[-1].append(observation)
+          '''
+          if old_events in source:
+              source = source.replace(old_events, new_events, 1)
+          elif 'EVENT_CLUSTER_GAP_SECONDS' not in source:
+              raise RuntimeError('event clustering patch point not found')
+
+          source = source.replace('source=f"v21_{slug}_w{window_count:02d}"', 'source=f"v23_{slug}_w{window_count:02d}"')
+          source = source.replace('source="turbo_v21_time_local_section_consensus"', 'source="turbo_v23_time_local_section_consensus"')
+          source = source.replace('lesson76_time_local_repetition_regression_v21', 'lesson76_time_local_repetition_regression_v23')
+          source = source.replace('FAST_PRIMARY_PLUS_TIME_LOCAL_SECTION_CONSENSUS', 'FAST_PRIMARY_PLUS_COMPACT_SECTION_CONSENSUS')
+          source = source.replace('SECTION_RECOVERY_WINDOW=30_SECONDS_HOP_10_SECONDS', 'SECTION_RECOVERY_WINDOW=90_SECONDS_HOP_45_SECONDS')
+          source = source.replace('SECTION_RECOVERY_CONSENSUS=TIME_LOCAL_OVERLAPPING_WINDOWS', 'SECTION_RECOVERY_CONSENSUS=COMPACT_OVERLAP_EVENT_CONSENSUS')
+          source = source.replace('"source_versions_combined": [14, 16, 18, 19, 20],', '"source_versions_combined": [14, 16, 18, 19, 20, 22],')
+
+          pattern = re.compile(
+              r'(def transcript_indicators\(text: str, segments: list\[SegmentRecord\]\) -> dict\[str, object\]:\n'
+              r'    sections = strict_section_hits\(text\)\n'
+              r'    return \{.*?'
+              r')        "decoder_loop": detect_decoder_loop\(text\),',
+              re.S,
+          )
+          source, count = pattern.subn(
+              r'\1        "decoder_loop": any(detect_decoder_loop(segment.text) for segment in segments),',
+              source,
+              count=1,
+          )
+          if count != 1 and 'any(detect_decoder_loop(segment.text) for segment in segments)' not in source:
+              raise RuntimeError('transcript decoder-loop patch failed')
+
+          path.write_text(source, encoding='utf-8')
+          PY
+      - name: Validate v23 source
+        shell: bash
+        run: |
+          python -m py_compile TRANSCRIBE_B.py
+          python -m pip install --quiet pyflakes
+          pyflakes TRANSCRIBE_B.py
+          python - <<'PY'
+          import importlib.util
+          from pathlib import Path
+
+          source = Path('TRANSCRIBE_B.py').read_text(encoding='utf-8')
+          required = [
+              'TRANSCRIPTION_VERSION = 23',
+              'V23_PATCH_APPLIED = True',
+              'SECTION_WINDOW_SECONDS = 90.0',
+              'SECTION_WINDOW_HOP_SECONDS = 45.0',
+              'EVENT_CLUSTER_GAP_SECONDS = 6.0',
+              'flash_attention=False,',
+              'turbo_v23_time_local_section_consensus',
+              'lesson76_time_local_repetition_regression_v23',
+              'any(detect_decoder_loop(segment.text) for segment in segments)',
+          ]
+          missing = [item for item in required if item not in source]
+          if missing:
+              raise SystemExit(f'missing v23 markers: {missing}')
+          if 'EVENT_CLUSTER_SECONDS = 7.0' in source:
+              raise SystemExit('obsolete event clustering remains')
+
+          spec = importlib.util.spec_from_file_location('transcribe_v23', 'TRANSCRIBE_B.py')
+          module = importlib.util.module_from_spec(spec)
+          assert spec.loader is not None
+          spec.loader.exec_module(module)
+          assert module.clean_text('Sentence....') == 'Sentence.'
+          assert module.SECTION_WINDOW_SECONDS == 90.0
+          assert module.SECTION_WINDOW_HOP_SECONDS == 45.0
+          print('V23_VALIDATION=PASS')
+          PY
+      - name: Commit validated v23
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add TRANSCRIBE_B.py
+          if git diff --cached --quiet; then
+            echo 'No source changes required.'
+          else
+            git commit -m 'Build converged transcription v23'
+            git push origin HEAD:deliverables/20260802-converged-transcription-v23
+          fi
