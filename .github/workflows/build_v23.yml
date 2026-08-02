@@ -133,6 +133,7 @@ jobs:
           pyflakes TRANSCRIBE_B.py
           python - <<'PY'
           import importlib.util
+          import sys
           from pathlib import Path
 
           source = Path('TRANSCRIBE_B.py').read_text(encoding='utf-8')
@@ -156,6 +157,7 @@ jobs:
           spec = importlib.util.spec_from_file_location('transcribe_v23', 'TRANSCRIBE_B.py')
           module = importlib.util.module_from_spec(spec)
           assert spec.loader is not None
+          sys.modules[spec.name] = module
           spec.loader.exec_module(module)
           assert module.clean_text('Sentence....') == 'Sentence.'
           assert module.SECTION_WINDOW_SECONDS == 90.0
