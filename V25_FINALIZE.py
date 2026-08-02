@@ -7,7 +7,7 @@ pattern = re.compile(
     r'def correct_repeated_english_variants\(.*?\n(?=def apply_corrections_to_segments)',
     re.S,
 )
-replacement = '''def correct_repeated_english_variants(
+replacement = r'''def correct_repeated_english_variants(
     text: str,
 ) -> tuple[str, list[dict[str, object]]]:
     candidates = [
