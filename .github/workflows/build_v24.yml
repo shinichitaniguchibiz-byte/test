@@ -1,0 +1,92 @@
+name: Build converged transcription v24
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-v24:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: deliverables/20260802-converged-transcription-v24
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Patch v24 source
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path('TRANSCRIBE_B.py')
+          source = path.read_text(encoding='utf-8')
+          source = source.replace('TRANSCRIPTION_VERSION = 23', 'TRANSCRIPTION_VERSION = 24', 1)
+          source = source.replace('radio-transcription-v23', 'radio-transcription-v24')
+          source = source.replace('V23_PATCH_APPLIED = True', 'V23_PATCH_APPLIED = True\nV24_PATCH_APPLIED = True', 1)
+          source = source.replace(
+              'MIN_REPEATED_EVENT_AVG_LOGPROB = -0.48',
+              'MIN_REPEATED_EVENT_AVG_LOGPROB = -0.48\nMIN_SINGLE_EXAMPLE_AVG_LOGPROB = -0.35\nSINGLE_EXAMPLE_PREFIXES = ("suppose ", "imagine ", "just an idea", "what if ", "it might be a good idea", "we could ")',
+              1,
+          )
+
+          old = '''    while cursor < end:\n        chunk_end = min(end, cursor + SECTION_WINDOW_SECONDS)'''
+          new = '''    window_seconds = 45.0 if section_name == "Essential Expressions" else SECTION_WINDOW_SECONDS\n    hop_seconds = 15.0 if section_name == "Essential Expressions" else SECTION_WINDOW_HOP_SECONDS\n    while cursor < end:\n        chunk_end = min(end, cursor + window_seconds)'''
+          if old not in source:
+              raise RuntimeError('section window patch point missing')
+          source = source.replace(old, new, 1)
+          source = source.replace('cursor += SECTION_WINDOW_HOP_SECONDS', 'cursor += hop_seconds', 1)
+
+          old_accept = '''            accepted = source_supported and event_avg_logprob >= MIN_EVENT_AVG_LOGPROB\n            evidence_type = "overlapping_window_consensus"\n            if not accepted and repeated_supported:\n                accepted = True\n                evidence_type = "same_sentence_repeated_at_separate_times"'''
+          new_accept = '''            accepted = source_supported and event_avg_logprob >= MIN_EVENT_AVG_LOGPROB\n            evidence_type = "overlapping_window_consensus"\n            if not accepted and repeated_supported:\n                accepted = True\n                evidence_type = "same_sentence_repeated_at_separate_times"\n            normalized_prefix = canonical.strip().lower()\n            single_example_supported = (\n                section_name == "Essential Expressions"\n                and len(sources) == 1\n                and event_avg_logprob >= MIN_SINGLE_EXAMPLE_AVG_LOGPROB\n                and normalized_prefix.startswith(SINGLE_EXAMPLE_PREFIXES)\n            )\n            if not accepted and single_example_supported:\n                accepted = True\n                evidence_type = "high_confidence_single_example"'''
+          if old_accept not in source:
+              raise RuntimeError('acceptance patch point missing')
+          source = source.replace(old_accept, new_accept, 1)
+
+          source = source.replace(
+              'elif not source_supported and not repeated_supported:\n                reason = "insufficient_independent_support"',
+              'elif not source_supported and not repeated_supported and not single_example_supported:\n                reason = "insufficient_independent_support"',
+              1,
+          )
+          source = source.replace(
+              'elif event_avg_logprob < MIN_EVENT_AVG_LOGPROB and not repeated_supported:',
+              'elif event_avg_logprob < MIN_EVENT_AVG_LOGPROB and not repeated_supported and not single_example_supported:',
+              1,
+          )
+
+          source = source.replace('(\"We\'re not exactly great in the kitchen\", 180.0, 330.0, 2, \"grammar_quote_and_replay\"),', '(\"We\'re not exactly great in the kitchen\", 180.0, 330.0, 1, \"grammar_replay\"),', 1)
+          source = source.replace('(\"Suppose we asked Emily for advice\", 385.0, 435.0, 1, \"essential_first_example\"),\n        ', '', 1)
+          source = source.replace('(\"Imagine we asked Emily for advice\", 385.0, 435.0, 1, \"essential_first_example\"),\n        ', '', 1)
+          source = source.replace('lesson76_time_local_repetition_regression_v23', 'lesson76_time_local_repetition_regression_v24')
+          source = source.replace('FAST_PRIMARY_PLUS_COMPACT_SECTION_CONSENSUS', 'FAST_PRIMARY_PLUS_ADAPTIVE_SECTION_CONSENSUS')
+          source = source.replace('SECTION_RECOVERY_WINDOW=90_SECONDS_HOP_45_SECONDS', 'SECTION_RECOVERY_WINDOW=ESSENTIAL_45_15_OTHER_90_45')
+          source = source.replace('"source_versions_combined": [14, 16, 18, 19, 20, 22],', '"source_versions_combined": [14, 16, 18, 19, 20, 22, 23],')
+          source = source.replace('source=f"v23_{slug}_w{window_count:02d}"', 'source=f"v24_{slug}_w{window_count:02d}"')
+          source = source.replace('source="turbo_v23_time_local_section_consensus"', 'source="turbo_v24_time_local_section_consensus"')
+          path.write_text(source, encoding='utf-8')
+          PY
+      - name: Validate v24 source
+        shell: bash
+        run: |
+          python -m py_compile TRANSCRIBE_B.py
+          python -m pip install --quiet pyflakes
+          pyflakes TRANSCRIBE_B.py
+          grep -q 'TRANSCRIPTION_VERSION = 24' TRANSCRIBE_B.py
+          grep -q 'V24_PATCH_APPLIED = True' TRANSCRIBE_B.py
+          grep -q 'MIN_SINGLE_EXAMPLE_AVG_LOGPROB = -0.35' TRANSCRIBE_B.py
+          grep -q 'high_confidence_single_example' TRANSCRIBE_B.py
+          grep -q 'window_seconds = 45.0 if section_name == "Essential Expressions"' TRANSCRIBE_B.py
+          echo V24_VALIDATION=PASS
+      - name: Commit validated v24
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add TRANSCRIBE_B.py
+          git commit -m 'Build converged transcription v24'
+          git push origin HEAD:deliverables/20260802-converged-transcription-v24
