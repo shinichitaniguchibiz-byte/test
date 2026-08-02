@@ -250,3 +250,6 @@ source = source.replace(
 )
 
 path.write_text(source, encoding='utf-8')
+
+finalize_source = Path('V25_FINALIZE.py').read_text(encoding='utf-8')
+exec(compile(finalize_source, 'V25_FINALIZE.py', 'exec'), {'__name__': '__main__'})
