@@ -27,7 +27,9 @@ DEFAULT_BATCH_SIZE = 8
 DEFAULT_OPENING_AUDIT_SECONDS = 210.0
 DEFAULT_MAX_REPAIR_WINDOWS = 1
 OPENING_AUDIT_PADDING_SECONDS = 2.5
+SECTION_AUDIT_PADDING_SECONDS = 2.0
 REPAIR_PADDING_SECONDS = 4.0
+V15_PATCH_APPLIED = True
 JST = timezone(timedelta(hours=9), name="JST")
 
 RUNTIME_PACKAGES = (
@@ -124,6 +126,27 @@ class OpeningAuditDecision:
     audit_anchor_hits: int
     baseline_section_hits: int
     audit_section_hits: int
+
+
+@dataclass
+class SectionAuditDecision:
+    accepted: bool
+    reason: str
+    section_name: str
+    core_start: float
+    core_end: float
+    baseline_text: str
+    audit_text: str
+    coverage_ratio: float
+    token_recall: float
+    baseline_score: float
+    audit_score: float
+    baseline_anchor_hits: int
+    audit_anchor_hits: int
+    baseline_section_hits: int
+    audit_section_hits: int
+    baseline_english_candidates: int
+    audit_english_candidates: int
 
 
 @dataclass
@@ -674,10 +697,104 @@ def discover_repeated_anchors(segments: Iterable[SegmentRecord]) -> list[str]:
     for cluster in clusters:
         if len(cluster) < 2:
             continue
-        representative = min(cluster, key=lambda value: len(value))
+        normalized_counts = Counter(
+            normalize_for_comparison(value) for value in cluster
+        )
+        representative_normalized = max(
+            normalized_counts,
+            key=lambda value: (normalized_counts[value], len(value)),
+        )
+        matching = [
+            value
+            for value in cluster
+            if normalize_for_comparison(value) == representative_normalized
+        ]
+        representative = max(matching, key=len)
         results.append((len(cluster), representative))
     results.sort(key=lambda item: (-item[0], -len(item[1])))
     return [text for _count, text in results[:10]]
+
+
+def correct_repeated_english_variants(
+    text: str,
+) -> tuple[str, list[dict[str, object]], int]:
+    candidates = split_english_candidates(text)
+    clusters: list[list[str]] = []
+    for candidate in candidates:
+        normalized = normalize_for_comparison(candidate)
+        best_index: int | None = None
+        best_ratio = 0.0
+        for index, cluster in enumerate(clusters):
+            ratio = SequenceMatcher(
+                None,
+                normalized,
+                normalize_for_comparison(cluster[0]),
+            ).ratio()
+            if ratio > best_ratio:
+                best_index = index
+                best_ratio = ratio
+        if best_index is not None and best_ratio >= 0.82:
+            clusters[best_index].append(candidate)
+        else:
+            clusters.append([candidate])
+
+    corrected = text
+    corrections: list[dict[str, object]] = []
+    unresolved = 0
+    for cluster in clusters:
+        exact_counts = Counter(clean_text(value) for value in cluster)
+        if sum(exact_counts.values()) < 4 or len(exact_counts) < 2:
+            continue
+        canonical, canonical_count = max(
+            exact_counts.items(),
+            key=lambda item: (item[1], len(item[0])),
+        )
+        canonical_words = english_words(canonical)
+        if canonical_count < 2 or len(canonical_words) < 5:
+            continue
+        cluster_changed = False
+        for variant, variant_count in exact_counts.items():
+            if variant == canonical:
+                continue
+            variant_words = english_words(variant)
+            if not variant_words:
+                continue
+            if canonical_words[0].lower() != variant_words[0].lower():
+                continue
+            if canonical_words[-1].lower() != variant_words[-1].lower():
+                continue
+            if abs(len(canonical_words) - len(variant_words)) > 3:
+                continue
+            canonical_normalized = normalize_for_comparison(canonical)
+            variant_normalized = normalize_for_comparison(variant)
+            if canonical_normalized in variant_normalized or variant_normalized in canonical_normalized:
+                continue
+            similarity = SequenceMatcher(
+                None,
+                canonical_normalized,
+                variant_normalized,
+            ).ratio()
+            if similarity < 0.82 or canonical_count <= variant_count:
+                continue
+            occurrences = corrected.count(variant)
+            if occurrences == 0:
+                continue
+            corrected = corrected.replace(variant, canonical)
+            corrections.append(
+                {
+                    'from': variant,
+                    'to': canonical,
+                    'occurrences': occurrences,
+                    'canonical_count': canonical_count,
+                    'variant_count': variant_count,
+                    'similarity': round(similarity, 6),
+                }
+            )
+            cluster_changed = True
+        if not cluster_changed:
+            unresolved += 1
+
+    return corrected, corrections, unresolved
 
 
 def anchor_exact_hits(text: str, anchors: Iterable[str]) -> int:
@@ -1002,6 +1119,112 @@ def apply_opening_audit(
     return deduplicate_segments([*audit_segments, *retained])
 
 
+def segments_between(
+    segments: Iterable[SegmentRecord],
+    start_time: float,
+    end_time: float,
+) -> list[SegmentRecord]:
+    return [
+        segment
+        for segment in segments
+        if start_time <= (segment.start + segment.end) / 2.0 <= end_time
+    ]
+
+
+def find_section_interval(
+    segments: list[SegmentRecord],
+    start_section: str,
+    end_section: str,
+) -> tuple[float, float] | None:
+    start_time: float | None = None
+    for segment in sorted(segments, key=lambda item: (item.start, item.end)):
+        hits = strict_section_hits(segment.text)
+        if start_time is None and hits.get(start_section, False):
+            start_time = segment.start
+            continue
+        if start_time is not None and hits.get(end_section, False):
+            if segment.start > start_time:
+                return start_time, segment.start
+    return None
+
+
+def decide_section_audit(
+    section_name: str,
+    baseline_segments: list[SegmentRecord],
+    audit_segments: list[SegmentRecord],
+    anchors: list[str],
+    core_start: float,
+    core_end: float,
+) -> SectionAuditDecision:
+    baseline_text = format_transcript(baseline_segments).strip()
+    audit_text = format_transcript(audit_segments).strip() if audit_segments else ''
+    coverage_ratio = len(audit_text) / max(len(baseline_text), 1)
+    recall = token_recall(baseline_text, audit_text)
+    baseline_score = quality_score(baseline_text, baseline_segments)
+    audit_score = quality_score(audit_text, audit_segments)
+    baseline_anchor_hits = anchor_exact_hits(baseline_text, anchors)
+    audit_anchor_hits = anchor_exact_hits(audit_text, anchors)
+    baseline_section_hits = sum(strict_section_hits(baseline_text).values())
+    audit_section_hits = sum(strict_section_hits(audit_text).values())
+    baseline_candidates = len(split_english_candidates(baseline_text))
+    audit_candidates = len(split_english_candidates(audit_text))
+
+    accepted = False
+    reason = 'baseline_retained'
+    if not audit_text:
+        reason = 'audit_empty'
+    elif '�' in audit_text or detect_decoder_loop(audit_text):
+        reason = 'audit_anomaly_rejected'
+    elif not 0.95 <= coverage_ratio <= 1.65:
+        reason = 'audit_coverage_guard_rejected'
+    elif recall < 0.72:
+        reason = 'audit_content_recall_rejected'
+    elif audit_anchor_hits < baseline_anchor_hits:
+        reason = 'audit_anchor_guard_rejected'
+    elif audit_section_hits < baseline_section_hits:
+        reason = 'audit_section_guard_rejected'
+    elif audit_candidates >= baseline_candidates + 2 and audit_score >= baseline_score - 0.10:
+        accepted = True
+        reason = 'section_examples_recovered'
+    elif coverage_ratio >= 1.06 and audit_score >= baseline_score - 0.05:
+        accepted = True
+        reason = 'section_coverage_improved'
+
+    return SectionAuditDecision(
+        accepted=accepted,
+        reason=reason,
+        section_name=section_name,
+        core_start=core_start,
+        core_end=core_end,
+        baseline_text=baseline_text,
+        audit_text=audit_text,
+        coverage_ratio=coverage_ratio,
+        token_recall=recall,
+        baseline_score=baseline_score,
+        audit_score=audit_score,
+        baseline_anchor_hits=baseline_anchor_hits,
+        audit_anchor_hits=audit_anchor_hits,
+        baseline_section_hits=baseline_section_hits,
+        audit_section_hits=audit_section_hits,
+        baseline_english_candidates=baseline_candidates,
+        audit_english_candidates=audit_candidates,
+    )
+
+
+def apply_section_audit(
+    segments: list[SegmentRecord],
+    audit_segments: list[SegmentRecord],
+    core_start: float,
+    core_end: float,
+) -> list[SegmentRecord]:
+    retained = [
+        segment
+        for segment in segments
+        if not core_start <= (segment.start + segment.end) / 2.0 <= core_end
+    ]
+    return deduplicate_segments([*retained, *audit_segments])
+
+
 def detect_strong_events(segments: list[SegmentRecord]) -> list[SuspicionEvent]:
     events: list[SuspicionEvent] = []
     for index, segment in enumerate(segments):
@@ -1227,7 +1450,7 @@ def automatic_review_status(
         return "REVIEW_REQUIRED"
     if int(indicators["text_characters"]) < int(audio_seconds * 4.2):
         return "REVIEW_REQUIRED"
-    return "ACCEPT_FOR_AI_POST_CORRECTION"
+    return "READY_FOR_AI_CORRECTION"
 
 
 def secondary_processing_effect(
@@ -1354,6 +1577,33 @@ def opening_decision_to_dict(
     }
 
 
+def section_decision_to_dict(
+    decision: SectionAuditDecision | None,
+) -> dict[str, object]:
+    if decision is None:
+        return {'status': 'NOT_RUN'}
+    return {
+        'status': 'RUN',
+        'accepted': decision.accepted,
+        'decision_reason': decision.reason,
+        'section_name': decision.section_name,
+        'core_start': round(decision.core_start, 3),
+        'core_end': round(decision.core_end, 3),
+        'coverage_ratio': round(decision.coverage_ratio, 6),
+        'token_recall': round(decision.token_recall, 6),
+        'baseline_score': round(decision.baseline_score, 6),
+        'audit_score': round(decision.audit_score, 6),
+        'baseline_anchor_hits': decision.baseline_anchor_hits,
+        'audit_anchor_hits': decision.audit_anchor_hits,
+        'baseline_section_hits': decision.baseline_section_hits,
+        'audit_section_hits': decision.audit_section_hits,
+        'baseline_english_candidates': decision.baseline_english_candidates,
+        'audit_english_candidates': decision.audit_english_candidates,
+        'baseline_text': decision.baseline_text,
+        'audit_text': decision.audit_text,
+    }
+
+
 def repair_decision_to_dict(decision: RepairDecision) -> dict[str, object]:
     return {
         "window_index": decision.window_index,
@@ -1454,9 +1704,11 @@ def run_child() -> int:
             timer.finish()
 
             print("TRANSCRIPTION_CONFIGURATION")
-            print("TRANSCRIPTION_MODE=BATCHED_TURBO_GUARDED_OPENING_AUDIT")
+            print("TRANSCRIPTION_MODE=BATCHED_TURBO_GUARDED_OPENING_AND_SECTION_AUDIT")
             print("PRIMARY_POLICY=FAST_BATCHED_VAD_FULL_PROGRAM_PASS")
             print("OPENING_AUDIT_POLICY=NO_VAD_ADD_COVERAGE_ONLY_WITH_CONTENT_GUARDS")
+            print("SECTION_AUDIT_POLICY=ESSENTIAL_EXPRESSIONS_NO_VAD_ONLY_WHEN_EXAMPLES_ARE_SPARSE")
+            print("REPEATED_ENGLISH_POLICY=WITHIN_RECORDING_MAJORITY_CONSENSUS_ONLY")
             print("COMPLEMENTARY_LANGUAGE_RECOVERY=DISABLED_NO_MEASURABLE_GAIN")
             print("LARGE_V3_POLICY=RARE_STRONG_ANOMALIES_ONLY")
             print("EDUCATIONAL_FORMATTING_APPLIED=NO")
@@ -1578,15 +1830,85 @@ def run_child() -> int:
                 print("OPENING_AUDIT_DECISION=NOT_RUN")
             timer.finish()
 
+            timer.start("essential_section_no_vad_audit")
+            section_decision: SectionAuditDecision | None = None
+            post_section_segments = list(post_opening_segments)
+            section_interval = find_section_interval(
+                post_opening_segments,
+                "Essential Expressions",
+                "Practical Usage",
+            )
+            if section_interval is not None:
+                section_start, section_end = section_interval
+                baseline_section_segments = segments_between(
+                    post_opening_segments,
+                    section_start,
+                    section_end,
+                )
+                baseline_section_text = (
+                    format_transcript(baseline_section_segments)
+                    if baseline_section_segments
+                    else ""
+                )
+                if len(split_english_candidates(baseline_section_text)) < 6:
+                    audit_start = max(0.0, section_start - SECTION_AUDIT_PADDING_SECONDS)
+                    audit_end = min(audio_seconds, section_end + SECTION_AUDIT_PADDING_SECONDS)
+                    section_audit_slice = transcribe_slice(
+                        primary_model,
+                        audio,
+                        start=audit_start,
+                        end=audit_end,
+                        language=requested_language,
+                        source="turbo_essential_no_vad",
+                        beam_size=5,
+                    )
+                    section_audit_segments = segments_between(
+                        section_audit_slice,
+                        section_start,
+                        section_end,
+                    )
+                    section_decision = decide_section_audit(
+                        "Essential Expressions",
+                        baseline_section_segments,
+                        section_audit_segments,
+                        anchors,
+                        section_start,
+                        section_end,
+                    )
+                    print(
+                        "SECTION_AUDIT_DECISION "
+                        f"ACCEPTED={'YES' if section_decision.accepted else 'NO'} "
+                        f"SECTION={section_decision.section_name} "
+                        f"CORE_START={section_decision.core_start:.3f} "
+                        f"CORE_END={section_decision.core_end:.3f} "
+                        f"COVERAGE_RATIO={section_decision.coverage_ratio:.3f} "
+                        f"TOKEN_RECALL={section_decision.token_recall:.3f} "
+                        f"BASELINE_EXAMPLES={section_decision.baseline_english_candidates} "
+                        f"AUDIT_EXAMPLES={section_decision.audit_english_candidates} "
+                        f"REASON={section_decision.reason}"
+                    )
+                    if section_decision.accepted:
+                        post_section_segments = apply_section_audit(
+                            post_opening_segments,
+                            section_audit_segments,
+                            section_start,
+                            section_end,
+                        )
+                else:
+                    print("SECTION_AUDIT_DECISION=SKIPPED_SUFFICIENT_ENGLISH_COVERAGE")
+            else:
+                print("SECTION_AUDIT_DECISION=NOT_APPLICABLE")
+            timer.finish()
+
             del primary_model
             gc.collect()
 
             timer.start("detect_strong_repair_windows")
-            post_opening_text = format_transcript(post_opening_segments)
-            strong_events = detect_strong_events(post_opening_segments)
+            post_opening_text = format_transcript(post_section_segments)
+            strong_events = detect_strong_events(post_section_segments)
             repair_windows = build_repair_windows(
                 strong_events,
-                post_opening_segments,
+                post_section_segments,
                 audio_seconds,
                 arguments.max_repair_windows,
             )
@@ -1604,7 +1926,7 @@ def run_child() -> int:
             print(f"STRONG_REPAIR_WINDOW_COUNT={len(repair_windows)}")
 
             timer.start("selective_large_v3_repairs")
-            final_segments = list(post_opening_segments)
+            final_segments = list(post_section_segments)
             repair_decisions: list[RepairDecision] = []
             repair_model_updated = False
             if repair_windows:
@@ -1671,6 +1993,11 @@ def run_child() -> int:
             timer.start("assemble_final_transcript")
             final_segments = deduplicate_segments(final_segments)
             final_text = format_transcript(final_segments)
+            final_text, consensus_corrections, unresolved_variant_clusters = (
+                correct_repeated_english_variants(final_text)
+            )
+            print(f"CONSENSUS_CORRECTIONS_APPLIED={len(consensus_corrections)}")
+            print(f"REPEATED_VARIANT_CLUSTERS_UNRESOLVED={unresolved_variant_clusters}")
             final_indicators = transcript_indicators(
                 final_text,
                 final_segments,
@@ -1686,6 +2013,12 @@ def run_child() -> int:
                 baseline_indicators,
                 final_indicators,
             )
+            if consensus_corrections:
+                effect = "MEASURABLE_CONSENSUS_CORRECTION"
+            elif section_decision is not None and section_decision.accepted:
+                effect = "SECTION_COVERAGE_GAIN"
+            elif effect == "MEASURABLE_GAIN":
+                effect = "COVERAGE_CHANGE_NOT_ACCURACY_MEASUREMENT"
             timer.finish()
 
             timer.start("calculate_reference_metrics")
@@ -1706,6 +2039,7 @@ def run_child() -> int:
 
             primary_seconds = timer.seconds_for("primary_batched_transcription")
             opening_seconds = timer.seconds_for("opening_no_vad_audit")
+            section_seconds = timer.seconds_for("essential_section_no_vad_audit")
             repair_seconds = timer.seconds_for("selective_large_v3_repairs")
             accepted_repairs = sum(item.accepted for item in repair_decisions)
             opening_accepted = bool(opening_decision and opening_decision.accepted)
@@ -1720,7 +2054,7 @@ def run_child() -> int:
                     "metrics": str(output_paths.metrics),
                 },
                 "configuration": {
-                    "mode": "batched_turbo_guarded_opening_audit",
+                    "mode": "batched_turbo_guarded_opening_and_section_audit",
                     "language": arguments.language,
                     "batch_size_requested": arguments.batch_size,
                     "batch_size_used": batch_size_used,
@@ -1739,6 +2073,13 @@ def run_child() -> int:
                 "repeated_phrase_anchors": anchors,
                 "baseline": baseline_indicators,
                 "opening_audit": opening_decision_to_dict(opening_decision),
+                "essential_section_audit": section_decision_to_dict(section_decision),
+                "repeated_english_consensus": {
+                    "correction_count": len(consensus_corrections),
+                    "corrections": consensus_corrections,
+                    "unresolved_variant_cluster_count": unresolved_variant_clusters,
+                    "source": "same_recording_repeated_occurrences_only",
+                },
                 "strong_repair_detection": {
                     "event_count": len(strong_events),
                     "reason_counts": dict(
@@ -1771,6 +2112,10 @@ def run_child() -> int:
                 "secondary_processing": {
                     "effect": effect,
                     "opening_audit_accepted": opening_accepted,
+                    "essential_section_audit_accepted": bool(
+                        section_decision and section_decision.accepted
+                    ),
+                    "consensus_corrections_applied": len(consensus_corrections),
                     "large_v3_repairs_accepted": accepted_repairs,
                     "text_character_change": (
                         int(final_indicators["text_characters"])
@@ -1788,8 +2133,9 @@ def run_child() -> int:
                 "performance": {
                     "primary_seconds": primary_seconds,
                     "opening_audit_seconds": opening_seconds,
+                    "essential_section_audit_seconds": section_seconds,
                     "large_v3_repair_seconds": repair_seconds,
-                    "secondary_seconds": opening_seconds + repair_seconds,
+                    "secondary_seconds": opening_seconds + section_seconds + repair_seconds,
                     "total_seconds": timer.total_seconds,
                     "primary_realtime_factor": primary_seconds / audio_seconds,
                     "total_realtime_factor": timer.total_seconds / audio_seconds,
@@ -1808,11 +2154,19 @@ def run_child() -> int:
             print(f"METRICS_FILE={output_paths.metrics}")
             print(f"PRIMARY_SECONDS={primary_seconds:.3f}")
             print(f"OPENING_AUDIT_SECONDS={opening_seconds:.3f}")
+            print(f"ESSENTIAL_SECTION_AUDIT_SECONDS={section_seconds:.3f}")
             print(f"LARGE_V3_REPAIR_SECONDS={repair_seconds:.3f}")
-            print(f"SECONDARY_SECONDS={opening_seconds + repair_seconds:.3f}")
+            print(
+                f"SECONDARY_SECONDS="
+                f"{opening_seconds + section_seconds + repair_seconds:.3f}"
+            )
             print(f"TOTAL_SECONDS={total_seconds:.3f}")
             print(f"TOTAL_PROCESS_REALTIME_FACTOR={total_seconds / audio_seconds:.4f}")
             print(f"OPENING_AUDIT_ACCEPTED={'YES' if opening_accepted else 'NO'}")
+            print(
+                f"ESSENTIAL_SECTION_AUDIT_ACCEPTED="
+                f"{'YES' if section_decision and section_decision.accepted else 'NO'}"
+            )
             print(f"LARGE_V3_WINDOWS_PROCESSED={len(repair_windows)}")
             print(f"LARGE_V3_REPAIRS_ACCEPTED={accepted_repairs}")
             print(f"BASELINE_TEXT_CHARACTERS={len(baseline_text)}")
