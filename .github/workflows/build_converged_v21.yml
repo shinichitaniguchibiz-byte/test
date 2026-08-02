@@ -1,4 +1,5 @@
 # v21 convergence validation
+# trigger: 2026-08-02T15:52+09:00
 name: Build converged transcription v21
 
 on:
