@@ -82,9 +82,9 @@ replacement = '''def correct_repeated_english_variants(
             ).ratio()
             if similarity < 0.74 or canonical_count <= variant_count:
                 continue
-            word_pattern = r"\\b" + r"[\\s,;:!?'.-]*".join(
+            word_pattern = r"\b" + r"[\s,;:!?'.-]*".join(
                 re.escape(word) for word in variant_words
-            ) + r"\\b[.!?]?"
+            ) + r"\b[.!?]?"
             corrected, occurrences = re.subn(
                 word_pattern,
                 canonical,
@@ -106,7 +106,7 @@ replacement = '''def correct_repeated_english_variants(
 
 
 '''
-source, count = pattern.subn(replacement, source, count=1)
+source, count = pattern.subn(lambda _match: replacement, source, count=1)
 if count != 1:
     raise RuntimeError('final repeated correction replacement failed')
 path.write_text(source, encoding='utf-8')
