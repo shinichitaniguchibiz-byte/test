@@ -1,0 +1,27 @@
+name: Validate TRANSCRIBE_B v18
+
+on:
+  pull_request:
+    paths:
+      - TRANSCRIBE_B.py
+      - .github/workflows/validate_transcribe_v18.yml
+
+jobs:
+  validate:
+    if: github.head_ref == 'deliverables/20260802-balanced-transcription-v18'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m py_compile TRANSCRIBE_B.py
+      - run: python -m pip install --quiet pyflakes
+      - run: pyflakes TRANSCRIBE_B.py
+      - name: Reject obsolete runtime variables
+        run: |
+          ! grep -q 'section_chunk_recovered_examples' TRANSCRIBE_B.py
+          ! grep -q 'section_chunk_seconds' TRANSCRIBE_B.py
+          ! grep -q 'SECTION_TARGET_RECOVERED_EXAMPLES' TRANSCRIBE_B.py
