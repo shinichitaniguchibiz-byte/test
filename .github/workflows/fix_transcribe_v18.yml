@@ -1,0 +1,46 @@
+name: Fix TRANSCRIBE_B v18
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/fix_transcribe_v18.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.head_ref == 'deliverables/20260802-balanced-transcription-v18'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Remove obsolete variable and validate
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('TRANSCRIBE_B.py')
+          source = path.read_text(encoding='utf-8')
+          old = '            post_opening_text = format_transcript(post_section_segments)\n'
+          if old in source:
+              source = source.replace(old, '', 1)
+              path.write_text(source, encoding='utf-8')
+          PY
+          python -m py_compile TRANSCRIBE_B.py
+          python -m pip install --quiet pyflakes
+          pyflakes TRANSCRIBE_B.py
+          ! grep -q 'section_chunk_recovered_examples' TRANSCRIBE_B.py
+          ! grep -q 'section_chunk_seconds' TRANSCRIBE_B.py
+          ! grep -q 'SECTION_TARGET_RECOVERED_EXAMPLES' TRANSCRIBE_B.py
+      - name: Commit fix
+        run: |
+          if git diff --quiet; then exit 0; fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add TRANSCRIBE_B.py
+          git commit -m "Remove obsolete v18 runtime variable"
+          git push origin HEAD:${{ github.head_ref }}
