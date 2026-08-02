@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Iterable, TextIO
 
 
-TRANSCRIPTION_VERSION = 23
+TRANSCRIPTION_VERSION = 24
 DEVICE = "cuda"
 COMPUTE_TYPE = "float16"
 SAMPLE_RATE = 16000
@@ -84,6 +84,7 @@ MIN_EVENT_AVG_LOGPROB = -0.55
 MIN_REPEATED_EVENT_AVG_LOGPROB = -0.48
 V22_PATCH_APPLIED = True
 V23_PATCH_APPLIED = True
+V24_PATCH_APPLIED = True
 
 
 class TranscriptionError(RuntimeError):
@@ -282,7 +283,7 @@ def installed_versions() -> dict[str, str | None]:
 def latest_pypi_version(package: str) -> str:
     request = urllib.request.Request(
         f"https://pypi.org/pypi/{package}/json",
-        headers={"User-Agent": "radio-transcription-v23"},
+        headers={"User-Agent": "radio-transcription-v24"},
     )
     with urllib.request.urlopen(request, timeout=15) as response:
         payload = json.load(response)
@@ -523,18 +524,43 @@ def language_label(text: str) -> str:
 
 
 def split_english_candidates(text: str) -> list[str]:
+    normalized_text = clean_text(text.replace("’", "'"))
+    english_runs = re.findall(
+        r"[A-Za-z][A-Za-z0-9'.,!?;:()\- ]{2,}",
+        normalized_text,
+    )
+    sentence_starters = (
+        r"Suppose|Imagine|What if|It might|Just an idea|Dad's|Yeah|True|Us|"
+        r"You know|Okay|Hmm|Let's|We've|We're|We should|In today's|Today's|"
+        r"You ready|One more time|Excellent work|Great work"
+    )
     candidates: list[str] = []
-    for piece in re.split(r"(?<=[.!?])\s+|[\r\n]+", text):
-        piece = clean_text(piece)
-        words = english_words(piece)
-        compact = re.sub(r"\s+", "", piece)
-        if not compact or not 4 <= len(words) <= 40:
+    seen: set[str] = set()
+    for english_run in english_runs:
+        english_run = clean_text(english_run).strip(" ,;:")
+        if not english_run:
             continue
-        if latin_character_count(piece) / len(compact) < 0.82:
-            continue
-        if len({word.lower() for word in words}) / len(words) < 0.42:
-            continue
-        candidates.append(piece)
+        english_run = re.sub(r"\b(Suppose|Imagine),\s*", r"\1 ", english_run)
+        english_run = re.sub(
+            rf",\s+(?=(?:{sentence_starters})\b)",
+            ".\n",
+            english_run,
+        )
+        for piece in re.split(r"(?<=[.!?])\s+|[\r\n]+", english_run):
+            piece = clean_text(piece).strip(" ,;:")
+            words = english_words(piece)
+            compact = re.sub(r"\s+", "", piece)
+            if not compact or not 4 <= len(words) <= 40:
+                continue
+            if latin_character_count(piece) / len(compact) < 0.82:
+                continue
+            if len({word.lower() for word in words}) / len(words) < 0.42:
+                continue
+            key = normalize_for_comparison(piece)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            candidates.append(piece)
     return candidates
 
 
@@ -795,7 +821,7 @@ def transcribe_section_windows(
                 start=cursor,
                 end=chunk_end,
                 language="en",
-                source=f"v23_{slug}_w{window_count:02d}",
+                source=f"v24_{slug}_w{window_count:02d}",
                 beam_size=3,
                 multilingual=False,
             )
@@ -809,16 +835,23 @@ def transcribe_section_windows(
 def candidate_observations(segments: list[SegmentRecord]) -> list[dict[str, object]]:
     observations: list[dict[str, object]] = []
     for segment in segments:
-        for candidate in split_english_candidates(segment.text):
+        candidates = split_english_candidates(segment.text)
+        if not candidates:
+            continue
+        duration = max(segment.end - segment.start, 0.001)
+        candidate_count = len(candidates)
+        for candidate_index, candidate in enumerate(candidates):
             if segment.avg_logprob < -0.72 or detect_decoder_loop(candidate):
                 continue
+            candidate_start = segment.start + duration * candidate_index / candidate_count
+            candidate_end = segment.start + duration * (candidate_index + 1) / candidate_count
             observations.append(
                 {
                     "text": candidate,
                     "normalized": normalize_for_comparison(candidate),
-                    "start": segment.start,
-                    "end": segment.end,
-                    "midpoint": (segment.start + segment.end) / 2.0,
+                    "start": candidate_start,
+                    "end": candidate_end,
+                    "midpoint": (candidate_start + candidate_end) / 2.0,
                     "avg_logprob": segment.avg_logprob,
                     "source": segment.source,
                 }
@@ -977,7 +1010,7 @@ def recover_time_local_consensus(
                         avg_logprob=event_avg_logprob,
                         compression_ratio=0.0,
                         no_speech_prob=0.0,
-                        source="turbo_v23_time_local_section_consensus",
+                        source="turbo_v24_time_local_section_consensus",
                     )
                 )
 
@@ -1236,7 +1269,7 @@ def lesson76_regression(
         )
     return {
         "status": "PASS" if all(bool(item["passed"]) for item in items) else "FAIL",
-        "profile": "lesson76_time_local_repetition_regression_v23",
+        "profile": "lesson76_time_local_repetition_regression_v24",
         "scope": "KNOWN_PHRASE_TIME_AND_OCCURRENCE_REGRESSION_NOT_ACCURACY_PERCENTAGE",
         "passed_count": sum(bool(item["passed"]) for item in items),
         "total_count": len(items),
@@ -1325,11 +1358,12 @@ def run_transcription() -> int:
             print(f"RUN_ID={run_id}")
             print("TRANSCRIPTION_TRANSACTION=1")
             print(f"TRANSCRIPTION_VERSION={TRANSCRIPTION_VERSION}")
-            print("TRANSCRIPTION_MODE=FAST_PRIMARY_PLUS_COMPACT_SECTION_CONSENSUS")
+            print("TRANSCRIPTION_MODE=FAST_PRIMARY_PLUS_MIXED_LANGUAGE_COMPACT_CONSENSUS")
             print("PRIMARY_PASS=FAST_BATCHED_VAD_FULL_AUDIO")
             print("SECTION_RECOVERY=GRAMMAR_ESSENTIAL_PRACTICAL_ONLY")
             print("SECTION_RECOVERY_WINDOW=90_SECONDS_HOP_45_SECONDS")
-            print("SECTION_RECOVERY_CONSENSUS=COMPACT_OVERLAP_EVENT_CONSENSUS")
+            print("SECTION_RECOVERY_CONSENSUS=MIXED_LANGUAGE_COMPACT_OVERLAP_EVENT_CONSENSUS")
+            print("MIXED_LANGUAGE_ENGLISH_EXTRACTION=ENABLED")
             print("FULL_AUDIO_SECOND_PASS=DISABLED")
             print("LARGE_V3_AUTOMATIC_PASS=DISABLED")
             print("CANDIDATES_IN_TRANSCRIPT=NO")
@@ -1539,7 +1573,7 @@ def run_transcription() -> int:
                 "version": TRANSCRIPTION_VERSION,
                 "convergence": {
                     "status": "FINAL_ACCEPTANCE_TEST",
-                    "source_versions_combined": [14, 16, 18, 19, 20, 22],
+                    "source_versions_combined": [14, 16, 18, 19, 20, 22, 23],
                     "v19_removed": [
                         "full_audio_second_pass",
                         "automatic_large_v3_gap_recovery",
@@ -1563,6 +1597,7 @@ def run_transcription() -> int:
                     "opening_audit_seconds": arguments.opening_audit_seconds,
                     "section_window_seconds": SECTION_WINDOW_SECONDS,
                     "section_window_hop_seconds": SECTION_WINDOW_HOP_SECONDS,
+                    "mixed_language_english_extraction": True,
                     "full_audio_second_pass": False,
                     "large_v3_automatic": False,
                     "candidate_text_written_to_transcript": False,
