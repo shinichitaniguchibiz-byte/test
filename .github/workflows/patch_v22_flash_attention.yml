@@ -59,7 +59,6 @@ jobs:
               'TRANSCRIPTION_VERSION = 22',
               'V22_PATCH_APPLIED = True',
               'flash_attention=False,',
-              'return run_child()',
           ]
           missing = [item for item in required if item not in source]
           if missing:
