@@ -1,21 +1,22 @@
 name: Build converged transcription v24
 
 on:
-  push:
-    branches:
-      - deliverables/20260802-converged-transcription-v24
+  pull_request:
+    paths:
+      - .github/workflows/build_v24.yml
+      - TRANSCRIBE_B.py
 
 permissions:
   contents: write
 
 jobs:
   build-v24:
-    if: github.actor != 'github-actions[bot]'
+    if: github.head_ref == 'deliverables/20260802-converged-transcription-v24'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: deliverables/20260802-converged-transcription-v24
+          ref: ${{ github.head_ref }}
           fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
