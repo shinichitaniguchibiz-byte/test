@@ -44,7 +44,11 @@ function Get-GitText([string[]]$GitArgs) {
 
 function Read-Utf8Text([string]$Path) {
     $bytes = [System.IO.File]::ReadAllBytes($Path)
-    return [System.Text.Encoding]::UTF8.GetString($bytes)
+    $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+    if ($text.Length -gt 0 -and [int]$text[0] -eq 0xFEFF) {
+        $text = $text.Substring(1)
+    }
+    return $text
 }
 
 function Normalize-Lines([string]$Text) {
@@ -67,11 +71,18 @@ function Extract-BacktickPayloadLines([string]$Path) {
     return @(Normalize-Lines -Text $payload | Where-Object { $_ -ne "" })
 }
 
+function New-OrdinalHashtable([bool]$IgnoreCase) {
+    if ($IgnoreCase) {
+        return New-Object System.Collections.Hashtable ([System.StringComparer]::OrdinalIgnoreCase)
+    }
+    return New-Object System.Collections.Hashtable ([System.StringComparer]::Ordinal)
+}
+
 function Get-Multiset([string[]]$Lines) {
-    $map = New-Object 'System.Collections.Generic.Dictionary[string,int]' ([System.StringComparer]::Ordinal)
+    $map = New-OrdinalHashtable -IgnoreCase $false
     foreach ($line in $Lines) {
         if ($map.ContainsKey($line)) {
-            $map[$line] = $map[$line] + 1
+            $map[$line] = [int]$map[$line] + 1
         } else {
             $map[$line] = 1
         }
@@ -79,17 +90,17 @@ function Get-Multiset([string[]]$Lines) {
     return $map
 }
 
-function Get-MultisetDiff([System.Collections.Generic.Dictionary[string,int]]$Left, [System.Collections.Generic.Dictionary[string,int]]$Right) {
-    $result = New-Object System.Collections.Generic.List[string]
+function Get-MultisetDiff([System.Collections.Hashtable]$Left, [System.Collections.Hashtable]$Right) {
+    $result = New-Object System.Collections.ArrayList
     foreach ($key in $Left.Keys) {
-        $leftCount = $Left[$key]
+        $leftCount = [int]$Left[$key]
         $rightCount = 0
         if ($Right.ContainsKey($key)) {
-            $rightCount = $Right[$key]
+            $rightCount = [int]$Right[$key]
         }
         if ($leftCount -gt $rightCount) {
             for ($i = 0; $i -lt ($leftCount - $rightCount); $i++) {
-                $result.Add($key)
+                [void]$result.Add([string]$key)
             }
         }
     }
@@ -97,18 +108,18 @@ function Get-MultisetDiff([System.Collections.Generic.Dictionary[string,int]]$Le
 }
 
 function Build-LevelMap([string[]]$Lines, [int]$WordIndex, [int]$LevelIndex) {
-    $map = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Generic.HashSet[string]]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $map = New-OrdinalHashtable -IgnoreCase $true
     foreach ($line in $Lines) {
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
-        $parts = $line -split "`t", -1
+        $parts = $line -split "`t"
         if ($parts.Count -le [Math]::Max($WordIndex, $LevelIndex)) { continue }
         $word = $parts[$WordIndex].Trim()
         $level = $parts[$LevelIndex].Trim()
         if ([string]::IsNullOrWhiteSpace($word) -or [string]::IsNullOrWhiteSpace($level)) { continue }
         if (-not $map.ContainsKey($word)) {
-            $map[$word] = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+            $map[$word] = New-OrdinalHashtable -IgnoreCase $true
         }
-        [void]$map[$word].Add($level)
+        $map[$word][$level] = $true
     }
     return $map
 }
@@ -117,7 +128,7 @@ function Measure-ReferenceCoverage(
     [string[]]$Rows,
     [int]$WordIndex,
     [int]$LevelIndex,
-    [System.Collections.Generic.Dictionary[string,System.Collections.Generic.HashSet[string]]]$ReferenceMap
+    [System.Collections.Hashtable]$ReferenceMap
 ) {
     $stats = [ordered]@{
         NONBLANK = 0
@@ -128,7 +139,7 @@ function Measure-ReferenceCoverage(
     }
     foreach ($line in $Rows) {
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
-        $parts = $line -split "`t", -1
+        $parts = $line -split "`t"
         if ($parts.Count -le [Math]::Max($WordIndex, $LevelIndex)) { continue }
         $word = $parts[$WordIndex].Trim()
         $level = $parts[$LevelIndex].Trim()
@@ -139,7 +150,7 @@ function Measure-ReferenceCoverage(
         $stats.NONBLANK++
         if (-not $ReferenceMap.ContainsKey($word)) {
             $stats.NO_WORD++
-        } elseif ($ReferenceMap[$word].Contains($level)) {
+        } elseif ($ReferenceMap[$word].ContainsKey($level)) {
             $stats.MATCH++
         } else {
             $stats.CONFLICT++
@@ -149,10 +160,10 @@ function Measure-ReferenceCoverage(
 }
 
 function Find-LiteralReferences([string[]]$TrackedPaths, [string[]]$Needles) {
-    $hits = New-Object System.Collections.Generic.List[object]
+    $hits = New-Object System.Collections.ArrayList
     foreach ($relative in $TrackedPaths) {
         if ($relative -in @("CEFR.txt", "LEAP.txt", "SVL.txt")) { continue }
-        $full = Join-Path $script:Root ($relative.Replace('/', '\'))
+        $full = Join-Path $script:Root $relative
         if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { continue }
         try {
             $text = Read-Utf8Text -Path $full
@@ -165,7 +176,7 @@ function Find-LiteralReferences([string[]]$TrackedPaths, [string[]]$Needles) {
                 if ($lines[$lineNo].IndexOf($needle, [System.StringComparison]::Ordinal) -ge 0) {
                     $snippet = $lines[$lineNo].Trim()
                     if ($snippet.Length -gt 260) { $snippet = $snippet.Substring(0, 260) + "..." }
-                    $hits.Add([pscustomobject]@{
+                    [void]$hits.Add([pscustomobject]@{
                         PATH = $relative
                         LINE = $lineNo + 1
                         NEEDLE = $needle
@@ -204,7 +215,7 @@ if ($status.Count -ne 0) { Fail "Worktree must be clean for provenance audit.`n$
 
 $required = @("CEFR.txt", "LEAP.txt", "SVL.txt", "scripts/words-leap.js", "scripts/words-teppeki.js")
 foreach ($relative in $required) {
-    if (-not (Test-Path -LiteralPath (Join-Path $Root ($relative.Replace('/', '\'))) -PathType Leaf)) {
+    if (-not (Test-Path -LiteralPath (Join-Path $Root $relative) -PathType Leaf)) {
         Fail "Required file is missing: $relative"
     }
 }
@@ -228,8 +239,8 @@ $leapHeader = $leapTextLines[0]
 $leapRows = @($leapTextLines | Select-Object -Skip 1)
 $leapRuntimeRows = @(Extract-BacktickPayloadLines -Path (Join-Path $Root "scripts\words-leap.js"))
 
-$sourceBadColumns = @($leapRows | Where-Object { ($_ -split "`t", -1).Count -ne 7 })
-$runtimeBadColumns = @($leapRuntimeRows | Where-Object { ($_ -split "`t", -1).Count -ne 7 })
+$sourceBadColumns = @($leapRows | Where-Object { ($_ -split "`t").Count -ne 7 })
+$runtimeBadColumns = @($leapRuntimeRows | Where-Object { ($_ -split "`t").Count -ne 7 })
 $sourceMap = Get-Multiset -Lines $leapRows
 $runtimeMap = Get-Multiset -Lines $leapRuntimeRows
 $sourceOnly = @(Get-MultisetDiff -Left $sourceMap -Right $runtimeMap)
