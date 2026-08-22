@@ -170,11 +170,12 @@ function Find-LiteralReferences([string[]]$TrackedPaths, [string[]]$Needles) {
         } catch {
             continue
         }
-        $lines = Normalize-Lines -Text $text
+        $lines = @(Normalize-Lines -Text $text)
         for ($lineNo = 0; $lineNo -lt $lines.Count; $lineNo++) {
+            $lineText = [string]$lines[$lineNo]
             foreach ($needle in $Needles) {
-                if ($lines[$lineNo].IndexOf($needle, [System.StringComparison]::Ordinal) -ge 0) {
-                    $snippet = $lines[$lineNo].Trim()
+                if ($lineText.IndexOf($needle, [System.StringComparison]::Ordinal) -ge 0) {
+                    $snippet = $lineText.Trim()
                     if ($snippet.Length -gt 260) { $snippet = $snippet.Substring(0, 260) + "..." }
                     [void]$hits.Add([pscustomobject]@{
                         PATH = $relative
