@@ -1,0 +1,139 @@
+:root {
+  font-family: "Hiragino Kaku Gothic ProN", "Yu Gothic", sans-serif;
+  color: #1f2937;
+  background: #f5f7fb;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+header {
+  background: #1d4ed8;
+  color: white;
+  padding: 16px 24px;
+}
+
+header h1 {
+  margin: 0 0 6px;
+  font-size: 1.4rem;
+}
+
+header p {
+  margin: 0;
+  opacity: 0.95;
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: 1.2fr 1fr;
+  gap: 16px;
+  padding: 16px;
+  min-height: calc(100vh - 100px);
+}
+
+.left-panel {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  gap: 16px;
+}
+
+.card {
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 2px 8px rgba(31, 41, 55, 0.08);
+  padding: 16px;
+}
+
+.filter-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+label {
+  display: grid;
+  gap: 6px;
+  font-size: 0.9rem;
+}
+
+input,
+select,
+button {
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 0.95rem;
+}
+
+.actions {
+  margin-top: 12px;
+  display: flex;
+  gap: 8px;
+}
+
+button {
+  cursor: pointer;
+  background: #2563eb;
+  color: #fff;
+  border-color: #2563eb;
+}
+
+button.secondary {
+  background: #fff;
+  color: #2563eb;
+}
+
+.result-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+  max-height: 42vh;
+  overflow: auto;
+}
+
+.result-item {
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 10px;
+  cursor: pointer;
+}
+
+.result-item:hover {
+  border-color: #3b82f6;
+  background: #eff6ff;
+}
+
+.muted {
+  color: #64748b;
+}
+
+.badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0;
+}
+
+.badge {
+  background: #e2e8f0;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 0.78rem;
+}
+
+.pdf-list {
+  padding-left: 18px;
+}
+
+@media (max-width: 960px) {
+  .layout {
+    grid-template-columns: 1fr;
+  }
+}
