@@ -1,0 +1,44 @@
+name: Package radio repository setup
+
+on:
+  pull_request:
+    paths:
+      - "radio_repository_setup/**"
+      - ".github/workflows/package-radio-repository-setup.yml"
+  workflow_dispatch:
+
+jobs:
+  validate-and-package:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate setup script
+        shell: pwsh
+        run: |
+          $Target = Join-Path $env:RUNNER_TEMP "radio-recording"
+          New-Item -ItemType Directory -Path $Target -Force | Out-Null
+          foreach ($Name in @("audio", "database", "dev", "main")) {
+            New-Item -ItemType Directory -Path (Join-Path $Target $Name) -Force | Out-Null
+          }
+          powershell.exe -ExecutionPolicy Bypass -File .\radio_repository_setup\SETUP_RADIO_REPOSITORY.ps1 -TargetRoot $Target
+          if ($LASTEXITCODE -ne 0) { throw "Setup validation failed." }
+          powershell.exe -ExecutionPolicy Bypass -File (Join-Path $Target "dev\scripts\run_checks.ps1")
+          if ($LASTEXITCODE -ne 0) { throw "Repository checks failed." }
+
+      - name: Package setup
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path artifact -Force | Out-Null
+          Compress-Archive `
+            -Path .\radio_repository_setup\SETUP_RADIO_REPOSITORY.ps1, .\radio_repository_setup\README_SETUP.txt `
+            -DestinationPath .\artifact\20260731_radio_repository_environment_setup.zip `
+            -Force
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: 20260731_radio_repository_environment_setup
+          path: artifact/20260731_radio_repository_environment_setup.zip
+          if-no-files-found: error
