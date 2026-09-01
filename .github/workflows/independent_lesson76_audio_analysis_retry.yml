@@ -1,0 +1,79 @@
+name: Independent Lesson 76 Audio Analysis Retry
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/independent_lesson76_audio_analysis_retry.yml
+      - analysis_scripts/lesson76_independent.py
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    if: github.head_ref == 'analysis/20260802-lesson76-independent-audio'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install media and transcription tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg curl
+          python -m pip install faster-whisper==1.2.1 ctranslate2==4.8.1 huggingface-hub==0.26.0
+      - name: Acquire the identified broadcast with browser-compatible headers
+        id: acquire
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p independent_audio_analysis
+          PLAYER_URL='https://www.nhk.or.jp/radio/player/ondemand.html?p=PMMJ59J6N2_01_4323812'
+          STREAM_URL='https://vod-stream.nhk.jp/radioondemand/r/PMMJ59J6N2/s/stream_PMMJ59J6N2_cc17127cad24323699c547b835fd3d58/index.m3u8'
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/150.0.0.0 Safari/537.36'
+          curl -L --fail --silent --show-error -A "$UA" -c independent_audio_analysis/cookies.txt "$PLAYER_URL" -o independent_audio_analysis/player.html || true
+          COOKIE_HEADER="$(awk 'BEGIN{ORS="; "} !/^#/ {print $6"="$7}' independent_audio_analysis/cookies.txt 2>/dev/null || true)"
+          {
+            echo "PLAYER_URL=$PLAYER_URL"
+            echo "STREAM_URL=$STREAM_URL"
+            echo "COOKIE_HEADER_LENGTH=${#COOKIE_HEADER}"
+            curl -L -sS -o /dev/null -w 'PLAYER_HTTP=%{http_code}\n' -A "$UA" -e "$PLAYER_URL" "$PLAYER_URL" || true
+            curl -L -sS -o /dev/null -w 'STREAM_HTTP=%{http_code}\n' -A "$UA" -e "$PLAYER_URL" -H 'Origin: https://www.nhk.or.jp' -H "Cookie: $COOKIE_HEADER" "$STREAM_URL" || true
+          } | tee independent_audio_analysis/http_diagnostics.txt
+          HEADER_STRING=$'User-Agent: '"$UA"$'\r\nReferer: '"$PLAYER_URL"$'\r\nOrigin: https://www.nhk.or.jp\r\nCookie: '"$COOKIE_HEADER"$'\r\n'
+          ffmpeg -hide_banner -loglevel error -y \
+            -headers "$HEADER_STRING" \
+            -http_seekable 0 \
+            -i "$STREAM_URL" \
+            -vn -c:a copy -bsf:a aac_adtstoasc \
+            independent_audio_analysis/original.m4a \
+            2>&1 | tee independent_audio_analysis/ffmpeg_download.log
+          test -s independent_audio_analysis/original.m4a
+      - name: Trim and independently transcribe
+        if: steps.acquire.outcome == 'success'
+        shell: bash
+        env:
+          HF_HUB_DISABLE_PROGRESS_BARS: '1'
+        run: |
+          set -euo pipefail
+          ffmpeg -hide_banner -loglevel error -y -ss 44 -i independent_audio_analysis/original.m4a -vn -c:a copy -avoid_negative_ts make_zero independent_audio_analysis/b.m4a
+          ffprobe -v error -show_entries format=duration,bit_rate:stream=codec_name,sample_rate,channels -of json independent_audio_analysis/b.m4a > independent_audio_analysis/audio_metadata.json
+          ffmpeg -hide_banner -loglevel error -y -ss 315 -to 550 -i independent_audio_analysis/b.m4a -ac 1 -ar 16000 independent_audio_analysis/essential.wav
+          ffmpeg -hide_banner -loglevel error -y -ss 185 -to 330 -i independent_audio_analysis/b.m4a -ac 1 -ar 16000 independent_audio_analysis/grammar.wav
+          ffmpeg -hide_banner -loglevel error -y -ss 540 -to 715 -i independent_audio_analysis/b.m4a -ac 1 -ar 16000 independent_audio_analysis/practical.wav
+          python analysis_scripts/lesson76_independent.py | tee independent_audio_analysis/workflow.log
+          rm -f independent_audio_analysis/original.m4a independent_audio_analysis/b.m4a independent_audio_analysis/*.wav independent_audio_analysis/player.html independent_audio_analysis/cookies.txt
+      - name: Upload independent analysis and acquisition diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lesson76-independent-audio-analysis-retry
+          path: independent_audio_analysis/
+          retention-days: 7
+          if-no-files-found: error
+      - name: Fail if audio acquisition did not succeed
+        if: steps.acquire.outcome != 'success'
+        run: exit 1
